@@ -1,6 +1,7 @@
 # 微信机器人容器（dannicool/docker-wechatbot-webhook）
 # 用法：docker compose -f deploy/docker-compose.yml up -d
-# 前置：/root/wxBot_logs/.login_token 里先写好 BOT_TOKEN；
+# 前置：设置 BOT_TOKEN（与 /root/wxBot_logs/.login_token 内容一致，可用
+#       export BOT_TOKEN=$(cat /root/wxBot_logs/.login_token)）；
 #       /root/wxBot_session.json 必须先用 touch 创建（否则会被当成目录挂载）。
 services:
   wxbot:
@@ -10,7 +11,7 @@ services:
     ports:
       - "3002:3001"
     environment:
-      LOGIN_API_TOKEN: "${BOT_TOKEN:-$(cat /root/wxBot_logs/.login_token 2>/dev/null)}"
+      LOGIN_API_TOKEN: "${BOT_TOKEN}"
       RECVD_MSG_API: "http://172.17.0.1:3004/receive_msg"
       ACCEPT_RECVD_MSG_MYSELF: "false"
     volumes:
