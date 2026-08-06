@@ -170,7 +170,9 @@ DETAIL_HELP = (
     "     开启后会引导确认城市；在群里开启就推送到群，私聊开启就推送到私聊\n"
     "1️⃣1️⃣ /取消推送：取消每日推送\n"
     "1️⃣2️⃣ 群里使用：先 @机器人 再发命令或算式；\n"
-    "     群提醒到点会 @ 本人，私聊提醒直接发消息"
+    "     群提醒到点会 @ 本人，私聊提醒直接发消息\n"
+    "1️⃣3️⃣ 管理员授权：/权限 <密码> 验证后，可用 /授权 <昵称或ID> 给人开通 AI、\n"
+    "     /取消授权 <昵称或ID> 收回、/授权列表 查看已授权用户"
 )
 
 VIEW_TOKEN = ""
@@ -545,7 +547,7 @@ def load_permissions():
         with open(PERM_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
-        return {"members": {}}
+        return {"members": {}, "admins": {}}
 
 
 def save_permissions(p):
@@ -562,6 +564,45 @@ def is_allowed(from_id):
     with PERM_LOCK:
         p = load_permissions()
         return from_id in p.get("members", {})
+
+
+def is_admin(from_id):
+    if not from_id:
+        return False
+    with PERM_LOCK:
+        p = load_permissions()
+        return from_id in p.get("admins", {})
+
+
+def grant_admin(from_id, name):
+    with PERM_LOCK:
+        p = load_permissions()
+        p.setdefault("admins", {})
+        p["admins"][from_id] = {
+            "name": name or from_id, "since": now_str(),
+        }
+        save_permissions(p)
+
+
+def find_user_by_ref(ref):
+    """把「微信ID 或 昵称」解析成 (from_id, name)；昵称重复时返回 None 要求用 ID。"""
+    ref = (ref or "").strip()
+    if not ref:
+        return None
+    with USERS_LOCK:
+        users = load_users().get("users", {})
+    if ref in users:
+        return ref, users[ref].get("name") or ref
+    hits = [(fid, info.get("name") or fid)
+            for fid, info in users.items() if (info.get("name") or "") == ref]
+    if len(hits) == 1:
+        return hits[0]
+    if not hits:
+        hits = [(fid, info.get("name") or fid)
+                for fid, info in users.items() if ref in (info.get("name") or "")]
+        if len(hits) == 1:
+            return hits[0]
+    return None
 
 
 def grant_member(from_id, name, granted_by):
@@ -1383,6 +1424,61 @@ def handle_command(text, from_id, from_name, room_id, room_name, cfg):
 
     if cmd == "/说明":
         return DETAIL_HELP
+
+    if cmd == "/权限":
+        if not rest:
+            return "🔑 用法：/权限 <密码>，验证成功后可用 /授权 给别人开通 AI"
+        try:
+            with open(TOKEN_FILE, "r", encoding="utf-8") as f:
+                admin_pwd = f.read().strip()
+        except Exception:
+            admin_pwd = ""
+        if rest.strip() == admin_pwd:
+            grant_admin(from_id, from_name)
+            return ("✅ 已识别为管理员。现在可以用：\n"
+                    "  👤 /授权 <微信ID或昵称> → 给他开通 AI\n"
+                    "  🚫 /取消授权 <微信ID或昵称> → 收回\n"
+                    "  📋 /授权列表 → 查看已授权用户")
+        return "❌ 密码错误"
+
+    if cmd == "/授权":
+        if not is_admin(from_id):
+            return "🔒 你不是管理员。请先私聊或 @机器人 发送 /权限 <密码> 验证身份"
+        if not rest:
+            return "⚠️ 用法：/授权 <微信ID或昵称>"
+        hit = find_user_by_ref(rest)
+        if not hit:
+            return ("❌ 没找到这个用户。需要他先给机器人发过至少一条消息（这样机器人才能记住他的微信ID），"
+                    "再用 /授权 <昵称>；如果昵称重复，请用他的微信ID。")
+        fid, fname = hit
+        grant_member(fid, fname, from_name)
+        return f"✅ 已授权 {fname}，他现在可以用 /ai 了。"
+
+    if cmd == "/取消授权":
+        if not is_admin(from_id):
+            return "🔒 你不是管理员。请先私聊或 @机器人 发送 /权限 <密码> 验证身份"
+        if not rest:
+            return "⚠️ 用法：/取消授权 <微信ID或昵称>"
+        hit = find_user_by_ref(rest)
+        if not hit:
+            return "❌ 没找到这个用户"
+        fid, fname = hit
+        if revoke_member(fid):
+            return f"🗑️ 已取消 {fname} 的授权，他不能再使用 AI 功能。"
+        return f"ℹ️ {fname} 本来就没有授权。"
+
+    if cmd == "/授权列表":
+        if not is_admin(from_id):
+            return "🔒 你不是管理员。请先私聊或 @机器人 发送 /权限 <密码> 验证身份"
+        with PERM_LOCK:
+            p = load_permissions()
+        members = p.get("members", {})
+        if not members:
+            return "📋 当前还没有已授权用户"
+        lines = [f"📋 已授权用户（共 {len(members)} 人）："]
+        for fid, info in members.items():
+            lines.append(f"  {info.get('name') or fid}  |  {fid}")
+        return "\n".join(lines)
 
     if cmd in ("/帮助", "/help", "/指令"):
         return FALLBACK_HELP
