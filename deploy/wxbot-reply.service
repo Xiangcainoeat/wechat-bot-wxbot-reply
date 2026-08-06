@@ -1,0 +1,12 @@
+[Unit]
+Description=WeChat Bot Auto Reply Service
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /root/wxbot-reply/app.py
+Restart=always
+RestartSec=3
+WorkingDirectory=/root/wxbot-reply
+
+[Install]
+WantedBy=multi-user.target

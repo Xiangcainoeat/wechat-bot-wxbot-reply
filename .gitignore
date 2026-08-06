@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+*.bak
+*.bak.*
+
+# 运行时数据与密钥（切勿提交）
+config.json
+.view_token
+.login_token
+wxBot_session.json
+messages.log
+error.log
+system_events.log
+ledger.json
+reminders.json
+subscriptions.json
+permissions.json
+users.json
+ilink_outbox.json
