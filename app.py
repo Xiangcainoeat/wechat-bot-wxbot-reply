@@ -1206,6 +1206,10 @@ def ai_tool_call(name, args):
         return "工具调用失败: {}".format(str(e)[:100])
 
 
+MAX_TOOL_ROUNDS = 8      # 单次 /ai 最多工具轮次（每轮可能含多个并行工具调用）
+TOOL_RETRIES = 2         # 网关 5xx/429/连接失败时的重试次数
+
+
 def ai_chat(prompt, cfg=None, timeout=40):
     ai = cfg if cfg is not None else ai_config()
     base = (ai.get("base_url") or "").strip().rstrip("/")
@@ -1215,64 +1219,98 @@ def ai_chat(prompt, cfg=None, timeout=40):
         raise ValueError("AI 未配置：请在管理后台「AI 配置」填写接口地址 / API Key / 模型")
     url = base if base.endswith("/chat/completions") else base + "/chat/completions"
     messages = [{"role": "user", "content": prompt}]
-    for _round in range(6):
-        payload = {
-            "model": model,
-            "messages": messages,
-            "tools": AI_TOOLS,
-            "tool_choice": "auto",
-            "stream": False,
-        }
-        req = urllib.request.Request(
-            url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            headers={"Content-Type": "application/json", "Authorization": "Bearer " + key},
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                data = json.loads(r.read().decode("utf-8", "ignore"))
-        except urllib.error.HTTPError as e:
-            body = ""
+    seen_calls = set()
+
+    def _call(tools):
+        payload = {"model": model, "messages": messages, "stream": False}
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+        last_err = None
+        for attempt in range(TOOL_RETRIES + 1):
+            req = urllib.request.Request(
+                url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                headers={"Content-Type": "application/json", "Authorization": "Bearer " + key},
+                method="POST",
+            )
             try:
-                body = (e.read() or b"").decode("utf-8", "ignore")[:300]
-            except Exception:
-                pass
-            raise ValueError("HTTP Error {}: {}".format(e.code, body or e.reason)) from e
-        except urllib.error.URLError as e:
-            raise ValueError("连接失败: {}".format(e.reason)) from e
+                with urllib.request.urlopen(req, timeout=timeout) as r:
+                    return json.loads(r.read().decode("utf-8", "ignore"))
+            except urllib.error.HTTPError as e:
+                body = ""
+                try:
+                    body = (e.read() or b"").decode("utf-8", "ignore")[:300]
+                except Exception:
+                    pass
+                last_err = ValueError("HTTP Error {}: {}".format(e.code, body or e.reason))
+                if e.code in (429, 500, 502, 503, 504) and attempt < TOOL_RETRIES:
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                raise last_err
+            except urllib.error.URLError as e:
+                last_err = ValueError("连接失败: {}".format(e.reason))
+                if attempt < TOOL_RETRIES:
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                raise last_err
+        raise last_err
+
+    for _round in range(MAX_TOOL_ROUNDS):
+        data = _call(AI_TOOLS)
         try:
             msg = data["choices"][0]["message"]
         except Exception:
             raise ValueError("AI 返回格式异常: " + json.dumps(data, ensure_ascii=False)[:300])
-        tool_calls = msg.get("tool_calls")
-        if tool_calls:
+        tool_calls = msg.get("tool_calls") or []
+        if not tool_calls:
+            content = (msg.get("content") or "").strip()
+            return content or "（无回复）"
+        # 去掉与本次回答中重复的工具调用，避免同一查询反复搜索
+        fresh = []
+        for tc in tool_calls:
+            fn = tc.get("function", {})
+            key2 = (fn.get("name") or "", fn.get("arguments") or "")
+            if key2 in seen_calls:
+                continue
+            seen_calls.add(key2)
+            fresh.append(tc)
+        if not fresh:
+            break  # 全是重复调用，直接进入不带工具的总结轮
+        messages.append({
+            "role": "assistant",
+            "content": msg.get("content") or None,
+            "tool_calls": [
+                {"id": tc.get("id") or ("call-%d" % i), "type": "function",
+                 "function": {"name": tc.get("function", {}).get("name", ""),
+                              "arguments": tc.get("function", {}).get("arguments", "{}")}}
+                for i, tc in enumerate(fresh)
+            ],
+        })
+        for tc in fresh:
+            fn = tc.get("function", {})
+            name = fn.get("name") or ""
+            try:
+                args = json.loads(fn.get("arguments") or "{}")
+            except Exception:
+                args = {}
+            result = ai_tool_call(name, args)
             messages.append({
-                "role": "assistant",
-                "content": msg.get("content") or None,
-                "tool_calls": [
-                    {"id": tc.get("id") or ("call-%d" % i), "type": "function",
-                     "function": {"name": tc.get("function", {}).get("name", ""),
-                                  "arguments": tc.get("function", {}).get("arguments", "{}")}}
-                    for i, tc in enumerate(tool_calls)
-                ],
+                "role": "tool",
+                "tool_call_id": tc.get("id") or "",
+                "content": result,
             })
-            for tc in tool_calls:
-                fn = tc.get("function", {})
-                name = fn.get("name") or ""
-                try:
-                    args = json.loads(fn.get("arguments") or "{}")
-                except Exception:
-                    args = {}
-                result = ai_tool_call(name, args)
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.get("id") or "",
-                    "content": result,
-                })
-            continue
-        content = (msg.get("content") or "").strip()
-        return content or "（无回复）"
-    raise ValueError("AI 工具调用轮次过多，已停止")
+    # 工具轮次用尽：去掉工具，让模型基于已有搜索结果直接总结，而不是报错
+    messages.append({
+        "role": "user",
+        "content": "请根据上面已有的搜索结果和信息，直接回答我最初的问题。如果信息不足，就如实说明没有查到，"
+                   "并告诉我可以去哪个官方渠道查看。不要再调用任何工具。"
+    })
+    data = _call(None)
+    try:
+        content = (data["choices"][0]["message"].get("content") or "").strip()
+    except Exception:
+        raise ValueError("AI 返回格式异常: " + json.dumps(data, ensure_ascii=False)[:300])
+    return content or "（没搜到足够信息，请换个问法或稍后再试）"
 
 
 def ai_fetch_models(timeout=15):
