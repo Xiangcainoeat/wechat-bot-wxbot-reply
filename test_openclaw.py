@@ -1045,6 +1045,8 @@ class OpenClawTests(unittest.TestCase):
         self.assertEqual(payload["messages"][0]["role"], "user")
         self.assertEqual(payload["messages"][1]["role"], "assistant")
         self.assertEqual(len(payload["compactions"]), 1)
+        for msg in payload["messages"]:
+            self.assertNotEqual(msg["content"], "NO_REPLY")
         self.assertNotIn(fixture["user_id"], json.dumps(payload, ensure_ascii=False))
 
     def test_openclaw_session_post_dispatches_new_action_by_short_reference(self):
@@ -1190,6 +1192,8 @@ class OpenClawTests(unittest.TestCase):
         detect = self._require_callable("_looks_evasive_reply")
         self.assertFalse(detect("明天 8月8日 有无双祈愿活动，8月8日开启。"))
         self.assertFalse(detect("今天上海晴到多云，28 度。"))
+        self.assertFalse(detect("你喜欢的颜色是蓝色。你明天要去上海出差。需要我帮你查一下明天的天气，或者设置出发提醒吗？"))
+        self.assertFalse(detect("可以的，你想让我帮你查询一下上海的天气吗？"))
 
     def test_ai_answer_composes_answer_from_local_search_when_evasive(self):
         ai_answer = self._require_callable("ai_answer")

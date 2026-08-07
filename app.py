@@ -194,12 +194,20 @@ _EVASIVE_MARKERS = (
     "没看到", "没有看到", "没找到", "没有搜到", "没搜到", "未找到", "未搜到",
     "暂未发现", "尚未官宣", "暂未官宣", "还没官宣",
     "自己去查", "自己查", "自行查询", "自己去搜", "自己搜",
-    "查一下", "需要查", "查询一下", "我先查", "我去查", "回头查",
-    "稍等", "稍后", "才能确认", "核实一下", "确认一下",
+    "回头查", "稍等", "稍后", "才能确认",
     "发我一下", "发给我", "你发我", "把活动名", "链接发我", "截图发我",
     "去官网", "自己去官网", "去官方网站",
     "以游戏内活动中心为准", "以游戏内为准", "以官方为准", "以实际为准",
     "看官方微博", "关注官方微博", "官方微博和公众号", "官方公众号", "官方微博或公众号",
+)
+# 需要先查证/核实才能回答的措辞（“我查一下”“需要查一下”），但“帮你查一下”这类主动帮忙不算敷衍。
+_EVASIVE_REGEX = (
+    r"我(?:先|去|再)?查(?:一下|一?下|询)?",
+    r"需要(?:先)?查(?:一下|询)?",
+    r"(?:得|还得|必须)查一下",
+    r"查一下(?:才能|再|就能|最新|官方|公告)",
+    r"我(?:去|先|再)?核实一下|核实一下(?:才能|再|就能)",
+    r"我(?:去|先|再)?确认一下|确认一下(?:才能|再|就能)",
 )
 AI_CMDS = ("/ai", "/搜索", "/search")  # 需要授权的 OpenClaw 类命令
 SESSION_COMMANDS = {
@@ -2389,6 +2397,8 @@ def _looks_evasive_reply(text):
         return True
     if re.search(r"<\uff5c\uff5cDSML\uff5c\uff5c(?:tool_calls|invoke|parameter|result)\b", text):
         return True
+    if any(re.search(pattern, text) for pattern in _EVASIVE_REGEX):
+        return True
     return any(marker in text for marker in _EVASIVE_MARKERS)
 
 
@@ -4004,7 +4014,9 @@ class Handler(BaseHTTPRequestHandler):
             messages = [
                 {"role": rec.get("role"), "content": clean_wechat_reply(rec.get("content")),
                  "timestamp": rec.get("timestamp", "")}
-                for rec in transcript if rec.get("role") in ("user", "assistant")
+                for rec in transcript
+                if rec.get("role") in ("user", "assistant")
+                and str(rec.get("content") or "").strip() not in ("NO_REPLY", "（没有返回内容）")
             ]
             compactions = [dict(rec) for rec in transcript if rec.get("type") == "compaction"]
             self._json({
