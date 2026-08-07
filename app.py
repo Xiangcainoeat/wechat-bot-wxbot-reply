@@ -129,53 +129,39 @@ CITY_ALIASES = {
 }
 
 AI_NO_PERMISSION_MSG = (
-    "🔒 AI 功能需要授权后才能使用；未授权仍可使用：计算 / 记账 / 余额 / 提醒 / 说明。\n"
-    "输入 /权限 <密码> 即可开通（密码由机器人主人提供）。"
+    "AI 功能需要先授权才能使用。输入 /权限 <密码> 即可开通（密码由机器人主人提供）。\n"
+    "未授权仍可使用：计算、记账、余额、明细、提醒、推送、搜索。"
 )
 AI_CMDS = ("/ai",)  # 需要授权的 AI 类命令（未来接入平台后把新命令加进来）
 
 FALLBACK_HELP = (
-    "⚡ 我支持这些功能：\n"
-    "  📐 直接发算式 → 自动计算（4-2+3）\n"
-    "  🤖 /ai <内容> → AI 问答（需 /权限 <密码> 开通，可查天气/时间/搜索）\n"
-    "  🔎 /搜索 <内容> → 实时网页搜索（赛程/新闻/最新信息）\n"
-    "  📒 /记账 +算式 → 记收入\n"
-    "  📒 /记账 -算式 → 记支出\n"
-    "  💰 /余额 → 查看余额\n"
-    "  📋 /明细 → 全部记账\n"
-    "  🗑️ /清空 → 清空我的记账\n"
-    "  ⏰ /提醒 <时间> <内容> → 定时提醒\n"
-    "  🌤 /推送 <时间> → 每日天气推送（如 /推送 8:00）\n"
-    "  🗑️ /取消推送 [编号] → 取消每日推送\n"
-    "  📖 /说明 → 查看详细说明"
+    "我支持这些功能（群里请先 @我 再发）：\n"
+    "1. 计算：直接发算式，如 12×8-4\n"
+    "2. 记账：/记账 +100（收入）、/记账 -30（支出）\n"
+    "3. 记账查询：/余额、/明细、/清空\n"
+    "4. 提醒：/提醒 10分钟后 喝水\n"
+    "5. 天气：直接说“上海天气”；/推送 8:00 每天自动推\n"
+    "6. 搜索：/搜索 今天有什么比赛\n"
+    "7. AI 问答：/ai 你的问题（需 /权限 <密码> 开通）\n"
+    "8. 详细说明：/说明"
 )
 
 DETAIL_HELP = (
-    "📖 详细说明：\n"
-    "1️⃣ 自动计算：直接发算式，支持 + - × ÷ 括号 小数\n"
-    "     （例：4-2+3、10÷(2+3)、12.5×2）\n"
-    "2️⃣ /ai <内容>：单次调用 AI，不带上下文（需授权才能用）\n"
-    "     内置工具：天气查询 / 当前时间 / 精确计算\n"
-    "     （例：/ai 今天上海天气怎么样、/ai 现在几点）\n"
-    "3️⃣ /记账 +算式 [备注]：记收入（例：/记账 +8×4 买菜）\n"
-    "4️⃣ /记账 -算式 [备注]：记支出（例：/记账 -15×2）\n"
-    "5️⃣ /余额：查看我的余额和总笔数\n"
-    "6️⃣ /明细：列出我的全部记账\n"
-    "7️⃣ /清空：清空我的全部记账（不可恢复）\n"
-    "8️⃣ /提醒 <时间> <内容>：定时提醒\n"
-    "     时间支持：X分钟后 / X小时后 / HH:MM / YYYY-MM-DD HH:MM\n"
-    "     （例：/提醒 10分钟后 喝水）\n"
-    "9️⃣ /提醒列表 / 取消提醒 <编号>：管理我的提醒\n"
-    "🔟 /推送 <时间>：开启每日天气推送（如 /推送 8:00）\n"
-    "     开启后会引导确认城市；在群里开启就推送到群，私聊开启就推送到私聊\n"
-    "1️⃣1️⃣ /取消推送：取消每日推送\n"
-    "1️⃣2️⃣ 群里使用：先 @机器人 再发命令或算式；\n"
-    "     群提醒到点会 @ 本人，私聊提醒直接发消息\n"
-    "1️⃣3️⃣ 开通 AI：/权限 <密码> 输入正确密码即授权成功（授权当前账号）；\n"
-    "     密码由机器人主人提供，后台「用户与权限」页可随时收回\n"
-    "1️⃣4️⃣ 自然语言：也可以直接说大白话唤起功能，如\n"
-    "     “提醒我10分钟后喝水”“上海天气”“今天有什么比赛”“每天8点推送天气”；\n"
-    "     记账除外：账本必须用 /记账 + / - 精确格式，AI 不会代记"
+    "功能说明（群里请先 @我 再发）：\n"
+    "1. 计算：直接发算式，支持 + - × ÷ 括号、小数。例：12×8-4、10÷(2+3)\n"
+    "2. 记账：必须用 + 或 - 开头（AI 不会代记）：\n"
+    "   /记账 +8×4 记收入 32；/记账 -15×2 记支出 30；备注：/记账 +100 买菜\n"
+    "3. 记账查询：/余额 看余额和笔数；/明细 看全部记录；/清空 清空记录\n"
+    "4. 提醒：/提醒 <时间> <内容>，或直接说“10分钟后提醒我喝水”\n"
+    "   时间支持：10分钟后 / 2小时后 / 14:30 / 9点 / 明天9点\n"
+    "   群聊提醒会 @ 你，私聊提醒直接发消息\n"
+    "5. 每日天气推送：/推送 <时间>（如 /推送 8:00），会引导确认城市\n"
+    "   可设置多条；/取消推送 [编号] 取消\n"
+    "6. 联网搜索：/搜索 <内容>，如：/搜索 今天有什么比赛\n"
+    "7. AI 问答：/ai <问题>，可查天气、时间、联网搜索\n"
+    "   需先 /权限 <密码> 开通（密码由机器人主人提供）\n"
+    "8. 自然语言：说大白话也能唤起功能，如“上海天气”“提醒我10分钟后喝水”\n"
+    "   记账除外：账本必须用 /记账 + / - 精确格式，AI 不会代记"
 )
 
 VIEW_TOKEN = ""
@@ -713,7 +699,22 @@ def parse_remind_time(s):
         if ts <= now:
             ts += 86400
         return ts
-    m = re.match(r"^(?:(今天|明天|今晚|明早|明晚)\s*)?(?:(早上|早晨|上午|中午|下午|晚上|凌晨)\s*)?(\d{1,2})\s*点(?:\s*(\d{1,2})\s*分?|\s*(半))?$", s)
+    m = re.match(r"^(?:(今天|明天|今晚|明早|明晚|每天|每晚)\s*)?(?:(早上|早晨|上午|中午|下午|晚上|凌晨)\s*)?(\d{1,2}):(\d{2})$", s)
+    if m:
+        day_s, per_s, hh_s, mm_s = m.groups()
+        hh, mm = int(hh_s), int(mm_s)
+        if per_s in ("下午", "晚上") or day_s in ("今晚", "明晚") or (day_s or "").startswith("晚"):
+            if hh < 12:
+                hh += 12
+        day_add = 1 if day_s in ("明天", "明早", "明晚") else 0
+        t = time.mktime(time.localtime())
+        lt = list(time.localtime(t))
+        lt[3], lt[4], lt[5] = hh, mm, 0
+        ts = time.mktime(time.localtime(time.mktime(tuple(lt)))) + day_add * 86400
+        if ts <= now:
+            ts += 86400
+        return ts
+    m = re.match(r"^(?:(今天|明天|今晚|明早|明晚|每天|每晚)\s*)?(?:(早上|早晨|上午|中午|下午|晚上|凌晨)\s*)?(\d{1,2})\s*点(?:\s*(\d{1,2})\s*分?|\s*(半))?$", s)
     if m:
         day_s, per_s, hh_s, mm_s, half = m.groups()
         hh = int(hh_s)
@@ -788,18 +789,54 @@ def save_subs(data):
 
 
 def parse_push_time(s):
-    """解析推送时间，支持：8 / 8:30 / 08:30 / 8点 / 8点30 / 8点30分。返回 "HH:MM" 或 None。"""
+    """解析推送时间，支持：8 / 8:30 / 8点 / 8点30 / 8点半 / 八点 / 八点半 等。返回 "HH:MM" 或 None。"""
     s = (s or "").strip()
-    m = re.match(r"^(\d{1,2})\s*[:：点]\s*(\d{1,2})?\s*(?:分)?$", s)
+    m = re.match(r"^([0-9一二三四五六七八九十]+)\s*[:：点]\s*([0-9一二三四五六七八九十]{1,2})?\s*(半)?\s*(?:分)?$", s)
     if m:
-        h, mi = int(m.group(1)), int(m.group(2) or 0)
+        h, mi = cn_to_int(m.group(1)), cn_to_int(m.group(2)) if m.group(2) else (30 if m.group(3) else 0)
     else:
-        m = re.match(r"^(\d{1,2})$", s)
+        m = re.match(r"^([0-9一二三四五六七八九十]+)$", s)
         if not m:
             return None
-        h, mi = int(m.group(1)), 0
-    if 0 <= h <= 23 and 0 <= mi <= 59:
+        h, mi = cn_to_int(m.group(1)), 0
+    if h is not None and mi is not None and 0 <= h <= 23 and 0 <= mi <= 59:
         return "%02d:%02d" % (h, mi)
+    return None
+
+
+def split_push_time_city(rest):
+    """把「时间 城市」拆开，如「8:00 北京」「八点半 北京市朝阳区」。返回 (HH:MM, 城市) 或 (None, '')。"""
+    rest = (rest or "").strip()
+    m = re.match(r"^\s*([0-9一二三四五六七八九十]+(?:\s*[:：点]\s*(?:[0-9一二三四五六七八九十]{1,2}|\s*半)?\s*(?:分)?)?)\s*(.*)$",
+                 rest, re.S)
+    if m:
+        hm = parse_push_time(m.group(1))
+        if hm:
+            return hm, (m.group(2) or "").strip()
+    return parse_push_time(rest), ""
+
+
+def cn_to_int(s):
+    """中文数字/阿拉伯数字 -> int（仅需 0-59 范围）。"""
+    s = (s or "").strip()
+    if not s:
+        return None
+    if s.isdigit():
+        return int(s)
+    digits = {"零": 0, "一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
+              "六": 6, "七": 7, "八": 8, "九": 9, "十": 10,
+              "十一": 11, "十二": 12, "十三": 13, "十四": 14, "十五": 15,
+              "十六": 16, "十七": 17, "十八": 18, "十九": 19, "二十": 20,
+              "二十一": 21, "二十二": 22, "二十三": 23}
+    if s in digits:
+        return digits[s]
+    if "十" in s:
+        parts = s.split("十")
+        if len(parts) == 2:
+            tens = digits.get(parts[0]) if parts[0] else 1
+            ones = digits.get(parts[1]) if parts[1] else 0
+            if tens is not None and ones is not None:
+                return tens * 10 + ones
     return None
 
 
@@ -857,36 +894,196 @@ def remove_sub(sid):
     return False
 
 
+# ---------------- 分步引导（/推送 /提醒 不写全参数时逐步收集） ----------------
+WIZARD = {}
+WIZARD_TTL = 600
+_wizard_lock = threading.Lock()
+
+
+def wizard_get(from_id):
+    with _wizard_lock:
+        w = WIZARD.get(from_id)
+        if w and time.time() - w.get("ts", 0) > WIZARD_TTL:
+            WIZARD.pop(from_id, None)
+            return None
+        return dict(w) if w else None
+
+
+def wizard_set(from_id, w):
+    w["ts"] = time.time()
+    with _wizard_lock:
+        WIZARD[from_id] = w
+
+
+def wizard_clear(from_id):
+    with _wizard_lock:
+        WIZARD.pop(from_id, None)
+
+
+def wizard_start_push(from_id, from_name, room_id, room_name):
+    wizard_set(from_id, {
+        "step": "push_time",
+        "from_id": from_id, "from_name": from_name,
+        "room_id": room_id, "room_name": room_name,
+    })
+    return "请输入推送时间（例如：8 / 8:30 / 8点30），或发 取消 中止"
+
+
+def wizard_start_remind(from_id, from_name, room_id, room_name):
+    wizard_set(from_id, {
+        "step": "remind_time",
+        "from_id": from_id, "from_name": from_name,
+        "room_id": room_id, "room_name": room_name,
+    })
+    return "请输入提醒时间（例如：10分钟后 / 14:30 / 明天9点），或发 取消 中止"
+
+
+def _wizard_create_push(w, c):
+    label = c["name"] + ("·" + c["admin1"] if c.get("admin1") else "")
+    upsert_sub({
+        "from_id": w.get("from_id"), "from_name": w.get("from_name") or "",
+        "room_id": w.get("room_id") or "", "room_name": w.get("room_name") or "",
+        "time": w.get("time"), "city": c["name"], "city_label": label,
+        "lat": c["lat"], "lon": c["lon"],
+        "channel": "ilink" if (w.get("from_id") or "").endswith("@im.wechat")
+                   or (w.get("room_id") or "").endswith("@chatroom") else "web",
+    })
+    wizard_clear(w.get("from_id"))
+    where = "群聊「%s」" % w.get("room_name") if w.get("room_id") else "私聊"
+    return ("每日推送已开启：每天 {} 在{}推送「{} 天气」。\n"
+            "  修改：/推送 <时间>；取消：/取消推送".format(w.get("time"), where, label))
+
+
+def handle_wizard(from_id, text):
+    """处理分步引导的下一步输入；没有进行中的引导返回 None。"""
+    w = wizard_get(from_id)
+    if not w:
+        return None
+    text = (text or "").strip()
+    cancel = text.lower() in ("取消", "cancel", "q", "0", "中止")
+    if w.get("step") == "push_time":
+        if cancel:
+            wizard_clear(from_id)
+            return "已取消"
+        hm = parse_push_time(text)
+        if not hm:
+            return "时间格式不认识。请输入时间，例如：8 / 8:30 / 8点30（或发 取消 中止）"
+        w["time"] = hm
+        w["step"] = "push_city"
+        wizard_set(from_id, w)
+        return "已记录推送时间 {}。请输入地点/城市（例如：北京 / 上海 / 长垣），或发 取消 中止".format(hm)
+    if w.get("step") == "push_city":
+        if cancel:
+            wizard_clear(from_id)
+            return "已取消"
+        cands = geocode_city(text)
+        if not cands:
+            return "没找到城市「{}」，请重新输入（例如：北京 / 上海 / 长垣），或发 取消 中止".format(text)
+        if len(cands) > 1:
+            w["cands"] = cands[:3]
+            w["step"] = "push_city_choose"
+            wizard_set(from_id, w)
+            lines = ["找到多个城市，请回复数字选择："]
+            for i, c in enumerate(cands[:3], 1):
+                lines.append("{}. {}（{}）".format(i, c["name"], c.get("admin1") or ""))
+            lines.append("0. 取消")
+            return "\n".join(lines)
+        return _wizard_create_push(w, cands[0])
+    if w.get("step") == "push_city_choose":
+        if cancel:
+            wizard_clear(from_id)
+            return "已取消"
+        try:
+            idx = int(text) - 1
+        except Exception:
+            return "请回复数字（1-3）或 0 取消"
+        cands = w.get("cands") or []
+        if not (0 <= idx < len(cands)):
+            return "数字不对，请回复 1-{} 或 0 取消".format(len(cands))
+        return _wizard_create_push(w, cands[idx])
+    if w.get("step") == "remind_time":
+        if cancel:
+            wizard_clear(from_id)
+            return "已取消"
+        m = _REMIND_RE.match(text)
+        ts = parse_remind_time(m.group(1)) if m else None
+        if not ts:
+            return "时间格式不认识。请输入时间，例如：10分钟后 / 14:30 / 明天9点（或发 取消 中止）"
+        w["time_raw"] = m.group(1)
+        w["ts_at"] = ts
+        w["step"] = "remind_content"
+        wizard_set(from_id, w)
+        return "已记录提醒时间 {}。请输入提醒内容（例如：喝水），或发 取消 中止".format(fmt_remind_time(ts))
+    if w.get("step") == "remind_content":
+        if cancel:
+            wizard_clear(from_id)
+            return "已取消"
+        if not text:
+            return "请输入提醒内容（例如：喝水），或发 取消 中止"
+        rid = add_reminder(w.get("from_id"), w.get("from_name"), w.get("room_id"), w.get("room_name"),
+                           w.get("ts_at"), text)
+        wizard_clear(from_id)
+        return "提醒已设置（编号 {}）：{}（{}）".format(rid, text, fmt_remind_time(w.get("ts_at")))
+    return None
+
+
 def cmd_push(rest, from_id, from_name, room_id, room_name):
-    """/推送 命令处理（含分步确认）。"""
+    """/推送 命令处理：支持「时间」或「时间 城市」一句话开启（含分步确认）。"""
     rest = (rest or "").strip()
     subs = get_subs(from_id)
     if not rest:
-        if not subs:
-            return ("⏰ 每日推送用法：/推送 <时间>\n"
-                    "  例：/推送 8:00（每天 8 点推送天气）\n"
-                    "  先设时间，再按提示确认城市。可设置多条；取消：/取消推送")
-        lines = ["🌤 你的每日推送（{} 条）：".format(len(subs))]
-        for i, s in enumerate(subs, 1):
-            where = "群聊「%s」" % s.get("room_name") if s.get("room_id") else "私聊"
-            lines.append("{}. 每天 {} 在{}推送「{} 天气」".format(
-                i, s.get("time"), where, s.get("city_label") or s.get("city")))
-        lines.append("  新增：/推送 <时间>；取消：/取消推送 <编号>")
-        return "\n".join(lines)
-    hm = parse_push_time(rest)
+        if subs:
+            lines = ["你的每日推送（{} 条）：".format(len(subs))]
+            for i, s in enumerate(subs, 1):
+                where = "群聊「%s」" % s.get("room_name") if s.get("room_id") else "私聊"
+                lines.append("{}. 每天 {} 在{}推送「{} 天气」".format(
+                    i, s.get("time"), where, s.get("city_label") or s.get("city")))
+            lines.append("  新增：/推送 <时间>（会逐步引导）；取消：/取消推送 <编号>")
+            return "\n".join(lines)
+        return wizard_start_push(from_id, from_name, room_id, room_name)
+    hm, city = split_push_time_city(rest)
     if not hm:
-        return ("⚠️ 时间格式不认识，请用数字：8 / 8:30 / 8点30\n"
-                "  例：/推送 8:00")
+        return ("时间格式不认识，请用数字：8 / 8:30 / 8点30 / 八点\n"
+                "  例：/推送 8:00 或 /推送 8:00 北京")
     for s in subs:
         if s.get("time") == hm and (s.get("room_id") or "") == (room_id or ""):
-            return ("⚠️ 你已有一个每天 {} 的推送（同一位置）。\n"
+            return ("你已有一个每天 {} 的推送（同一位置）。\n"
                     "  查看：/推送；取消旧的：/取消推送 <编号>".format(hm))
+    if city:
+        cands = geocode_city(city)
+        if not cands:
+            return ("没找到城市「{}」，请检查是否有错别字，或用 /推送 <时间> 重新设置。".format(city))
+        if len(cands) == 1:
+            c = cands[0]
+            label = c["name"] + ("·" + c["admin1"] if c.get("admin1") else "")
+            upsert_sub({
+                "from_id": from_id, "from_name": from_name,
+                "room_id": room_id, "room_name": room_name,
+                "time": hm, "city": c["name"], "city_label": label,
+                "lat": c["lat"], "lon": c["lon"],
+                "channel": "ilink" if (from_id.endswith("@im.wechat")
+                                       or (room_id or "").endswith("@chatroom")) else "web",
+            })
+            where = "群聊「%s」" % room_name if room_id else "私聊"
+            return ("每日推送已开启：每天 {} 在{}推送「{} 天气」。\n"
+                    "  修改：/推送 <时间>；取消：/取消推送".format(hm, where, label))
+        set_pending(from_id, {
+            "state": "await_confirm", "time": hm,
+            "from_id": from_id, "from_name": from_name,
+            "room_id": room_id, "room_name": room_name,
+            "candidates": cands[:3],
+        })
+        lines = ["找到多个城市，请回复数字选择："]
+        for i, c in enumerate(cands[:3], 1):
+            lines.append("{}. {}（{}{}）".format(i, c["name"], c.get("admin1") or "", c.get("country") or ""))
+        lines.append("0. 取消")
+        return "\n".join(lines)
     set_pending(from_id, {
         "state": "await_city", "time": hm,
         "from_id": from_id, "from_name": from_name,
         "room_id": room_id, "room_name": room_name,
     })
-    return ("⏰ 已记录推送时间 {}。\n"
+    return ("已记录推送时间 {}。\n"
             "现在请回复你的城市（如：长垣 / 长垣县 / changyuan），我来确认。"
             .format(hm))
 
@@ -1063,24 +1260,46 @@ def ai_config():
 
 def geocode_city(name):
     """城市名 -> 候选 [{name, admin1, country, lat, lon}]（中文/拼音/英文均可）"""
-    key = re.sub(r"[市县区]$", "", (name or "").strip()).lower()
-    hit = CITY_ALIASES.get(key) or CITY_ALIASES.get((name or "").strip().lower())
-    if hit:
-        return [dict(hit)]
-    url = ("https://geocoding-api.open-meteo.com/v1/search?name="
-           + urllib.parse.quote(name) + "&count=3&language=zh&format=json")
-    with urllib.request.urlopen(url, timeout=12) as r:
-        data = json.loads(r.read().decode("utf-8", "ignore"))
-    out = []
-    for it in data.get("results", []):
-        out.append({
-            "name": it.get("name") or "",
-            "admin1": it.get("admin1") or "",
-            "country": it.get("country") or "",
-            "lat": it.get("latitude"),
-            "lon": it.get("longitude"),
-        })
-    return out
+    raw = (name or "").strip()
+    # 查询名候选：原样 → 去掉尾部市/县/区 → 最前面的市/省 → 最后一段区/县名
+    queries = [raw]
+    s = re.sub(r"[市县区]$", "", raw)
+    if s and s != raw:
+        queries.append(s)
+    m = re.match(r"^(.{2,8}?(?:省|市))", raw)
+    if m:
+        t = re.sub(r"[省市]$", "", m.group(1))
+        if t and t not in queries:
+            queries.append(t)
+    m2 = re.search(r"([\u4e00-\u9fa5]{2,6}?[县区])$", raw)
+    if m2:
+        t = re.sub(r"[县区]$", "", m2.group(1))
+        if t and t not in queries:
+            queries.append(t)
+    for q in queries:
+        k = re.sub(r"[市县区]$", "", q).lower()
+        hit = CITY_ALIASES.get(k) or CITY_ALIASES.get(q.lower())
+        if hit:
+            return [dict(hit)]
+        url = ("https://geocoding-api.open-meteo.com/v1/search?name="
+               + urllib.parse.quote(q) + "&count=3&language=zh&format=json")
+        try:
+            with urllib.request.urlopen(url, timeout=12) as r:
+                data = json.loads(r.read().decode("utf-8", "ignore"))
+        except Exception:
+            data = {}
+        out = []
+        for it in data.get("results", []):
+            out.append({
+                "name": it.get("name") or "",
+                "admin1": it.get("admin1") or "",
+                "country": it.get("country") or "",
+                "lat": it.get("latitude"),
+                "lon": it.get("longitude"),
+            })
+        if out:
+            return out
+    return []
 
 
 def fetch_weather(lat, lon):
@@ -1351,41 +1570,171 @@ def ai_fetch_models(timeout=15):
     return ids
 
 
-# ---------------- 自然语言意图识别（v1） ----------------
-# 规则：AI 只负责“听懂”，不负责“执行”。识别结果由下方 smart_fallback 路由到
-# 已有的确定性工具；记账除外：识别为记账也只回格式引导，绝不写入账本。
-INTENT_TOOL = [{
-    "type": "function",
-    "function": {
-        "name": "route_intent",
-        "description": "识别用户这句话想做什么，输出结构化结果，供后续路由到对应功能。"
-                       "支持意图：calculate 数学计算；ledger 记账（把“加/减”转成 + / -，"
-                       "金额可以是算式如 8*4）；remind 设置定时提醒；push 开启每日天气推送；"
-                       "weather 查询天气；search 查最新信息/新闻/赛程；chat 普通闲聊问答；"
-                       "other 无法归入以上任何一类。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "intent": {"type": "string",
-                           "enum": ["calculate", "ledger", "remind", "push", "weather", "search", "chat", "other"]},
-                "expression": {"type": "string", "description": "intent=calculate 时的数学表达式，如 8*4-2"},
-                "op": {"type": "string", "description": "intent=ledger 时的 + 或 -（把口语“加/减”转成符号）"},
-                "amount_expr": {"type": "string", "description": "intent=ledger 时的金额算式，如 8*4 或 100"},
-                "note": {"type": "string", "description": "intent=ledger 时的备注"},
-                "time": {"type": "string",
-                         "description": "intent=remind/push 时的时间，尽量转成：10分钟后 / 2小时后 / 14:30 / 9点 / 明天9点"},
-                "remind_text": {"type": "string", "description": "intent=remind 时的提醒内容"},
-                "city": {"type": "string", "description": "intent=weather/push 时的城市名"},
-                "query": {"type": "string", "description": "intent=search 时的搜索关键词"}
-            },
-            "required": ["intent"]
+# ---------------- 自然语言路由（function calling） ----------------
+# 每个功能一个工具 schema：AI 直接选择工具并生成参数，代码再调用对应功能执行。
+# 参数缺失时用最多 2 轮追问补齐，保证路由后功能一定被成功拉起。
+ROUTE_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "set_reminder",
+            "description": "设置定时提醒（到点提醒一次）。用户提到提醒/别忘了/几点叫我/到点叫我时使用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "time": {"type": "string",
+                             "description": "提醒时间，只允许这些格式：10分钟后 / 2小时后 / 14:30 / 9点 / 9点半 / 明天9点 / 明天8:00 / 明天早上9点。把口语时间转成这些格式"},
+                    "content": {"type": "string",
+                                "description": "提醒内容（要提醒的具体事项）。用户没明说就留空"}
+                },
+                "required": ["time"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_daily_push",
+            "description": "开启每日天气推送。用户提到每天/每日 + 时间 + 推送/播报/天气时使用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "time": {"type": "string",
+                             "description": "推送时间，转成数字格式：8:00 / 8点30 / 8点半（用户说“八点”就输出 8:00）"},
+                    "city": {"type": "string",
+                             "description": "城市名，尽量归一化到市/县级：“北京市朝阳区”输出“北京”，“上海市”输出“上海”，“长垣县”输出“长垣”；没有明确说城市就留空"}
+                },
+                "required": ["time"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "查询某个城市的实时天气和今日预报。只要用户想查天气就调用本工具"
+                           "（包括只说“查天气”“天气”没给城市的情况），城市可以留空，系统会追问城市。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string",
+                             "description": "城市名，归一化到市/县级（“北京市朝阳区”输出“北京”）"}
+                },
+                "required": ["city"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "联网搜索最新信息（新闻、赛程、比分、实时动态等）。只要用户想搜索就调用本工具，"
+                           "关键词可以留空，系统会追问。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "搜索关键词，尽量具体"}
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "calculate",
+            "description": "计算数学算式。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "expression": {"type": "string", "description": "算式，如 8*4-2"}
+                },
+                "required": ["expression"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ledger_help",
+            "description": "用户想记账（记收入/记支出/记一笔账）时使用。注意：本机器人记账必须用 + / - 精确格式，本工具只返回记账格式说明，绝不代记。",
+            "parameters": {"type": "object", "properties": {}}
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "chat_answer",
+            "description": "普通闲聊、寒暄或与功能无关的问答。"
+                           "注意：查天气/设提醒/记账/搜索/计算请调用对应工具，不要用本工具代替。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "description": "用户的问题或话题"}
+                },
+                "required": ["question"]
+            }
         }
     }
-}]
+]
+
+LEDGER_FORMAT_HINT = (
+    "记账需要精确格式（AI 不会代记）：\n"
+    "  /记账 +8×4 记收入 32\n"
+    "  /记账 -15×2 记支出 30\n"
+    "  备注：/记账 +100 买菜"
+)
+
+# 路由后的补参追问：from_id -> {"tool","args","missing","text","rounds","ts"}
+PENDING_ROUTE = {}
+PENDING_TTL = 600
+_route_lock = threading.Lock()
+
+ROUTE_QUESTIONS = {
+    "set_reminder": {
+        "time": "几点提醒？例如：10分钟后 / 14:30 / 明天9点",
+        "content": "提醒你做什么？例如：提醒我10分钟后喝水",
+    },
+    "set_daily_push": {
+        "time": "每天几点推送天气？例如：8:00 / 8点30",
+        "city": "推送哪个城市的天气？例如：北京 / 上海 / 长垣",
+    },
+    "get_weather": {
+        "city": "查哪个城市的天气？",
+    },
+    "web_search": {
+        "query": "想搜索什么内容？",
+    },
+    "calculate": {
+        "expression": "要算什么？直接发算式，例如：8×4-2",
+    },
+}
+
+
+def route_pending_get(from_id):
+    with _route_lock:
+        p = PENDING_ROUTE.get(from_id)
+        if p and time.time() - p.get("ts", 0) > PENDING_TTL:
+            PENDING_ROUTE.pop(from_id, None)
+            return None
+        return dict(p) if p else None
+
+
+def route_pending_set(from_id, tool, args, missing, text, rounds):
+    with _route_lock:
+        PENDING_ROUTE[from_id] = {
+            "tool": tool, "args": args, "missing": missing,
+            "text": text, "rounds": rounds, "ts": time.time(),
+        }
+
+
+def route_pending_clear(from_id):
+    with _route_lock:
+        PENDING_ROUTE.pop(from_id, None)
 
 
 def ai_route(text, timeout=30):
-    """用同一个 AI 模型识别消息意图，返回结构化 dict。失败抛异常。"""
+    """AI 用 function calling 选择功能并生成参数。返回 (工具名, 参数字典)。"""
     ai = ai_config()
     base = (ai.get("base_url") or "").strip().rstrip("/")
     key = (ai.get("api_key") or "").strip()
@@ -1396,8 +1745,8 @@ def ai_route(text, timeout=30):
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": text}],
-        "tools": INTENT_TOOL,
-        "tool_choice": {"type": "function", "function": {"name": "route_intent"}},
+        "tools": ROUTE_TOOLS,
+        "tool_choice": "auto",
         "stream": False,
     }
     data = None
@@ -1430,78 +1779,154 @@ def ai_route(text, timeout=30):
                 continue
             raise last_err
     try:
-        tc = data["choices"][0]["message"]["tool_calls"][0]
-        args = json.loads(tc.get("function", {}).get("arguments") or "{}")
+        msg = data["choices"][0]["message"]
     except Exception:
         raise ValueError("意图识别返回格式异常")
-    return args
+    tcs = msg.get("tool_calls") or []
+    if not tcs:
+        content = (msg.get("content") or "").strip()
+        return "chat_answer", {"question": content or text}
+    tc = tcs[0]
+    name = tc.get("function", {}).get("name") or ""
+    try:
+        args = json.loads(tc.get("function", {}).get("arguments") or "{}")
+    except Exception:
+        args = {}
+    return name, args
 
 
-LEDGER_FORMAT_HINT = (
-    "📒 记账需要精确格式（AI 不会代记，避免记错）：\n"
-    "  /记账 +8×4  → 记收入 32\n"
-    "  /记账 -15×2 → 记支出 30\n"
-    "  支持备注：/记账 +100 买菜"
-)
+def _ask_route(from_id, tool, args, missing, text, rounds):
+    qs = [ROUTE_QUESTIONS.get(tool, {}).get(k) for k in missing]
+    qs = [q for q in qs if q]
+    route_pending_set(from_id, tool, args, missing, text, rounds)
+    return " ".join(qs) if qs else "请补充一下信息"
+
+
+def _do_reminder_route(args, text, from_id, from_name, room_id, room_name, rounds):
+    t = (args.get("time") or "").strip()
+    content = (args.get("content") or "").strip()
+    if not t and not content:
+        return _ask_route(from_id, "set_reminder", args, ["time", "content"], text, rounds)
+    if not t:
+        return _ask_route(from_id, "set_reminder", args, ["time"], text, rounds)
+    if not content:
+        return _ask_route(from_id, "set_reminder", args, ["content"], text, rounds)
+    m = _REMIND_RE.match((t + " " + content).strip())
+    if not m or not parse_remind_time(m.group(1)):
+        return _ask_route(from_id, "set_reminder", args, ["time"], text, rounds)
+    route_pending_clear(from_id)
+    return do_remind("{} {}".format(t, content), from_id, from_name, room_id, room_name)
+
+
+def _do_push_route(args, text, from_id, from_name, room_id, room_name, rounds):
+    t = (args.get("time") or "").strip()
+    city = (args.get("city") or "").strip()
+    hm = parse_push_time(t)
+    if not hm:
+        return _ask_route(from_id, "set_daily_push", args, ["time"], text, rounds)
+    if city:
+        cands = geocode_city(city)
+        if not cands:
+            return _ask_route(from_id, "set_daily_push", args, ["city"], text, rounds)
+        route_pending_clear(from_id)
+        return cmd_push("{} {}".format(hm, city), from_id, from_name, room_id, room_name)
+    route_pending_clear(from_id)
+    return cmd_push(hm, from_id, from_name, room_id, room_name)
+
+
+def _do_weather_route(args, text, from_id, rounds):
+    city = (args.get("city") or "").strip()
+    if not city:
+        return _ask_route(from_id, "get_weather", args, ["city"], text, rounds)
+    cands = geocode_city(city)
+    if not cands:
+        return _ask_route(from_id, "get_weather", args, ["city"], text, rounds)
+    route_pending_clear(from_id)
+    c = cands[0]
+    label = c["name"] + ("·" + c["admin1"] if c.get("admin1") else "")
+    return format_weather(label, fetch_weather(c["lat"], c["lon"]))
+
+
+def _do_search_route(args, text, from_id, rounds):
+    q = (args.get("query") or "").strip()
+    if not q:
+        return _ask_route(from_id, "web_search", args, ["query"], text, rounds)
+    route_pending_clear(from_id)
+    return "搜索结果：\n" + web_search(q)
+
+
+def _do_calc_route(args, text, from_id, rounds):
+    expr = normalize_expr(args.get("expression") or "")
+    if not is_math_expr(expr):
+        return _ask_route(from_id, "calculate", args, ["expression"], text, rounds)
+    route_pending_clear(from_id)
+    try:
+        return "{} = {}".format(expr, fmt_number(evaluate_math(expr)))
+    except Exception:
+        return "这个算式算不出来，请确认一下"
+
+
+def dispatch_route(tool, args, text, from_id, from_name, room_id, room_name, rounds=1):
+    """执行路由到的功能；参数缺失时记 pending 并追问（最多 3 轮）。"""
+    try:
+        if tool == "set_reminder":
+            return _do_reminder_route(args, text, from_id, from_name, room_id, room_name, rounds)
+        if tool == "set_daily_push":
+            return _do_push_route(args, text, from_id, from_name, room_id, room_name, rounds)
+        if tool == "get_weather":
+            return _do_weather_route(args, text, from_id, rounds)
+        if tool == "web_search":
+            return _do_search_route(args, text, from_id, rounds)
+        if tool == "calculate":
+            return _do_calc_route(args, text, from_id, rounds)
+        if tool == "ledger_help":
+            route_pending_clear(from_id)
+            return LEDGER_FORMAT_HINT
+        if tool == "chat_answer":
+            route_pending_clear(from_id)
+            if not is_allowed(from_id):
+                return AI_NO_PERMISSION_MSG
+            q = (args.get("question") or text or "").strip()
+            return "🤖 " + ai_chat(q)
+    except Exception as e:
+        log_error(f"意图执行失败: {e}")
+        return None
+    return None
 
 
 def smart_fallback(text, from_id, from_name, room_id, room_name, cfg):
-    """自然语言意图识别 v1：非命令、非算式消息的兜底。
-    - 记账：即使识别为记账也只回格式引导，绝不写入账本；
-    - 提醒/天气/推送/搜索/计算：识别后直接唤起对应功能；
-    - 闲聊：仅授权用户进入 AI 对话，未授权提示开通。"""
+    """自然语言路由：非命令、非算式消息的兜底。
+    AI 选择工具并生成参数；缺参数时最多 2 轮追问补齐，保证功能被拉起。"""
     if not cfg.get("smart", True):
         return None
     text = (text or "").strip()
     if len(text) < 2:
         return None
+    pending = route_pending_get(from_id)
+    if pending:
+        if pending.get("rounds", 1) >= 3:
+            route_pending_clear(from_id)
+            return "没收到需要的参数，已取消。可以直接重新说一遍，例如：提醒我10分钟后喝水 / 上海天气"
+        ctx = ("之前你说：{old}。你想执行功能「{tool}」，还缺：{missing}。"
+               "用户现在补充说：{new}。请调用对应工具并补全所有参数。").format(
+            old=pending.get("text", ""), tool=pending.get("tool", ""),
+            missing="、".join(pending.get("missing", [])), new=text)
+        try:
+            tool, args = ai_route(ctx)
+        except Exception as e:
+            log_error(f"补参路由失败: {e}")
+            return None
+        if tool != pending.get("tool"):
+            route_pending_clear(from_id)
+            return dispatch_route(tool, args, text, from_id, from_name, room_id, room_name, rounds=1)
+        return dispatch_route(tool, args, text, from_id, from_name, room_id, room_name,
+                              rounds=pending.get("rounds", 1) + 1)
     try:
-        r = ai_route(text)
+        tool, args = ai_route(text)
     except Exception as e:
         log_error(f"意图识别失败: {e}")
         return None
-    intent = r.get("intent") or ""
-    try:
-        if intent == "ledger":
-            return LEDGER_FORMAT_HINT
-        if intent == "calculate":
-            expr = normalize_expr(r.get("expression") or "")
-            if is_math_expr(expr):
-                try:
-                    return f"{expr} = {fmt_number(evaluate_math(expr))}"
-                except Exception:
-                    return None
-        if intent == "remind":
-            t = (r.get("time") or "").strip()
-            txt = (r.get("remind_text") or "").strip()
-            if t and txt:
-                return do_remind(f"{t} {txt}", from_id, from_name, room_id, room_name)
-        if intent == "push":
-            t = (r.get("time") or "").strip()
-            if t:
-                city = (r.get("city") or "").strip()
-                return cmd_push((t + " " + city).strip(), from_id, from_name, room_id, room_name)
-        if intent == "weather":
-            city = (r.get("city") or "").strip()
-            if city:
-                cands = geocode_city(city)
-                if not cands:
-                    return f"⚠️ 没找到城市：{city}"
-                c = cands[0]
-                label = c["name"] + ("·" + c["admin1"] if c.get("admin1") else "")
-                return format_weather(label, fetch_weather(c["lat"], c["lon"]))
-        if intent == "search":
-            q = (r.get("query") or "").strip()
-            if q:
-                return "🔎 搜索结果：\n" + web_search(q)
-        if intent == "chat":
-            if not is_allowed(from_id):
-                return AI_NO_PERMISSION_MSG
-            return "🤖 " + ai_chat(text)
-    except Exception as e:
-        log_error(f"意图执行失败: {e}")
-        return None
-    return None
+    return dispatch_route(tool, args, text, from_id, from_name, room_id, room_name, rounds=1)
 
 
 # ---------------- 命令处理 ----------------
@@ -1643,28 +2068,35 @@ def do_ledger(rest, from_id):
 _REMIND_RE = re.compile(
     r"^(\d{4}-\d{1,2}-\d{1,2}[ T]\d{1,2}:\d{2}"       # 2026-08-08 09:00
     r"|\d{1,2}:\d{2}"                                     # 14:30
+    r"|(?:(?:今天|明天|今晚|明早|明晚|每天|每晚)\s*)?(?:(?:早上|早晨|上午|中午|下午|晚上|凌晨)\s*)?\d{1,2}:\d{2}"  # 明天8:00 / 下午3:30
     r"|\d+\s*秒(?:钟)?(?:后)?"                             # 30秒后
     r"|\d+\s*分钟?(?:钟)?(?:后)?"                          # 10分钟后
     r"|\d+\s*小时?(?:后)?"                                 # 2小时后
-    r"|(?:(?:今天|明天|今晚|明早|明晚)\s*)?(?:(?:早上|早晨|上午|中午|下午|晚上|凌晨)\s*)?\d{1,2}\s*点(?:\s*\d{1,2}\s*分?|\s*半)?"  # 9点 / 明天9点半 / 明天早上9点
+    r"|(?:(?:今天|明天|今晚|明早|明晚|每天|每晚)\s*)?(?:(?:早上|早晨|上午|中午|下午|晚上|凌晨)\s*)?\d{1,2}\s*点(?:\s*\d{1,2}\s*分?|\s*半)?"  # 9点 / 明天9点半 / 明天早上9点
     r")\s*(.*)$", re.S)
 
 
 def do_remind(rest, from_id, from_name, room_id, room_name=""):
     rest = rest.strip()
     if not rest:
-        return "⚠️ 提醒用法：/提醒 <时间> <内容>\n  时间：10分钟后 / 2小时后 / 14:30 / 2026-08-08 09:00\n  例：/提醒 10分钟后 喝水"
+        return wizard_start_remind(from_id, from_name, room_id, room_name)
     m = _REMIND_RE.match(rest)
     if not m:
-        return "⚠️ 提醒用法：/提醒 <时间> <内容>，例如：/提醒 10分钟后 喝水"
+        return "时间格式不认识。请输入时间，例如：10分钟后 / 14:30 / 明天9点（或发 取消 中止）"
     ts = parse_remind_time(m.group(1))
     content = (m.group(2) or "").strip()
     if not ts:
-        return ("⚠️ 时间格式不认识，支持：\n  10分钟后 / 2小时后\n  14:30（今天，过了则明天）\n  2026-08-08 09:00")
+        return "时间格式不认识。请输入时间，例如：10分钟后 / 14:30 / 明天9点（或发 取消 中止）"
     if not content:
-        return "⚠️ 提醒内容不能为空，例如：/提醒 10分钟后 喝水"
+        wizard_set(from_id, {
+            "step": "remind_content",
+            "time_raw": m.group(1), "ts_at": ts,
+            "from_id": from_id, "from_name": from_name,
+            "room_id": room_id, "room_name": room_name,
+        })
+        return "已记录提醒时间 {}。请输入提醒内容（例如：喝水），或发 取消 中止".format(fmt_remind_time(ts))
     rid = add_reminder(from_id, from_name, room_id, room_name, ts, content)
-    return f"⏰ 提醒已设置（编号 {rid}）：{content}（{fmt_remind_time(ts)}）"
+    return "提醒已设置（编号 {}）：{}（{}）".format(rid, content, fmt_remind_time(ts))
 
 
 def reminder_worker():
@@ -2673,8 +3105,11 @@ class Handler(BaseHTTPRequestHandler):
             text_in = content.strip()
             # 每日推送城市确认流程：有待确认时优先处理（群里可不用 @机器人）
             pending_reply = handle_pending_reply(from_id, text_in) if text_in else None
+            wizard_reply = handle_wizard(from_id, text_in) if (pending_reply is None and text_in) else None
             if pending_reply is not None:
                 reply = pending_reply
+            elif wizard_reply is not None:
+                reply = wizard_reply
             elif (not in_room) or mentioned:
                 # 群聊里可能带 @机器人 前缀（如 "@kindle /余额"），先剥掉再判断命令
                 cmd_text = re.sub(r"^@\s*[\u4e00-\u9fa5\w\-]+", "", text_in).strip()
