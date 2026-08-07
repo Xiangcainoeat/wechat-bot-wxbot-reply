@@ -935,10 +935,10 @@ class OpenClawTests(unittest.TestCase):
         self.assertEqual(rpc.call_count, 2)
         compact_method, compact_params = rpc.call_args_list[0].args[:2]
         self.assertEqual(compact_method, "sessions.compact")
-        self.assertEqual(compact_params, {"key": "wx-user", "maxLines": 2})
+        self.assertEqual(compact_params, {"key": "agent:wxbot:openai-user:wx-user", "maxLines": 2})
         inject_method, inject_params = rpc.call_args_list[1].args[:2]
         self.assertEqual(inject_method, "chat.inject")
-        self.assertEqual(inject_params["sessionKey"], "wx-user")
+        self.assertEqual(inject_params["sessionKey"], "agent:wxbot:openai-user:wx-user")
         self.assertEqual(inject_params["label"], "compaction-summary")
         self.assertIn("用户喜欢蓝色，明天去上海。", inject_params["message"])
         self.assertIn("【历史对话压缩摘要】", inject_params["message"])

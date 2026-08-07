@@ -2629,13 +2629,21 @@ def openclaw_compact_session(user_id):
     summary = clean_wechat_reply(summary or "")
     if not summary or summary == "（没有返回内容）":
         raise ValueError("上下文摘要生成失败")
+    # RPC 需要完整 agent 前缀 key（chat completions 的 user 字段可裸 key，RPC 不行）
+    gateway_key = (key if str(key).startswith(_OPENCLAW_INDEX_PREFIX)
+                   else _OPENCLAW_INDEX_PREFIX + str(key))
     with _openclaw_session_lock(key):
         # 1) 网关原生压缩：保留最近对话，归档旧转录，重置该会话 token 统计
         compact = _openclaw_gateway_rpc(
-            "sessions.compact", {"key": key, "maxLines": 2}, timeout=60)
+            "sessions.compact", {"key": gateway_key, "maxLines": 2}, timeout=60)
         if not compact.get("ok"):
             raise ValueError("网关上下文压缩失败: {}".format(
                 compact.get("reason") or compact.get("error") or "未知错误"))
+        if not compact.get("compacted"):
+            # 会话行数很少无需截断：不注入摘要，避免上下文虚增
+            with OPENCLAW_USAGE_LOCK:
+                _OPENCLAW_LAST_USAGE.pop(str(key), None)
+            return _with_context_status("当前会话内容很少，暂时不需要压缩。", key)
         # 2) 摘要写回同一会话（gateway 内部追加，不触发模型回复）
         seed_text = (
             "【历史对话压缩摘要】这是系统压缩旧对话后生成的记忆摘要，请长期记住并作为回答依据。"
@@ -2644,7 +2652,7 @@ def openclaw_compact_session(user_id):
         )
         injected = _openclaw_gateway_rpc(
             "chat.inject",
-            {"sessionKey": key, "message": seed_text, "label": "compaction-summary"},
+            {"sessionKey": gateway_key, "message": seed_text, "label": "compaction-summary"},
             timeout=30,
         )
         if not injected.get("ok"):
