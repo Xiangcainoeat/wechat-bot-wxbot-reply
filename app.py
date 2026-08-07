@@ -614,6 +614,14 @@ def openclaw_parse_transcript(path):
             role = str(message.get("role") or "")
             content = _openclaw_content_text(message.get("content"))
             if role in ("user", "assistant") and content:
+                if role == "assistant" and content.startswith("[compaction-summary]"):
+                    # 应用层 chat.inject 写回的压缩摘要，识别为压缩事件
+                    records.append({
+                        "type": "compaction",
+                        "timestamp": timestamp,
+                        "summary": content[len("[compaction-summary]"):].lstrip(" \n"),
+                    })
+                    continue
                 rec = {"role": role, "content": content, "timestamp": timestamp}
                 usage = message.get("usage") or {}
                 if isinstance(usage, dict):

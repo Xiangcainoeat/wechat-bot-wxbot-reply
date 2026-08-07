@@ -780,6 +780,23 @@ class OpenClawTests(unittest.TestCase):
         self.assertEqual(records[2]["type"], "compaction")
         self.assertEqual(records[2]["tokens_before"], 120000)
 
+    def test_transcript_parser_marks_injected_compaction_summary(self):
+        parse_transcript = self._require_callable("openclaw_parse_transcript")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "t.jsonl")
+            self._write_jsonl(path, [
+                {"type": "message", "timestamp": "2026-08-07T11:00:00Z",
+                 "message": {"role": "assistant", "content": [
+                     {"type": "text", "text": "[compaction-summary]\n\n【历史对话压缩摘要】用户喜欢蓝色。"}]}},
+                {"type": "message", "timestamp": "2026-08-07T11:00:01Z",
+                 "message": {"role": "user", "content": [{"type": "text", "text": "我喜欢的颜色"}]}},
+            ])
+            records = parse_transcript(path)
+        self.assertEqual(len(records), 2)
+        self.assertEqual(records[0]["type"], "compaction")
+        self.assertIn("用户喜欢蓝色", records[0]["summary"])
+        self.assertEqual(records[1]["role"], "user")
+
     def test_context_usage_format_includes_used_limit_and_percent(self):
         format_usage = self._require_callable("format_context_usage")
         self.assertEqual(
