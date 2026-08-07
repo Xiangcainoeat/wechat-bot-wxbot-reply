@@ -2727,7 +2727,7 @@ def _looks_like_compact_request(text):
     t = (text or "").strip()
     if not t or len(t) > 60:
         return False
-    if re.search(r"(?:什么是|啥是|什么叫|介绍一下|讲讲|科普|解释|原理|怎么|如何|为什么)", t):
+    if re.search(r"(?:什么是|啥是|什么叫|介绍一下|讲讲|科普|解释|原理|怎么|如何|为什么|区别|不同)", t):
         return False
     return bool(re.search(r"(?:压缩|精简)", t)
                 and re.search(r"(?:上下文|历史|记忆|对话|聊天)", t))
@@ -2738,7 +2738,7 @@ def _looks_like_new_session_request(text):
     t = (text or "").strip()
     if not t or len(t) > 40:
         return False
-    if re.search(r"(?:什么是|啥是|介绍一下|讲讲|解释|怎么|如何|为什么)", t):
+    if re.search(r"(?:什么是|啥是|介绍一下|讲讲|解释|怎么|如何|为什么|区别|不同)", t):
         return False
     if re.search(r"(?:开启|新开|新建|重新开|重新开始|再开|换个|开)(?:一个|个|一条|一次)?(?:新的?)?(?:对话|会话|聊天)", t):
         return True

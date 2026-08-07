@@ -954,6 +954,7 @@ class OpenClawTests(unittest.TestCase):
         self.assertTrue(detect("压缩对话"))
         self.assertFalse(detect("什么是上下文压缩"))
         self.assertFalse(detect("介绍一下上下文压缩的原理"))
+        self.assertFalse(detect("上下文压缩和开新会话有什么区别"))
         self.assertFalse(detect("压缩包怎么打开"))
         self.assertFalse(detect("今天天气怎么样"))
 
@@ -965,6 +966,7 @@ class OpenClawTests(unittest.TestCase):
         self.assertTrue(detect("新开一个对话"))
         self.assertFalse(detect("什么是新会话"))
         self.assertFalse(detect("新会话和旧会话有什么区别"))
+        self.assertFalse(detect("上下文压缩和开新会话有什么区别"))
         self.assertFalse(detect("你好"))
 
     def test_smart_fallback_compacts_on_natural_language_request(self):
