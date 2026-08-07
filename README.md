@@ -13,7 +13,7 @@
 | 分类 | 功能 | 用法 |
 | --- | --- | --- |
 | 自动计算 | 数学算式（`+ - × ÷` 括号 小数） | 直接发 `12*8-4` |
-| AI 问答 | 单次调用 AI（无上下文，需授权） | 直接说“今天上海天气怎么样”（`/ai` 仍兼容） |
+| AI 问答 | OpenClaw 智能体问答（按用户保留会话，需授权） | 直接说“今天上海天气怎么样”（`/ai` 仍兼容） |
 | 联网搜索 | 实时网页搜索（赛程/新闻等） | 直接说“今天有什么比赛”（`/搜索` 仍兼容） |
 | 记账 | 收入/支出，按人独立 | `/记账 +8×4 买菜`、`/记账 -15×2` |
 | 记账 | 余额 / 明细 / 清空 | `/余额`、`/明细`、`/清空` |
@@ -105,7 +105,22 @@ bash deploy/install.sh
 }
 ```
 
-也可以在管理后台「AI 配置」页填写（支持在线测试模型连通性）。AI 问答才需要 AI 配置；搜索、天气、计算、记账、提醒等不需要。
+也可以在管理后台「AI 配置」页填写（支持在线测试模型连通性）。这份配置用于意图路由和联网搜索整理；搜索、天气、计算、记账、提醒等确定性功能不需要 AI。
+
+在已经部署 OpenClaw Gateway 的服务器上，AI 问答可以通过 OpenClaw，配置写在 `config.json` 的 `openclaw` 段：
+
+```json
+{
+  "openclaw": {
+    "enabled": true,
+    "base_url": "http://127.0.0.1:18788/v1",
+    "api_key": "<OpenClaw Gateway token>",
+    "model": "openclaw:wxbot"
+  }
+}
+```
+
+机器人会把微信用户 ID 作为会话标识交给 OpenClaw，同一用户的后续提问可以延续上下文。服务器为微信入口使用独立的 `wxbot` 智能体，只开放网页搜索/抓取，不开放命令执行、文件读写、消息发送或自动化工具；现有 `main` 智能体和其他渠道不受影响。全新安装时 `openclaw.enabled` 默认为 `false`，未配置或显式关闭时自动回退到上面的 OpenAI 兼容接口。OpenClaw 的模型 provider 使用同一个 `ai.base_url`、`ai.api_key` 和 `ai.model`，在已部署 OpenClaw 的服务器上手工填入 Gateway token 即可启用，不把真实 token 提交到仓库。
 
 改完配置后重启服务：
 
@@ -205,6 +220,7 @@ docker run -d --name wxBotWebhook --restart unless-stopped \
 | 搜索 | Bing（`cn.bing.com/search`）HTML 解析 | 无需搜索引擎 API key，国内可访问 |
 | 天气 | Open-Meteo 免费 API + 内置常用城市坐标表 | 县级市（如长垣）也能精确匹配 |
 | 部署 | Docker + systemd + shell 脚本 | `deploy/install.sh` 一键安装 |
+| 智能体问答 | OpenClaw Gateway `/v1/chat/completions` | 本机调用，按微信用户维持会话 |
 
 ---
 
