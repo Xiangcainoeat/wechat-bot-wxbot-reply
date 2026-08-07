@@ -824,7 +824,7 @@ class OpenClawTests(unittest.TestCase):
         ):
             self.assertEqual(
                 context_status("wx-user"),
-                "（上下文 4.9k / 128k，3.8%）",
+                "（上下文 4.9k / 128k，3.8%；缓存命中 1792 / 未命中 3088）",
             )
 
     def test_sessions_index_context_uses_input_plus_cache_read_from_transcript(self):
@@ -886,30 +886,12 @@ class OpenClawTests(unittest.TestCase):
 
         self.assertEqual(models, ["wxbot/gpt-5.5", "bailian/qwen3.5-plus"])
 
-    def test_display_model_name_shows_configured_model(self):
-        display = self._require_callable("_display_model_name")
-        self.assertEqual(display("deepseek-v4-flash"), "deepseek-v4-flash")
-        self.assertEqual(display("wxbot/gpt-5.5"), "gpt-5.5")
-        self.assertEqual(display(""), "openclaw:wxbot")
-
-    def test_display_model_name_resolves_openclaw_route_from_config(self):
-        display = self._require_callable("_display_model_name")
-        with tempfile.TemporaryDirectory() as tmp:
-            config_path = os.path.join(tmp, "openclaw.json")
-            self._write_json(config_path, {
-                "agents": {
-                    "list": [{"id": "wxbot", "model": "wxbot/gpt-5.5"}],
-                    "defaults": {"model": {"primary": "bailian/qwen3.5-plus"}},
-                },
-            })
-            with mock.patch.object(app, "OPENCLAW_CONFIG_FILE", config_path, create=True):
-                self.assertEqual(display("openclaw:wxbot"), "gpt-5.5")
-                self.assertEqual(display("openclaw:unknown"), "qwen3.5-plus")
-
-    def test_wechat_system_prompt_uses_dynamic_model(self):
-        self.assertIn("{model}", app.WECHAT_SYSTEM_PROMPT)
-        prompt = app.WECHAT_SYSTEM_PROMPT.format(model="deepseek-v4-flash")
-        self.assertIn("当前使用 deepseek-v4-flash", prompt)
+    def test_wechat_system_prompt_does_not_claim_a_model(self):
+        prompt = app.WECHAT_SYSTEM_PROMPT
+        self.assertIn("我是 OpenClaw 智能体", prompt)
+        self.assertNotIn("当前使用", prompt)
+        self.assertNotIn("{model}", prompt)
+        self.assertNotIn("gpt", prompt.lower())
 
     def test_ai_answer_uses_active_session_key(self):
         with mock.patch.object(
@@ -1027,13 +1009,15 @@ class OpenClawTests(unittest.TestCase):
         self.assertTrue(detect("我现在没法实时确认，你可以自己去查。"))
         self.assertTrue(detect("暂未官宣，建议你关注官方微博和公众号。"))
         self.assertTrue(detect("你把活动名、截图，或者公告链接发我一下，我直接帮你看。"))
+        self.assertTrue(detect("我查一下王者荣耀明天的最新活动信息。"))
+        self.assertTrue(detect("需要查一下最新公告才能确认，稍等。"))
 
     def test_looks_evasive_reply_ignores_normal_answers(self):
         detect = self._require_callable("_looks_evasive_reply")
         self.assertFalse(detect("明天 8月8日 有无双祈愿活动，8月8日开启。"))
         self.assertFalse(detect("今天上海晴到多云，28 度。"))
 
-    def test_ai_answer_retries_with_force_search_when_evasive(self):
+    def test_ai_answer_composes_answer_from_local_search_when_evasive(self):
         ai_answer = self._require_callable("ai_answer")
         with mock.patch.object(
             app, "openclaw_config",
@@ -1042,7 +1026,8 @@ class OpenClawTests(unittest.TestCase):
         ), mock.patch.object(
             app, "openclaw_active_key", return_value="wx-user",
         ), mock.patch.object(
-            app, "local_web_search", return_value="",
+            app, "local_web_search",
+            return_value="1. 无双祈愿活动 8月8日开启\n   妲己九尾天狐返场",
         ) as local_search, mock.patch.object(
             app, "openclaw_chat", side_effect=[
                 "我没看到相关公告，你可以自己去查。",
@@ -1058,7 +1043,42 @@ class OpenClawTests(unittest.TestCase):
             chat.call_args_list[1].kwargs.get("system_prompt"),
             app.WECHAT_SYSTEM_PROMPT,
         )
-        local_search.assert_not_called()
+        self.assertEqual(
+            chat.call_args_list[1].kwargs.get("system_prompt"),
+            app.OPENCLAW_COMPOSE_SYSTEM_PROMPT,
+        )
+        local_search.assert_called_once()
+
+    def test_usage_breakdown_handles_deepseek_and_openclaw_formats(self):
+        breakdown = self._require_callable("_usage_breakdown")
+        deepseek = {
+            "prompt_tokens": 265,
+            "prompt_tokens_details": {"cached_tokens": 256},
+            "prompt_cache_hit_tokens": 256,
+            "prompt_cache_miss_tokens": 9,
+        }
+        self.assertEqual(breakdown(deepseek), (265, 256, 9))
+        self.assertEqual(breakdown({"input": 3088, "cacheRead": 1792}), (4880, 1792, 3088))
+        self.assertEqual(breakdown({"prompt_tokens": 100}), (100, 0, 100))
+        self.assertIsNone(breakdown({}))
+
+    def test_openclaw_context_status_includes_cache_breakdown(self):
+        status = self._require_callable("_openclaw_context_status")
+        with mock.patch.object(app, "openclaw_config", return_value={}):
+            with app.OPENCLAW_USAGE_LOCK:
+                app._OPENCLAW_LAST_USAGE["wx-user"] = {
+                    "prompt_tokens": 265,
+                    "prompt_tokens_details": {"cached_tokens": 256},
+                    "prompt_cache_hit_tokens": 256,
+                    "prompt_cache_miss_tokens": 9,
+                }
+            try:
+                result = status("wx-user")
+            finally:
+                with app.OPENCLAW_USAGE_LOCK:
+                    app._OPENCLAW_LAST_USAGE.pop("wx-user", None)
+        self.assertIn("上下文 265 / 128k", result)
+        self.assertIn("缓存命中 256 / 未命中 9", result)
 
     def test_ai_answer_falls_back_to_local_search_when_retry_evasive(self):
         ai_answer = self._require_callable("ai_answer")

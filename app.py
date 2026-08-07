@@ -171,15 +171,14 @@ WECHAT_SYSTEM_PROMPT = (
     "遇到新闻、人物动态、天气、赛事、活动、价格或其他需要核实最新信息的问题时，"
     "必须先使用网页工具搜索核实后再回答，不要回复无法确认，也不要让用户自己去查。"
     "不要展示工具调用过程、工具参数、来源链接或内部等待文本，直接给出核实后的结论。"
-    "如果用户问你是谁、基于什么智能体或运行环境，统一回答：我是 OpenClaw 智能体，当前使用 {model}。"
+    "如果用户问你是谁、基于什么智能体或运行环境，统一回答：我是 OpenClaw 智能体。"
 )
-OPENCLAW_SEARCH_SYSTEM_PROMPT = (
+OPENCLAW_COMPOSE_SYSTEM_PROMPT = (
     "你正在通过微信向用户回复。输出必须是适合微信聊天窗口的纯文本，不要使用 Markdown、"
     "加粗符号、反引号、井号标题、表格、项目符号或 emoji，用短段落和简单的数字编号表达，控制长度。"
-    "用户的问题需要核实最新信息：必须立即调用网页搜索工具搜索核实后再回答，"
-    "直接把核实到的内容发给用户，给出具体结论。"
-    "绝对不要回复无法确认、没看到、没找到，也不要建议用户自己去查；"
-    "不要展示工具调用过程、工具参数、来源链接或内部等待文本。"
+    "以下是刚搜索到的资料，请直接根据这些资料完整回答用户的问题，给出具体结论。"
+    "不要提及搜索过程、资料格式或来源链接，不要回复需要查一下、稍等之类的话。"
+    "资料里没有的信息直接说明未找到，不要编造日期或细节。"
 )
 # 敷衍回答标记：命中任一即认为 OpenClaw 没有真正搜索/回答问题。
 _EVASIVE_MARKERS = (
@@ -187,6 +186,8 @@ _EVASIVE_MARKERS = (
     "没看到", "没有看到", "没找到", "没有搜到", "没搜到", "未找到", "未搜到",
     "暂未发现", "尚未官宣", "暂未官宣", "还没官宣",
     "自己去查", "自己查", "自行查询", "自己去搜", "自己搜",
+    "查一下", "需要查", "查询一下", "我先查", "我去查", "回头查",
+    "稍等", "稍后", "才能确认", "核实一下", "确认一下",
     "发我一下", "发给我", "你发我", "把活动名", "链接发我", "截图发我",
     "去官网", "自己去官网", "去官方网站",
     "以游戏内活动中心为准", "以游戏内为准", "以官方为准", "以实际为准",
@@ -667,6 +668,7 @@ def openclaw_parse_sessions_index(index_path=None, transcript_dir=None):
                 or _positive_usage_value(
                     entry, "totalTokens", "inputTokens", "input_tokens"
                 ))
+        breakdown = _usage_breakdown(latest_usage)
         limit = (_positive_usage_value(
             entry, "contextWindow", "contextTokens", "contextWindowTokens"
         ) or 128000)
@@ -677,6 +679,8 @@ def openclaw_parse_sessions_index(index_path=None, transcript_dir=None):
             "updated_at": _openclaw_time(entry.get("updatedAt")),
             "context_used": used,
             "context_limit": limit,
+            "context_cached": breakdown[1] if breakdown else None,
+            "context_miss": breakdown[2] if breakdown else None,
             "message_count": len(messages),
             "compaction_count": len(compactions),
             "_user_id": user_id,
@@ -699,7 +703,7 @@ def read_openclaw_transcript(session_id, transcript_dir=None):
     return openclaw_parse_transcript(path)
 
 
-def format_context_usage(used, limit):
+def format_context_usage(used, limit, cached=None, miss=None):
     if used is None or limit is None:
         return ""
     try:
@@ -712,7 +716,10 @@ def format_context_usage(used, limit):
                 text = "{:.1f}".format(value / 1000).rstrip("0").rstrip(".")
                 return text + "k"
             return str(int(value))
-        return "（上下文 {} / {}，{:.1f}%）".format(fmt(used), fmt(limit), used / limit * 100)
+        result = "（上下文 {} / {}，{:.1f}%）".format(fmt(used), fmt(limit), used / limit * 100)
+        if cached is not None and miss is not None:
+            result = result[:-1] + "；缓存命中 {} / 未命中 {}）".format(int(cached), int(miss))
+        return result
     except Exception:
         return ""
 
@@ -730,35 +737,77 @@ def _positive_usage_value(data, *keys):
     return None
 
 
-def _context_used_from_usage(usage):
-    """从 Gateway/OpenClaw usage 取当前上下文 token 数：input + cacheRead。
+def _usage_int(data, *keys):
+    if not isinstance(data, dict):
+        return None
+    for key in keys:
+        value = data.get(key)
+        try:
+            if value is not None:
+                return int(value)
+        except (TypeError, ValueError):
+            continue
+    return None
 
-    OpenClaw 把缓存命中的提示词 token 单独记在 cacheRead，input 只含新 token；
-    只取 input 会少算一部分上下文，造成上下文“变小”的假象。
+
+def _usage_breakdown(usage):
+    """跨格式解析 usage，返回 (上下文总 token, 缓存命中, 未命中) 或 None。
+
+    OpenClaw/litellm：input 只含新 token，cacheRead 是缓存命中，总数=input+cacheRead。
+    DeepSeek/OpenAI：prompt_tokens 已含缓存命中，命中在 prompt_tokens_details.cached_tokens
+    或 prompt_cache_hit_tokens，未命中可显式给出或由总数减命中得出。
     """
     if not isinstance(usage, dict):
         return None
-    fresh = _positive_usage_value(usage, "input", "inputTokens", "prompt_tokens")
-    cached = _positive_usage_value(usage, "cacheRead", "cacheReadTokens", "cached_tokens")
-    if fresh is not None and cached is not None:
-        return fresh + cached
-    return fresh
+    fresh = _usage_int(usage, "input", "inputTokens")
+    cached = _usage_int(usage, "cacheRead", "cacheReadTokens")
+    if fresh is not None and cached is not None and (fresh + cached) > 0:
+        return fresh + cached, cached, fresh
+    prompt = _usage_int(usage, "prompt_tokens", "promptTokens")
+    if prompt is not None and prompt > 0:
+        details = usage.get("prompt_tokens_details")
+        hit = (_usage_int(details, "cached_tokens")
+               or _usage_int(usage, "prompt_cache_hit_tokens", "cacheReadInputTokens")
+               or 0)
+        miss = (_usage_int(usage, "prompt_cache_miss_tokens", "cacheMissInputTokens")
+                or max(prompt - hit, 0))
+        return prompt, hit, miss
+    return None
+
+
+def _context_used_from_usage(usage):
+    parts = _usage_breakdown(usage)
+    return parts[0] if parts else None
 
 
 def _openclaw_context_status(session_key):
     with OPENCLAW_USAGE_LOCK:
         usage = dict(_OPENCLAW_LAST_USAGE.get(str(session_key)) or {})
     if usage:
-        used = _context_used_from_usage(usage)
+        parts = _usage_breakdown(usage)
         limit = _positive_usage_value(usage, "contextTokens", "contextWindow") or 128000
-        if used is not None:
-            result = format_context_usage(used, limit)
+        if parts:
+            result = format_context_usage(parts[0], limit, parts[1], parts[2])
             if result:
                 return result
+    # 与后台同源：优先 transcript 最新一条 usage，其次原生索引
     try:
         index_path = openclaw_config().get("session_index") or OPENCLAW_INDEX_FILE
+        transcript_dir = openclaw_config().get("transcript_dir") or OPENCLAW_TRANSCRIPT_DIR
         with open(index_path, "r", encoding="utf-8") as f:
             entry = (json.load(f) or {}).get(_OPENCLAW_INDEX_PREFIX + str(session_key)) or {}
+        session_id = str(entry.get("sessionId") or "")
+        if session_id:
+            path = _openclaw_transcript_path(session_id, entry, transcript_dir)
+            messages = [r for r in openclaw_parse_transcript(path)
+                        if r.get("role") in ("user", "assistant")]
+            latest = next((r.get("usage") for r in reversed(messages) if r.get("usage")), {})
+            parts = _usage_breakdown(latest)
+            if parts:
+                limit = (_positive_usage_value(
+                    entry, "contextWindow", "contextTokens", "contextWindowTokens"
+                ) or 128000)
+                return format_context_usage(parts[0], limit, parts[1], parts[2])
         used = _positive_usage_value(entry, "totalTokens", "inputTokens", "input_tokens")
         limit = _positive_usage_value(entry, "contextWindow", "contextTokens") or 128000
         return format_context_usage(used, limit) if used is not None else ""
@@ -2143,55 +2192,6 @@ def openclaw_chat(prompt, session_id="", cfg=None, timeout=60,
         )
 
 
-def _openclaw_agent_model(agent_id, path=None):
-    """从 OpenClaw 配置读取指定 agent 的模型 ID，用于展示真实模型名。"""
-    path = path or OPENCLAW_CONFIG_FILE
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            config = json.load(f)
-    except Exception:
-        return ""
-    if not isinstance(config, dict):
-        return ""
-    agents = config.get("agents")
-    if not isinstance(agents, dict):
-        return ""
-    for item in agents.get("list") or []:
-        if isinstance(item, dict) and item.get("id") == agent_id:
-            value = str(item.get("model") or "").strip()
-            if value:
-                return value
-    defaults = agents.get("defaults")
-    if isinstance(defaults, dict):
-        value = str((defaults.get("model") or {}).get("primary") or "").strip()
-        if value:
-            return value
-    return ""
-
-
-def _display_model_name(model):
-    """把配置里的模型 ID 转成用户可读名称：openclaw:wxbot 解析为 agent 实际模型。"""
-    model = str(model or "").strip()
-    if not model:
-        return "openclaw:wxbot"
-    if model.startswith("openclaw:"):
-        agent_id = model.split(":", 1)[1].strip()
-        resolved = _openclaw_agent_model(agent_id)
-        if resolved:
-            model = resolved
-    if "/" in model and not model.startswith("http"):
-        model = model.rsplit("/", 1)[-1]
-    return model or "openclaw:wxbot"
-
-
-def _wechat_system_prompt(model):
-    """微信默认系统提示词；模型名按配置动态注入，路由 ID 解析不出时不暴露。"""
-    display = _display_model_name(model)
-    if display and "openclaw:" not in display:
-        return WECHAT_SYSTEM_PROMPT.format(model=display)
-    return WECHAT_SYSTEM_PROMPT.replace("，当前使用 {model}", "")
-
-
 def _openclaw_chat_request(prompt, session_id="", cfg=None, timeout=60,
                            system_prompt=WECHAT_SYSTEM_PROMPT, sanitize=True):
     """通过 OpenClaw Gateway 问答；session_id 用于按微信用户维持连续会话。"""
@@ -2201,8 +2201,6 @@ def _openclaw_chat_request(prompt, session_id="", cfg=None, timeout=60,
     model = (claw.get("model") or "openclaw:wxbot").strip()
     if not base or not key:
         raise ValueError("OpenClaw 未配置：缺少 Gateway 地址或 token")
-    if system_prompt == WECHAT_SYSTEM_PROMPT:
-        system_prompt = _wechat_system_prompt(model)
     url = base if base.endswith("/chat/completions") else base + "/chat/completions"
     payload = {
         "model": model,
@@ -2370,29 +2368,31 @@ def _looks_evasive_reply(text):
     return any(marker in text for marker in _EVASIVE_MARKERS)
 
 
-def _openclaw_search_retry(prompt, key, cfg, original, retry_chat=True):
-    """OpenClaw 回复敷衍/失败时：先强制搜索重试一次，仍不行则本地搜索兜底。"""
-    if retry_chat:
-        try:
-            retry = openclaw_chat(
-                prompt, session_id=key, cfg=cfg,
-                system_prompt=OPENCLAW_SEARCH_SYSTEM_PROMPT, timeout=40,
-            )
-            if not _looks_evasive_reply(retry):
-                return retry
-        except Exception:
-            pass
+def _openclaw_search_retry(prompt, key, cfg, original, compose=True):
+    """OpenClaw 回复敷衍/失败时：本地搜索资料，让模型直接整合出完整回答。"""
     try:
         results = local_web_search(prompt)
-        if results:
-            return "AI 搜索通道暂时不稳定，已用本地搜索兜底，直接给你搜到的结果：\n" + results
+        if not results:
+            return original or AI_FAILURE_MSG
+        if compose:
+            try:
+                answer = openclaw_chat(
+                    "用户问题：{}\n\n以下是搜索到的资料：\n{}".format(prompt, results),
+                    session_id=key, cfg=cfg,
+                    system_prompt=OPENCLAW_COMPOSE_SYSTEM_PROMPT, timeout=40,
+                )
+                if answer and not _looks_evasive_reply(answer):
+                    return answer
+            except Exception:
+                pass
+        return "AI 搜索通道暂时不稳定，已用本地搜索兜底，直接给你搜到的结果：\n" + results
     except Exception:
         pass
     return original or AI_FAILURE_MSG
 
 
 def ai_answer(prompt, session_id=""):
-    """所有微信 AI 问答统一使用 OpenClaw；敷衍/失败时强制搜索重试并本地搜索兜底。"""
+    """所有微信 AI 问答统一使用 OpenClaw；敷衍/失败时本地搜索并整合完整回答。"""
     claw = openclaw_config()
     enabled = claw.get("enabled", False)
     if enabled and claw.get("base_url") and claw.get("api_key"):
@@ -2403,7 +2403,7 @@ def ai_answer(prompt, session_id=""):
             reply = ""
         if not reply or _looks_evasive_reply(reply):
             reply = _openclaw_search_retry(
-                prompt, key, claw, reply, retry_chat=bool(reply))
+                prompt, key, claw, reply, compose=bool(reply))
         return _with_context_status(reply, key) if key else reply
     raise ValueError("OpenClaw 未配置：请启用 Gateway 并填写地址和 token")
 
@@ -3478,7 +3478,10 @@ def _openclaw_session_public(item, user_name=""):
         "updated_at": item.get("updated_at", ""),
         "context_used": item.get("context_used"),
         "context_limit": item.get("context_limit"),
-        "context_text": format_context_usage(item.get("context_used"), item.get("context_limit")),
+        "context_text": format_context_usage(
+            item.get("context_used"), item.get("context_limit"),
+            item.get("context_cached"), item.get("context_miss"),
+        ),
         "message_count": item.get("message_count", 0),
         "compaction_count": item.get("compaction_count", 0),
         "active": bool(item.get("_active")),
