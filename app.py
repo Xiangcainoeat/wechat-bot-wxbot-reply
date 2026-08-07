@@ -172,7 +172,10 @@ DETAIL_HELP = (
     "1️⃣2️⃣ 群里使用：先 @机器人 再发命令或算式；\n"
     "     群提醒到点会 @ 本人，私聊提醒直接发消息\n"
     "1️⃣3️⃣ 开通 AI：/权限 <密码> 输入正确密码即授权成功（授权当前账号）；\n"
-    "     密码找管理员要，后台「用户与权限」页可随时收回"
+    "     密码由机器人主人提供，后台「用户与权限」页可随时收回\n"
+    "1️⃣4️⃣ 自然语言：也可以直接说大白话唤起功能，如\n"
+    "     “提醒我10分钟后喝水”“上海天气”“今天有什么比赛”“每天8点推送天气”；\n"
+    "     记账除外：账本必须用 /记账 + / - 精确格式，AI 不会代记"
 )
 
 VIEW_TOKEN = ""
@@ -197,7 +200,7 @@ def load_token():
 
 
 def load_config():
-    cfg = {"auto_reply": True}
+    cfg = {"auto_reply": True, "smart": True}
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             cfg.update(json.load(f))
@@ -707,6 +710,22 @@ def parse_remind_time(s):
         lt = list(time.localtime(t))
         lt[3], lt[4], lt[5] = hh, mm, 0
         ts = time.mktime(time.localtime(time.mktime(tuple(lt))))
+        if ts <= now:
+            ts += 86400
+        return ts
+    m = re.match(r"^(?:(今天|明天|今晚|明早|明晚)\s*)?(?:(早上|早晨|上午|中午|下午|晚上|凌晨)\s*)?(\d{1,2})\s*点(?:\s*(\d{1,2})\s*分?|\s*(半))?$", s)
+    if m:
+        day_s, per_s, hh_s, mm_s, half = m.groups()
+        hh = int(hh_s)
+        mm = int(mm_s) if mm_s else (30 if half else 0)
+        if per_s in ("下午", "晚上") or day_s in ("今晚", "明晚") or (day_s or "").startswith("晚"):
+            if hh < 12:
+                hh += 12
+        day_add = 1 if day_s in ("明天", "明早", "明晚") else 0
+        t = time.mktime(time.localtime())
+        lt = list(time.localtime(t))
+        lt[3], lt[4], lt[5] = hh, mm, 0
+        ts = time.mktime(time.localtime(time.mktime(tuple(lt)))) + day_add * 86400
         if ts <= now:
             ts += 86400
         return ts
@@ -1332,6 +1351,159 @@ def ai_fetch_models(timeout=15):
     return ids
 
 
+# ---------------- 自然语言意图识别（v1） ----------------
+# 规则：AI 只负责“听懂”，不负责“执行”。识别结果由下方 smart_fallback 路由到
+# 已有的确定性工具；记账除外：识别为记账也只回格式引导，绝不写入账本。
+INTENT_TOOL = [{
+    "type": "function",
+    "function": {
+        "name": "route_intent",
+        "description": "识别用户这句话想做什么，输出结构化结果，供后续路由到对应功能。"
+                       "支持意图：calculate 数学计算；ledger 记账（把“加/减”转成 + / -，"
+                       "金额可以是算式如 8*4）；remind 设置定时提醒；push 开启每日天气推送；"
+                       "weather 查询天气；search 查最新信息/新闻/赛程；chat 普通闲聊问答；"
+                       "other 无法归入以上任何一类。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "intent": {"type": "string",
+                           "enum": ["calculate", "ledger", "remind", "push", "weather", "search", "chat", "other"]},
+                "expression": {"type": "string", "description": "intent=calculate 时的数学表达式，如 8*4-2"},
+                "op": {"type": "string", "description": "intent=ledger 时的 + 或 -（把口语“加/减”转成符号）"},
+                "amount_expr": {"type": "string", "description": "intent=ledger 时的金额算式，如 8*4 或 100"},
+                "note": {"type": "string", "description": "intent=ledger 时的备注"},
+                "time": {"type": "string",
+                         "description": "intent=remind/push 时的时间，尽量转成：10分钟后 / 2小时后 / 14:30 / 9点 / 明天9点"},
+                "remind_text": {"type": "string", "description": "intent=remind 时的提醒内容"},
+                "city": {"type": "string", "description": "intent=weather/push 时的城市名"},
+                "query": {"type": "string", "description": "intent=search 时的搜索关键词"}
+            },
+            "required": ["intent"]
+        }
+    }
+}]
+
+
+def ai_route(text, timeout=30):
+    """用同一个 AI 模型识别消息意图，返回结构化 dict。失败抛异常。"""
+    ai = ai_config()
+    base = (ai.get("base_url") or "").strip().rstrip("/")
+    key = (ai.get("api_key") or "").strip()
+    model = (ai.get("model") or "").strip()
+    if not base or not key or not model:
+        raise ValueError("AI 未配置")
+    url = base if base.endswith("/chat/completions") else base + "/chat/completions"
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": text}],
+        "tools": INTENT_TOOL,
+        "tool_choice": {"type": "function", "function": {"name": "route_intent"}},
+        "stream": False,
+    }
+    data = None
+    last_err = None
+    for attempt in range(3):
+        req = urllib.request.Request(
+            url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Authorization": "Bearer " + key},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                data = json.loads(r.read().decode("utf-8", "ignore"))
+            break
+        except urllib.error.HTTPError as e:
+            body = ""
+            try:
+                body = (e.read() or b"").decode("utf-8", "ignore")[:200]
+            except Exception:
+                pass
+            last_err = ValueError("HTTP Error {}: {}".format(e.code, body or e.reason))
+            if e.code in (429, 500, 502, 503, 504) and attempt < 2:
+                time.sleep(1.0 * (attempt + 1))
+                continue
+            raise last_err
+        except urllib.error.URLError as e:
+            last_err = ValueError("连接失败: {}".format(e.reason))
+            if attempt < 2:
+                time.sleep(1.0 * (attempt + 1))
+                continue
+            raise last_err
+    try:
+        tc = data["choices"][0]["message"]["tool_calls"][0]
+        args = json.loads(tc.get("function", {}).get("arguments") or "{}")
+    except Exception:
+        raise ValueError("意图识别返回格式异常")
+    return args
+
+
+LEDGER_FORMAT_HINT = (
+    "📒 记账需要精确格式（AI 不会代记，避免记错）：\n"
+    "  /记账 +8×4  → 记收入 32\n"
+    "  /记账 -15×2 → 记支出 30\n"
+    "  支持备注：/记账 +100 买菜"
+)
+
+
+def smart_fallback(text, from_id, from_name, room_id, room_name, cfg):
+    """自然语言意图识别 v1：非命令、非算式消息的兜底。
+    - 记账：即使识别为记账也只回格式引导，绝不写入账本；
+    - 提醒/天气/推送/搜索/计算：识别后直接唤起对应功能；
+    - 闲聊：仅授权用户进入 AI 对话，未授权提示开通。"""
+    if not cfg.get("smart", True):
+        return None
+    text = (text or "").strip()
+    if len(text) < 2:
+        return None
+    try:
+        r = ai_route(text)
+    except Exception as e:
+        log_error(f"意图识别失败: {e}")
+        return None
+    intent = r.get("intent") or ""
+    try:
+        if intent == "ledger":
+            return LEDGER_FORMAT_HINT
+        if intent == "calculate":
+            expr = normalize_expr(r.get("expression") or "")
+            if is_math_expr(expr):
+                try:
+                    return f"{expr} = {fmt_number(evaluate_math(expr))}"
+                except Exception:
+                    return None
+        if intent == "remind":
+            t = (r.get("time") or "").strip()
+            txt = (r.get("remind_text") or "").strip()
+            if t and txt:
+                return do_remind(f"{t} {txt}", from_id, from_name, room_id, room_name)
+        if intent == "push":
+            t = (r.get("time") or "").strip()
+            if t:
+                city = (r.get("city") or "").strip()
+                return cmd_push((t + " " + city).strip(), from_id, from_name, room_id, room_name)
+        if intent == "weather":
+            city = (r.get("city") or "").strip()
+            if city:
+                cands = geocode_city(city)
+                if not cands:
+                    return f"⚠️ 没找到城市：{city}"
+                c = cands[0]
+                label = c["name"] + ("·" + c["admin1"] if c.get("admin1") else "")
+                return format_weather(label, fetch_weather(c["lat"], c["lon"]))
+        if intent == "search":
+            q = (r.get("query") or "").strip()
+            if q:
+                return "🔎 搜索结果：\n" + web_search(q)
+        if intent == "chat":
+            if not is_allowed(from_id):
+                return AI_NO_PERMISSION_MSG
+            return "🤖 " + ai_chat(text)
+    except Exception as e:
+        log_error(f"意图执行失败: {e}")
+        return None
+    return None
+
+
 # ---------------- 命令处理 ----------------
 def handle_command(text, from_id, from_name, room_id, room_name, cfg):
     """返回回复文本；无需回复返回 None。"""
@@ -1474,6 +1646,7 @@ _REMIND_RE = re.compile(
     r"|\d+\s*秒(?:钟)?(?:后)?"                             # 30秒后
     r"|\d+\s*分钟?(?:钟)?(?:后)?"                          # 10分钟后
     r"|\d+\s*小时?(?:后)?"                                 # 2小时后
+    r"|(?:(?:今天|明天|今晚|明早|明晚)\s*)?(?:(?:早上|早晨|上午|中午|下午|晚上|凌晨)\s*)?\d{1,2}\s*点(?:\s*\d{1,2}\s*分?|\s*半)?"  # 9点 / 明天9点半 / 明天早上9点
     r")\s*(.*)$", re.S)
 
 
@@ -1625,7 +1798,7 @@ a.link{color:#2f6fed;font-size:15px}
 </style></head>
 <body>
 <header><h1>🤖 微信机器人管理后台</h1>
-<div class="right"><span id="hdr-status">连接中…</span><a href="/api/export" download>下载完整记录</a><form method="post" action="/logout" style="display:inline"><button type="submit">退出登录</button></form></div>
+<div class="right"><span id="hdr-status">连接中…</span><button type="button" id="toggle-ids" onclick="toggleIds()">显示完整ID</button><a href="/api/export" download>下载完整记录</a><form method="post" action="/logout" style="display:inline"><button type="submit">退出登录</button></form></div>
 </header>
 <nav>
 <button class="active" onclick="switchTab('tab-status',this)">状态总览</button>
@@ -1773,6 +1946,24 @@ async function api(path,opts){
   return r.json();
 }
 function fmtTime(t){return t||''}
+var showIds=false;
+try{showIds=localStorage.getItem('wxbot_show_ids')==='1'}catch(e){}
+function shortId(id){
+  if(!id)return'';
+  if(showIds||id.length<=14)return id;
+  return id.slice(0,10)+'…'+id.slice(-4);
+}
+function toggleIds(){
+  showIds=!showIds;
+  try{localStorage.setItem('wxbot_show_ids',showIds?'1':'0')}catch(e){}
+  var b=document.getElementById('toggle-ids');
+  if(b)b.textContent=showIds?'隐藏完整ID':'显示完整ID';
+  loadOverview();loadUsers();
+}
+function initIdsBtn(){
+  var b=document.getElementById('toggle-ids');
+  if(b)b.textContent=showIds?'隐藏完整ID':'显示完整ID';
+}
 async function refreshStatus(){
   try{
     var s=await api('/api/status');
@@ -1940,7 +2131,7 @@ async function loadOverview(){
       }
       var aiTxt=u.ai_count?('共 '+u.ai_count+' 次'+(u.ai_last?'<br><span class="dim">'+esc(u.ai_last)+'</span>':'')):'—';
       var balance=(Number(u.balance)>0?'+':'')+u.balance;
-      h+='<tr><td>'+esc(u.name)+'<br><span class="dim">'+esc(u.fromId)+'</span></td><td>'+roleTxt+'</td>'
+      h+='<tr><td>'+esc(u.name)+'<br><span class="dim" title="'+esc(u.fromId)+'">'+esc(shortId(u.fromId))+'</span></td><td>'+roleTxt+'</td>'
         +'<td>'+subsTxt+'</td><td>'+u.reminders+' 条</td>'
         +'<td>'+esc(balance)+'（'+u.count+'笔）</td><td>'+aiTxt+'</td>'
         +'<td>'+esc(u.last_seen||'-')+'</td></tr>';
@@ -1959,7 +2150,7 @@ async function loadUsers(){
       var btns=u.role==='member'
         ?'<button class="btn btn2" data-a="revoke" data-f="'+esc(u.fromId)+'" onclick="userAct(this)">取消授权</button>'
         :'<button class="btn" data-a="grant" data-f="'+esc(u.fromId)+'" onclick="userAct(this)">授权</button>';
-      h+='<tr><td>'+esc(u.name)+'</td><td class="plain">'+esc(u.fromId)+'</td><td>'+esc(u.last_seen)+'</td>'
+      h+='<tr><td>'+esc(u.name)+'</td><td class="plain" title="'+esc(u.fromId)+'">'+esc(shortId(u.fromId))+'</td><td>'+esc(u.last_seen)+'</td>'
         +'<td>'+esc(fmtSigned(u.balance))+'</td><td>'+roleTxt+'</td><td>'+btns+'</td></tr>';
     });
     $('user-list').innerHTML=h+'</tbody></table>';
@@ -1982,6 +2173,7 @@ async function grantManual(){
     $('grant-result').textContent='✅ 已授权';$('grant-id').value='';$('grant-name').value='';loadUsers();refreshStatus();
   }catch(e){$('grant-result').textContent='授权失败'}
 }
+initIdsBtn();
 refreshStatus();
 loadMessages(0);
 loadLogs();
@@ -2504,6 +2696,8 @@ class Handler(BaseHTTPRequestHandler):
                             reply = "除数不能为 0"
                         except ValueError:
                             reply = None
+                    if reply is None:
+                        reply = smart_fallback(cmd_text, from_id, sender_name, room_id, room_name, cfg)
                     if reply is None:
                         reply = FALLBACK_HELP
 
