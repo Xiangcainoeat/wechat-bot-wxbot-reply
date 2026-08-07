@@ -1026,6 +1026,36 @@ class OpenClawTests(unittest.TestCase):
         self.assertNotIn("<invoke", result)
         self.assertNotIn("<parameter", result)
         self.assertIn("夏日农友节", result)
+        inline = clean("<tool_calls>\n<invoke name=\"exec\">\n"
+                       "<parameter name=\"cmd\" string=\"true\">curl -s x | grep y</parameter>\n"
+                       "</invoke>\n</tool_calls>\n答案")
+        self.assertEqual(inline.strip(), "答案")
+
+    def test_ai_answer_falls_back_when_raw_reply_is_tool_call(self):
+        ai_answer = self._require_callable("ai_answer")
+        with mock.patch.object(
+            app, "openclaw_config",
+            return_value={"enabled": True, "base_url": "http://127.0.0.1:18788/v1",
+                          "api_key": "k", "model": "openclaw:wxbot"},
+        ), mock.patch.object(
+            app, "openclaw_active_key", return_value="wx-user",
+        ), mock.patch.object(
+            app, "local_web_search",
+            return_value="1. 夏日农友节\n   8月8日开启",
+        ), mock.patch.object(
+            app, "openclaw_chat", side_effect=[
+                "<tool_calls>\n<invoke name=\"exec\">\n"
+                "<parameter name=\"cmd\" string=\"true\">curl x</parameter>\n"
+                "</invoke>\n</tool_calls>",
+                "明天是夏日农友节开启日，可领暴击夺宝券。",
+            ],
+        ) as chat:
+            result = ai_answer("王者明天活动")
+
+        self.assertIn("夏日农友节", result)
+        self.assertNotIn("<tool_calls>", result)
+        self.assertNotIn("<invoke", result)
+        self.assertEqual(chat.call_count, 2)
 
     def test_looks_evasive_reply_ignores_normal_answers(self):
         detect = self._require_callable("_looks_evasive_reply")

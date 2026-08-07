@@ -2017,7 +2017,8 @@ def clean_wechat_reply(text):
     """清掉模型偶尔输出的 Markdown 装饰和 emoji，保留适合微信的纯文本。"""
     text = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"(?is)<tool_calls>.*?</tool_calls>", "", text)
-    text = re.sub(r"(?m)^[ \t]*<[ /]?(?:invoke|parameter|result)[^>]*>[ \t]*(?:\n|$)", "", text)
+    text = re.sub(r"(?is)<parameter\b[^>]*>.*?</parameter>", "", text)
+    text = re.sub(r"(?m)^[ \t]*<[ /]?(?:invoke|parameter|result)\b[^>]*>.*(?:\n|$)", "", text)
     text = re.sub(r"<[ /]?tool_calls>", "", text)
     has_internal_trace = bool(re.search(r"(?m)^[ \t]*to=[^\n]*[ \t]*$", text))
     text = re.sub(r"(?m)^[ \t]*to=[^\n]*(?:\n|$)", "", text)
@@ -2405,12 +2406,14 @@ def ai_answer(prompt, session_id=""):
     if enabled and claw.get("base_url") and claw.get("api_key"):
         key = openclaw_active_key(session_id) if session_id else ""
         try:
-            reply = openclaw_chat(prompt, session_id=key, cfg=claw)
+            raw_reply = openclaw_chat(prompt, session_id=key, cfg=claw, sanitize=False)
         except Exception:
-            reply = ""
-        if not reply or _looks_evasive_reply(reply):
+            raw_reply = ""
+        reply = clean_wechat_reply(raw_reply)
+        if (not raw_reply or not reply
+                or _looks_evasive_reply(raw_reply) or _looks_evasive_reply(reply)):
             reply = _openclaw_search_retry(
-                prompt, key, claw, reply, compose=bool(reply))
+                prompt, key, claw, reply or raw_reply, compose=bool(raw_reply))
         return _with_context_status(reply, key) if key else reply
     raise ValueError("OpenClaw 未配置：请启用 Gateway 并填写地址和 token")
 
