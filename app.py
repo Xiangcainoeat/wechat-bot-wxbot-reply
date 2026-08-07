@@ -2458,11 +2458,105 @@ def _openclaw_session_by_key(session_key):
     return None
 
 
-def openclaw_compact_session(user_id):
-    """真正压缩上下文：把当前会话转录整理成摘要，开新会话注入摘要并切换 active key。
+def _openclaw_transcript_file_for_key(session_key, claw=None):
+    """按 session key 解析 transcript 文件路径（兼容裸 key 与带前缀 key）。"""
+    claw = claw or openclaw_config()
+    index_path = claw.get("session_index") or OPENCLAW_INDEX_FILE
+    transcript_dir = claw.get("transcript_dir") or OPENCLAW_TRANSCRIPT_DIR
+    key = str(session_key or "")
+    if not key.startswith(_OPENCLAW_INDEX_PREFIX):
+        key = _OPENCLAW_INDEX_PREFIX + key
+    try:
+        with open(index_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return None, None, None
+    entry = data.get(key) or {}
+    session_id = str(entry.get("sessionId") or "").strip()
+    if not session_id:
+        return None, None, None
+    path = _openclaw_transcript_path(session_id, entry, transcript_dir)
+    return path, session_id, entry
 
-    网关不拦截 /compact，因此由本应用读取转录 → 生成摘要 → 新会话注入摘要，
-    旧会话与 transcript 保留（后台仍可查看历史）。
+
+def _rewrite_compacted_transcript(path, summary, message_count):
+    """就地压缩 transcript：保留会话头部记录，用压缩事件+摘要用户消息替换旧对话。
+
+    网关按 mtime/size 缓存 transcript 索引，改写后下一次请求会重新读取；
+    旧 transcript 先归档为 <path>.bak-<iso> 便于追溯。
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw_lines = f.read().splitlines()
+    except Exception as e:
+        raise ValueError("读取 transcript 失败: {}".format(e))
+    header = []
+    seen_message = False
+    last_id = None
+    for line in raw_lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        if rec.get("type") == "message":
+            seen_message = True
+            continue
+        if seen_message:
+            continue
+        header.append(rec)
+        if isinstance(rec.get("id"), str) and rec.get("id"):
+            last_id = rec["id"]
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ")
+    compaction_id = secrets.token_hex(4)
+    message_id = secrets.token_hex(4)
+    compaction = {
+        "type": "compaction",
+        "id": compaction_id,
+        "parentId": last_id,
+        "timestamp": now,
+        "summary": summary,
+    }
+    seed_text = (
+        "【历史对话压缩摘要】这是系统压缩旧对话后生成的记忆摘要，请长期记住并作为回答依据。"
+        "回答用户问题时结合这份摘要，不要主动复述这份摘要，也不要提及压缩过程。\n\n"
+        + summary
+    )
+    message = {
+        "type": "message",
+        "id": message_id,
+        "parentId": compaction_id,
+        "timestamp": now,
+        "message": {
+            "role": "user",
+            "content": [{"type": "text", "text": seed_text}],
+        },
+    }
+    archive = "{}.bak-{}".format(path, time.strftime("%Y%m%dT%H%M%SZ"))
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            original = f.read()
+        with open(archive, "w", encoding="utf-8") as f:
+            f.write(original)
+    except Exception:
+        pass
+    lines = [json.dumps(rec, ensure_ascii=False) for rec in header]
+    lines.append(json.dumps(compaction, ensure_ascii=False))
+    lines.append(json.dumps(message, ensure_ascii=False))
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    os.replace(tmp, path)
+
+
+def openclaw_compact_session(user_id):
+    """真正压缩当前会话：把旧对话整理成摘要写回同一会话的 transcript（就地压缩）。
+
+    网关不拦截 /compact，由本应用读取当前会话转录 → 生成摘要 → 保留会话头部记录，
+    用「压缩事件 + 摘要用户消息」替换旧对话并归档旧 transcript。不切换、不新建会话，
+    后续消息上下文即为 系统提示 + 摘要，token 占用随之变小。
     """
     user_id = str(user_id or "").strip()
     key = openclaw_active_key(user_id)
@@ -2470,11 +2564,12 @@ def openclaw_compact_session(user_id):
         raise ValueError("缺少微信用户会话")
     claw = openclaw_config()
     item = _openclaw_session_by_key(key)
-    if not item:
-        return _with_context_status("当前会话还没有内容，暂时不需要压缩。", key)
-    records = [r for r in (item.get("_transcript") or []) if r.get("role") in ("user", "assistant")]
-    if len(records) < 2:
+    records = [r for r in (item or {}).get("_transcript") or [] if r.get("role") in ("user", "assistant")]
+    if not item or len(records) < 2:
         return _with_context_status("当前会话内容很少，暂时不需要压缩。", key)
+    path, _session_id, _entry = _openclaw_transcript_file_for_key(key, claw)
+    if not path or not os.path.isfile(path):
+        raise ValueError("找不到当前会话的 transcript 文件")
     lines = []
     for rec in records:
         role = "用户" if rec.get("role") == "user" else "OpenClaw"
@@ -2491,20 +2586,10 @@ def openclaw_compact_session(user_id):
     summary = clean_wechat_reply(summary or "")
     if not summary or summary == "（没有返回内容）":
         raise ValueError("上下文摘要生成失败")
-    new_key = "{}:session:{}".format(user_id, secrets.token_hex(8))
-    seed = (
-        "【历史对话压缩摘要】这是系统压缩旧对话后生成的记忆摘要，请长期记住并作为回答依据。"
-        "回答用户问题时结合这份摘要，不要主动复述这份摘要，也不要提及压缩过程。\n\n"
-        + summary
-    )
-    openclaw_chat(seed, session_id=new_key, cfg=claw, timeout=40)
-    with OPENCLAW_REGISTRY_LOCK:
-        data = _openclaw_registry_load()
-        data["users"][user_id] = {"active_key": new_key, "created_at": now_str()}
-        _openclaw_registry_save(data)
+    _rewrite_compacted_transcript(path, summary, len(records))
     return _with_context_status(
-        "已压缩上下文：把之前 {} 条对话整理成摘要，并开启新会话继续（原会话历史保留在后台）。".format(len(records)),
-        new_key,
+        "已压缩上下文：把之前 {} 条对话整理成摘要写回当前会话，后续对话从这里继续。".format(len(records)),
+        key,
     )
 
 

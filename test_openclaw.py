@@ -910,31 +910,43 @@ class OpenClawTests(unittest.TestCase):
         active.assert_called_once_with("wx-user")
         self.assertEqual(chat.call_args.kwargs["session_id"], "wx-user:session:new")
 
-    def test_compact_command_summarizes_and_switches_to_new_seeded_session(self):
+    def test_compact_command_rewrites_current_transcript_in_place(self):
         compact = self._require_callable("openclaw_compact_session")
         item = {"_transcript": [
             {"role": "user", "content": "你好，记住我喜欢蓝色"},
             {"role": "assistant", "content": "好的，记住了。"},
+            {"role": "user", "content": "我喜欢的颜色是什么"},
+            {"role": "assistant", "content": "蓝色。"},
         ]}
         cfg = {"enabled": True, "base_url": "http://127.0.0.1:18788/v1", "api_key": "k"}
-        with mock.patch.object(app, "openclaw_active_key", return_value="wx-user"), \
-             mock.patch.object(app, "_openclaw_session_by_key", return_value=item), \
-             mock.patch.object(app, "openclaw_config", return_value=cfg), \
-             mock.patch.object(app, "openclaw_chat",
-                               side_effect=["用户喜欢蓝色。", "好的，已记住。"]) as chat, \
-             mock.patch.object(app, "_openclaw_registry_load",
-                               return_value={"users": {"wx-user": {"active_key": "wx-user"}}}), \
-             mock.patch.object(app, "_openclaw_registry_save") as save:
-            reply = compact("wx-user")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "t.jsonl")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write('{"type":"session","id":"s0","timestamp":"t"}\n')
+                f.write('{"type":"model_change","id":"m0","parentId":null,"timestamp":"t"}\n')
+                f.write('{"type":"message","id":"u1","parentId":"m0","message":{"role":"user","content":[{"type":"text","text":"你好"}]}}\n')
+                f.write('{"type":"message","id":"a1","parentId":"u1","message":{"role":"assistant","content":[{"type":"text","text":"你好"}]}}\n')
+                f.write('{"type":"message","id":"u2","parentId":"a1","message":{"role":"user","content":[{"type":"text","text":"颜色"}]}}\n')
+                f.write('{"type":"message","id":"a2","parentId":"u2","message":{"role":"assistant","content":[{"type":"text","text":"蓝色"}]}}\n')
+            with mock.patch.object(app, "openclaw_active_key", return_value="wx-user"), \
+                 mock.patch.object(app, "_openclaw_session_by_key", return_value=item), \
+                 mock.patch.object(app, "_openclaw_transcript_file_for_key",
+                                   return_value=(path, "sid", {})), \
+                 mock.patch.object(app, "openclaw_config", return_value=cfg), \
+                 mock.patch.object(app, "openclaw_chat", return_value="用户喜欢蓝色，明天去上海。") as chat:
+                reply = compact("wx-user")
 
-        self.assertIn("已压缩上下文", reply)
-        self.assertIn("摘要", reply)
-        self.assertEqual(chat.call_args_list[0].kwargs["session_id"], "compose:wx-user")
-        new_key = chat.call_args_list[1].kwargs["session_id"]
-        self.assertTrue(new_key.startswith("wx-user:session:"))
-        self.assertIn("历史对话压缩摘要", chat.call_args_list[1].args[0])
-        saved = save.call_args.args[0]
-        self.assertEqual(saved["users"]["wx-user"]["active_key"], new_key)
+            self.assertIn("已压缩上下文", reply)
+            self.assertEqual(chat.call_args_list[0].kwargs["session_id"], "compose:wx-user")
+            self.assertEqual(chat.call_count, 1)
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+            self.assertNotIn('"u1"', content)
+            self.assertNotIn("我喜欢的颜色是什么", content)
+            self.assertIn("用户喜欢蓝色，明天去上海。", content)
+            self.assertIn('"type": "compaction"', content)
+            backups = [fn for fn in os.listdir(tmp) if fn.startswith("t.jsonl.bak-")]
+            self.assertEqual(len(backups), 1)
 
     def test_compact_skips_when_session_has_no_transcript(self):
         compact = self._require_callable("openclaw_compact_session")
