@@ -886,6 +886,31 @@ class OpenClawTests(unittest.TestCase):
 
         self.assertEqual(models, ["wxbot/gpt-5.5", "bailian/qwen3.5-plus"])
 
+    def test_display_model_name_shows_configured_model(self):
+        display = self._require_callable("_display_model_name")
+        self.assertEqual(display("deepseek-v4-flash"), "deepseek-v4-flash")
+        self.assertEqual(display("wxbot/gpt-5.5"), "gpt-5.5")
+        self.assertEqual(display(""), "openclaw:wxbot")
+
+    def test_display_model_name_resolves_openclaw_route_from_config(self):
+        display = self._require_callable("_display_model_name")
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = os.path.join(tmp, "openclaw.json")
+            self._write_json(config_path, {
+                "agents": {
+                    "list": [{"id": "wxbot", "model": "wxbot/gpt-5.5"}],
+                    "defaults": {"model": {"primary": "bailian/qwen3.5-plus"}},
+                },
+            })
+            with mock.patch.object(app, "OPENCLAW_CONFIG_FILE", config_path, create=True):
+                self.assertEqual(display("openclaw:wxbot"), "gpt-5.5")
+                self.assertEqual(display("openclaw:unknown"), "qwen3.5-plus")
+
+    def test_wechat_system_prompt_uses_dynamic_model(self):
+        self.assertIn("{model}", app.WECHAT_SYSTEM_PROMPT)
+        prompt = app.WECHAT_SYSTEM_PROMPT.format(model="deepseek-v4-flash")
+        self.assertIn("当前使用 deepseek-v4-flash", prompt)
+
     def test_ai_answer_uses_active_session_key(self):
         with mock.patch.object(
             app,

@@ -171,7 +171,7 @@ WECHAT_SYSTEM_PROMPT = (
     "遇到新闻、人物动态、天气、赛事、活动、价格或其他需要核实最新信息的问题时，"
     "必须先使用网页工具搜索核实后再回答，不要回复无法确认，也不要让用户自己去查。"
     "不要展示工具调用过程、工具参数、来源链接或内部等待文本，直接给出核实后的结论。"
-    "如果用户问你是谁、基于什么智能体或运行环境，统一回答：我是 OpenClaw 智能体，当前使用 gpt-5.5。"
+    "如果用户问你是谁、基于什么智能体或运行环境，统一回答：我是 OpenClaw 智能体，当前使用 {model}。"
 )
 OPENCLAW_SEARCH_SYSTEM_PROMPT = (
     "你正在通过微信向用户回复。输出必须是适合微信聊天窗口的纯文本，不要使用 Markdown、"
@@ -2143,6 +2143,55 @@ def openclaw_chat(prompt, session_id="", cfg=None, timeout=60,
         )
 
 
+def _openclaw_agent_model(agent_id, path=None):
+    """从 OpenClaw 配置读取指定 agent 的模型 ID，用于展示真实模型名。"""
+    path = path or OPENCLAW_CONFIG_FILE
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+    except Exception:
+        return ""
+    if not isinstance(config, dict):
+        return ""
+    agents = config.get("agents")
+    if not isinstance(agents, dict):
+        return ""
+    for item in agents.get("list") or []:
+        if isinstance(item, dict) and item.get("id") == agent_id:
+            value = str(item.get("model") or "").strip()
+            if value:
+                return value
+    defaults = agents.get("defaults")
+    if isinstance(defaults, dict):
+        value = str((defaults.get("model") or {}).get("primary") or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _display_model_name(model):
+    """把配置里的模型 ID 转成用户可读名称：openclaw:wxbot 解析为 agent 实际模型。"""
+    model = str(model or "").strip()
+    if not model:
+        return "openclaw:wxbot"
+    if model.startswith("openclaw:"):
+        agent_id = model.split(":", 1)[1].strip()
+        resolved = _openclaw_agent_model(agent_id)
+        if resolved:
+            model = resolved
+    if "/" in model and not model.startswith("http"):
+        model = model.rsplit("/", 1)[-1]
+    return model or "openclaw:wxbot"
+
+
+def _wechat_system_prompt(model):
+    """微信默认系统提示词；模型名按配置动态注入，路由 ID 解析不出时不暴露。"""
+    display = _display_model_name(model)
+    if display and "openclaw:" not in display:
+        return WECHAT_SYSTEM_PROMPT.format(model=display)
+    return WECHAT_SYSTEM_PROMPT.replace("，当前使用 {model}", "")
+
+
 def _openclaw_chat_request(prompt, session_id="", cfg=None, timeout=60,
                            system_prompt=WECHAT_SYSTEM_PROMPT, sanitize=True):
     """通过 OpenClaw Gateway 问答；session_id 用于按微信用户维持连续会话。"""
@@ -2152,6 +2201,8 @@ def _openclaw_chat_request(prompt, session_id="", cfg=None, timeout=60,
     model = (claw.get("model") or "openclaw:wxbot").strip()
     if not base or not key:
         raise ValueError("OpenClaw 未配置：缺少 Gateway 地址或 token")
+    if system_prompt == WECHAT_SYSTEM_PROMPT:
+        system_prompt = _wechat_system_prompt(model)
     url = base if base.endswith("/chat/completions") else base + "/chat/completions"
     payload = {
         "model": model,
