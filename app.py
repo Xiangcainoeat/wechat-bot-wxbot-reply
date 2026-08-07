@@ -2436,10 +2436,14 @@ def ai_answer(prompt, session_id=""):
 
 
 def _openclaw_session_by_key(session_key):
-    """按完整 Gateway session key 查找会话记录（含 transcript）。"""
+    """按 Gateway session key 查找会话记录（含 transcript），兼容裸 key 与带前缀 key。"""
+    session_key = str(session_key or "")
+    wanted = session_key
+    if not wanted.startswith(_OPENCLAW_INDEX_PREFIX):
+        wanted = _OPENCLAW_INDEX_PREFIX + wanted
     result = openclaw_parse_sessions_index()
     for item in result.get("sessions", []):
-        if item.get("_session_key") == session_key:
+        if item.get("_session_key") == wanted:
             return item
     return None
 
