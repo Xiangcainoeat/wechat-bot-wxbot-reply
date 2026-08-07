@@ -2016,6 +2016,14 @@ def public_openclaw_config(claw):
 def clean_wechat_reply(text):
     """清掉模型偶尔输出的 Markdown 装饰和 emoji，保留适合微信的纯文本。"""
     text = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    # 网关直连时模型可能把工具调用/推理文本以 DSML 全角反斜杠标签原样返回。
+    # 按 参数→调用→调用块→通用成对→自闭合→残留行 逐层剥除，防止工具文本泄漏。
+    text = re.sub(r"(?is)<\uff5c\uff5cDSML\uff5c\uff5cparameter\b[^>]*>.*?</\uff5c\uff5cDSML\uff5c\uff5cparameter\s*>", "", text)
+    text = re.sub(r"(?is)<\uff5c\uff5cDSML\uff5c\uff5cinvoke\b[^>]*>.*?</\uff5c\uff5cDSML\uff5c\uff5cinvoke\s*>", "", text)
+    text = re.sub(r"(?is)<\uff5c\uff5cDSML\uff5c\uff5ctool_calls\b[^>]*>.*?</\uff5c\uff5cDSML\uff5c\uff5ctool_calls\s*>", "", text)
+    text = re.sub(r"(?is)<\uff5c\uff5cDSML\uff5c\uff5c[a-z_]+(?:\s+[^>]*)?>.*?</\uff5c\uff5cDSML\uff5c\uff5c[a-z_]+\s*>", "", text)
+    text = re.sub(r"(?is)<\uff5c\uff5cDSML\uff5c\uff5c[a-z_]+(?:\s+[^>]*)?/>", "", text)
+    text = re.sub(r"(?m)^[ \t]*[^\n]*\uff5c\uff5cDSML\uff5c\uff5c[^\n]*(?:\n|$)", "", text)
     text = re.sub(r"(?is)<tool_calls>.*?</tool_calls>", "", text)
     text = re.sub(r"(?is)<parameter\b[^>]*>.*?</parameter>", "", text)
     text = re.sub(r"(?m)^[ \t]*<[ /]?(?:invoke|parameter|result)\b[^>]*>.*(?:\n|$)", "", text)
@@ -2373,6 +2381,8 @@ def _looks_evasive_reply(text):
     text = str(text or "")
     if "<tool_calls" in text or "<invoke name=" in text or "<parameter name=" in text:
         return True
+    if re.search(r"<\uff5c\uff5cDSML\uff5c\uff5c(?:tool_calls|invoke|parameter|result)\b", text):
+        return True
     return any(marker in text for marker in _EVASIVE_MARKERS)
 
 
@@ -2389,7 +2399,8 @@ def _openclaw_search_retry(prompt, key, cfg, original, compose=True):
                     session_id="compose:" + key, cfg=cfg,
                     system_prompt=OPENCLAW_COMPOSE_SYSTEM_PROMPT, timeout=40,
                 )
-                if answer and not _looks_evasive_reply(answer):
+                if (answer and "（没有返回内容）" not in answer
+                        and not _looks_evasive_reply(answer)):
                     return answer
             except Exception:
                 pass

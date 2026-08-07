@@ -13,6 +13,10 @@ import urllib.request
 import app
 
 
+# OpenClaw 网关直连时模型可能返回的 DSML 全角反斜杠标签（U+FF5C）前缀
+BS = "\uff5c\uff5c"
+
+
 class _OpenClawHandler(BaseHTTPRequestHandler):
     request_data = None
     request_auth = None
@@ -1012,6 +1016,12 @@ class OpenClawTests(unittest.TestCase):
         self.assertTrue(detect("我查一下王者荣耀明天的最新活动信息。"))
         self.assertTrue(detect("需要查一下最新公告才能确认，稍等。"))
         self.assertTrue(detect("<tool_calls>\n<invoke name=\"session_status\">\n<parameter name=\"action\" value=\"status\"/>\n</invoke>\n</tool_calls>"))
+        dsml = ("<" + BS + "DSML" + BS + "tool_calls>\n"
+                "<" + BS + "DSML" + BS + "invoke name=\"browser_text\">\n"
+                "<" + BS + "DSML" + BS + "parameter name=\"query\" string=\"true\">王者荣耀 明天 活动 2025</" + BS + "DSML" + BS + "parameter>\n"
+                "</" + BS + "DSML" + BS + "invoke>\n"
+                "</" + BS + "DSML" + BS + "tool_calls>")
+        self.assertTrue(detect(dsml))
 
     def test_clean_wechat_reply_strips_tool_call_markup(self):
         clean = self._require_callable("clean_wechat_reply")
@@ -1030,6 +1040,29 @@ class OpenClawTests(unittest.TestCase):
                        "<parameter name=\"cmd\" string=\"true\">curl -s x | grep y</parameter>\n"
                        "</invoke>\n</tool_calls>\n答案")
         self.assertEqual(inline.strip(), "答案")
+        dsml = ("<" + BS + "DSML" + BS + "tool_calls>\n"
+                "<" + BS + "DSML" + BS + "invoke name=\"browser_text\">\n"
+                "<" + BS + "DSML" + BS + "parameter name=\"caller\" string=\"true\">search</" + BS + "DSML" + BS + "parameter>\n"
+                "<" + BS + "DSML" + BS + "parameter name=\"query\" string=\"true\">王者荣耀 明天 活动 2025</" + BS + "DSML" + BS + "parameter>\n"
+                "</" + BS + "DSML" + BS + "invoke>\n"
+                "</" + BS + "DSML" + BS + "tool_calls>\n根据资料，明天是夏日农友节开启日。")
+        result = clean(dsml)
+        self.assertNotIn("DSML", result)
+        self.assertNotIn(BS, result)
+        self.assertIn("夏日农友节", result)
+        result = clean("<" + BS + "DSML" + BS + "tool_calls>\n"
+                       "<" + BS + "DSML" + BS + "parameter name=\"action\" value=\"status\"/>\n"
+                       "</" + BS + "DSML" + BS + "tool_calls>\n答案")
+        self.assertNotIn("DSML", result)
+        self.assertEqual(result.strip(), "答案")
+        generic = clean("<" + BS + "DSML" + BS + "ear>先获取当前日期，"
+                        "再搜索王者荣耀明天的具体活动时间。</" + BS + "DSML" + BS + "ear>答案")
+        self.assertNotIn("DSML", generic)
+        self.assertNotIn("先获取当前日期", generic)
+        self.assertEqual(generic.strip(), "答案")
+        inline = clean("答案<" + BS + "DSML" + BS + "parameter name=\"x\" value=\"y\"/>结束")
+        self.assertNotIn("DSML", inline)
+        self.assertEqual(inline.strip(), "答案结束")
 
     def test_ai_answer_falls_back_when_raw_reply_is_tool_call(self):
         ai_answer = self._require_callable("ai_answer")
@@ -1055,6 +1088,36 @@ class OpenClawTests(unittest.TestCase):
         self.assertIn("夏日农友节", result)
         self.assertNotIn("<tool_calls>", result)
         self.assertNotIn("<invoke", result)
+        self.assertEqual(chat.call_count, 2)
+
+    def test_ai_answer_falls_back_when_raw_reply_is_dsml_tool_call(self):
+        ai_answer = self._require_callable("ai_answer")
+        bs = "\uff5c\uff5c"
+        dsml = ("<" + bs + "DSML" + bs + "tool_calls>\n"
+                "<" + bs + "DSML" + bs + "invoke name=\"exec\">\n"
+                "<" + bs + "DSML" + bs + "parameter name=\"cmd\" string=\"true\">curl x</" + bs + "DSML" + bs + "parameter>\n"
+                "</" + bs + "DSML" + bs + "invoke>\n"
+                "</" + bs + "DSML" + bs + "tool_calls>")
+        with mock.patch.object(
+            app, "openclaw_config",
+            return_value={"enabled": True, "base_url": "http://127.0.0.1:18788/v1",
+                          "api_key": "k", "model": "openclaw:wxbot"},
+        ), mock.patch.object(
+            app, "openclaw_active_key", return_value="wx-user",
+        ), mock.patch.object(
+            app, "local_web_search",
+            return_value="1. 夏日农友节\n   8月8日开启",
+        ), mock.patch.object(
+            app, "openclaw_chat", side_effect=[
+                dsml,
+                "明天是夏日农友节开启日，可领暴击夺宝券。",
+            ],
+        ) as chat:
+            result = ai_answer("王者明天活动")
+
+        self.assertIn("夏日农友节", result)
+        self.assertNotIn("DSML", result)
+        self.assertNotIn(bs, result)
         self.assertEqual(chat.call_count, 2)
 
     def test_looks_evasive_reply_ignores_normal_answers(self):
