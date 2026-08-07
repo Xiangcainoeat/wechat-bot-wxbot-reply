@@ -134,15 +134,28 @@ AI_NO_PERMISSION_MSG = (
 )
 AI_CMDS = ("/ai",)  # 需要授权的 AI 类命令（未来接入平台后把新命令加进来）
 
+# 未授权用户的自然语言，只有可能涉及功能时才值得调 AI 路由；纯闲聊直接提示开通
+FUNCTION_HINTS = (
+    "天气", "气温", "温度", "多少度", "度", "下雨", "降雨", "下雪", "雪", "风力", "风",
+    "推送", "提醒", "闹钟", "几点", "多久", "时间", "明天", "后天", "今天", "日期", "星期", "几号",
+    "搜索", "查询", "查", "比赛", "新闻", "比分", "赛程", "排位", "股市", "汇率",
+    "记账", "账", "余额", "明细", "清空", "计算", "算", "等于", "多少", "什么", "谁",
+    "哪里", "怎么", "为什么", "能不能", "会不会", "可以吗", "帮我", "给我",
+)
+
+
+def _looks_functional(text):
+    return any(k in text for k in FUNCTION_HINTS)
+
 FALLBACK_HELP = (
     "我支持这些功能（群里请先 @我 再发）：\n"
     "1. 计算：直接发算式，如 12×8-4\n"
-    "2. 记账：/记账 +100（收入）、/记账 -30（支出）\n"
+    "2. 记账：/记账 +100、/记账 -30\n"
     "3. 记账查询：/余额、/明细、/清空\n"
     "4. 提醒：/提醒 10分钟后 喝水\n"
     "5. 天气：直接说“上海天气”；/推送 8:00 每天自动推\n"
-    "6. 搜索：/搜索 今天有什么比赛\n"
-    "7. AI 问答：/ai 你的问题（需 /权限 <密码> 开通）\n"
+    "6. 搜索：直接说“今天有什么比赛”\n"
+    "7. AI 问答：直接问我问题（需 /权限 <密码> 开通）\n"
     "8. 详细说明：/说明"
 )
 
@@ -150,15 +163,15 @@ DETAIL_HELP = (
     "功能说明（群里请先 @我 再发）：\n"
     "1. 计算：直接发算式，支持 + - × ÷ 括号、小数。例：12×8-4、10÷(2+3)\n"
     "2. 记账：必须用 + 或 - 开头（AI 不会代记）：\n"
-    "   /记账 +8×4 记收入 32；/记账 -15×2 记支出 30；备注：/记账 +100 买菜\n"
+    "   /记账 +8×4；/记账 -15×2；可加备注：/记账 +100 买菜\n"
     "3. 记账查询：/余额 看余额和笔数；/明细 看全部记录；/清空 清空记录\n"
     "4. 提醒：/提醒 <时间> <内容>，或直接说“10分钟后提醒我喝水”\n"
     "   时间支持：10分钟后 / 2小时后 / 14:30 / 9点 / 明天9点\n"
     "   群聊提醒会 @ 你，私聊提醒直接发消息\n"
     "5. 每日天气推送：/推送 <时间>（如 /推送 8:00），会引导确认城市\n"
     "   可设置多条；/取消推送 [编号] 取消\n"
-    "6. 联网搜索：/搜索 <内容>，如：/搜索 今天有什么比赛\n"
-    "7. AI 问答：/ai <问题>，可查天气、时间、联网搜索\n"
+    "6. 联网搜索：直接说“今天有什么比赛”“查一下最近的新闻”\n"
+    "7. AI 问答：直接问我问题，可查天气、时间、联网搜索\n"
     "   需先 /权限 <密码> 开通（密码由机器人主人提供）\n"
     "8. 自然语言：说大白话也能唤起功能，如“上海天气”“提醒我10分钟后喝水”\n"
     "   记账除外：账本必须用 /记账 + / - 精确格式，AI 不会代记"
@@ -1661,21 +1674,6 @@ ROUTE_TOOLS = [
             "parameters": {"type": "object", "properties": {}}
         }
     },
-    {
-        "type": "function",
-        "function": {
-            "name": "chat_answer",
-            "description": "普通闲聊、寒暄或与功能无关的问答。"
-                           "注意：查天气/设提醒/记账/搜索/计算请调用对应工具，不要用本工具代替。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "question": {"type": "string", "description": "用户的问题或话题"}
-                },
-                "required": ["question"]
-            }
-        }
-    }
 ]
 
 LEDGER_FORMAT_HINT = (
@@ -1744,7 +1742,15 @@ def ai_route(text, timeout=30):
     url = base if base.endswith("/chat/completions") else base + "/chat/completions"
     payload = {
         "model": model,
-        "messages": [{"role": "user", "content": text}],
+        "messages": [
+            {"role": "system", "content": (
+                "你是微信机器人，负责判断用户意图并调用功能。规则：\n"
+                "1. 明确的功能请求（设置提醒/每日天气推送/查天气/联网搜索/计算/记账）→ 调用对应工具并填好参数；\n"
+                "2. 只提到天气但没说城市 → 调用 get_weather，city 留空；\n"
+                "3. 闲聊、寒暄、与功能无关的问答 → 不要调用任何工具，直接在 content 里用一句话简短自然地回复。"
+            )},
+            {"role": "user", "content": text},
+        ],
         "tools": ROUTE_TOOLS,
         "tool_choice": "auto",
         "stream": False,
@@ -1785,7 +1791,7 @@ def ai_route(text, timeout=30):
     tcs = msg.get("tool_calls") or []
     if not tcs:
         content = (msg.get("content") or "").strip()
-        return "chat_answer", {"question": content or text}
+        return "chat_answer", {"question": text, "_direct": content}
     tc = tcs[0]
     name = tc.get("function", {}).get("name") or ""
     try:
@@ -1886,6 +1892,9 @@ def dispatch_route(tool, args, text, from_id, from_name, room_id, room_name, rou
             route_pending_clear(from_id)
             if not is_allowed(from_id):
                 return AI_NO_PERMISSION_MSG
+            direct = (args.get("_direct") or "").strip()
+            if direct:
+                return "🤖 " + direct
             q = (args.get("question") or text or "").strip()
             return "🤖 " + ai_chat(q)
     except Exception as e:
@@ -1902,6 +1911,9 @@ def smart_fallback(text, from_id, from_name, room_id, room_name, cfg):
     text = (text or "").strip()
     if len(text) < 2:
         return None
+    # 未授权用户：只有可能涉及功能的消息才调 AI 路由，纯闲聊直接提示开通，省一次 AI 调用
+    if not is_allowed(from_id) and not _looks_functional(text):
+        return AI_NO_PERMISSION_MSG
     pending = route_pending_get(from_id)
     if pending:
         if pending.get("rounds", 1) >= 3:
@@ -2326,7 +2338,7 @@ a.link{color:#2f6fed;font-size:15px}
 <div id="tab-users" class="tab">
   <div class="panel">
     <h3>授权用户（授权后才能用 AI；未授权仍可用基础功能）</h3>
-    <div class="sub" style="font-size:15px">规则：所有人可用 计算 / 记账 / 余额 / 明细 / 提醒 / 说明；只有已授权用户能用 /ai 等 AI 功能（授权/取消在下方表格操作）。</div>
+    <div class="sub" style="font-size:15px">规则：所有人可用 计算 / 记账 / 余额 / 明细 / 提醒 / 说明；只有已授权用户能使用 AI 问答（授权/取消在下方表格操作）。</div>
     <div id="user-list">-</div>
   </div>
   <div class="panel">
@@ -2343,7 +2355,7 @@ a.link{color:#2f6fed;font-size:15px}
 
 <div id="tab-ai" class="tab">
   <div class="panel">
-    <h3>AI 接口配置（供 /ai 命令使用，OpenAI 兼容格式）</h3>
+    <h3>AI 接口配置（OpenAI 兼容格式）</h3>
     <form class="inline" onsubmit="event.preventDefault();saveAI()">
       <label>接口地址 Base URL（如 https://api.deepseek.com 或 https://你的网关/v1）</label>
       <input type="text" id="ai-base" placeholder="https://api.example.com" autocomplete="off">
@@ -2359,7 +2371,7 @@ a.link{color:#2f6fed;font-size:15px}
         <button class="btn2" type="button" onclick="testAI()">测试连接</button>
         <span id="ai-result" style="font-size:15px;color:#666;word-break:break-all"></span>
       </div>
-      <div class="dim" style="font-size:14px">保存后机器人在微信里发 /ai 内容 即可使用；AI 为单次问答，不携带上下文。</div>
+      <div class="dim" style="font-size:14px">保存后可直接 @机器人 提问使用；AI 为单次问答，不携带上下文。</div>
     </form>
   </div>
 </div>
@@ -2806,7 +2818,7 @@ class Handler(BaseHTTPRequestHandler):
                     rec = json.loads(ln)
                 except Exception:
                     continue
-                if rec.get("type") == "text" and (rec.get("content") or "").strip().startswith("/ai"):
+                if rec.get("type") == "text" and (rec.get("reply") or "").strip().startswith("🤖"):
                     fid = rec.get("fromId") or ""
                     st = ai_stats.setdefault(fid, {"count": 0, "last": ""})
                     st["count"] += 1
