@@ -910,7 +910,7 @@ class OpenClawTests(unittest.TestCase):
         active.assert_called_once_with("wx-user")
         self.assertEqual(chat.call_args.kwargs["session_id"], "wx-user:session:new")
 
-    def test_compact_command_rewrites_current_transcript_in_place(self):
+    def test_compact_uses_gateway_native_compaction_in_place(self):
         compact = self._require_callable("openclaw_compact_session")
         item = {"_transcript": [
             {"role": "user", "content": "你好，记住我喜欢蓝色"},
@@ -919,34 +919,64 @@ class OpenClawTests(unittest.TestCase):
             {"role": "assistant", "content": "蓝色。"},
         ]}
         cfg = {"enabled": True, "base_url": "http://127.0.0.1:18788/v1", "api_key": "k"}
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "t.jsonl")
-            with open(path, "w", encoding="utf-8") as f:
-                f.write('{"type":"session","id":"s0","timestamp":"t"}\n')
-                f.write('{"type":"model_change","id":"m0","parentId":null,"timestamp":"t"}\n')
-                f.write('{"type":"message","id":"u1","parentId":"m0","message":{"role":"user","content":[{"type":"text","text":"你好"}]}}\n')
-                f.write('{"type":"message","id":"a1","parentId":"u1","message":{"role":"assistant","content":[{"type":"text","text":"你好"}]}}\n')
-                f.write('{"type":"message","id":"u2","parentId":"a1","message":{"role":"user","content":[{"type":"text","text":"颜色"}]}}\n')
-                f.write('{"type":"message","id":"a2","parentId":"u2","message":{"role":"assistant","content":[{"type":"text","text":"蓝色"}]}}\n')
-            with mock.patch.object(app, "openclaw_active_key", return_value="wx-user"), \
-                 mock.patch.object(app, "_openclaw_session_by_key", return_value=item), \
-                 mock.patch.object(app, "_openclaw_transcript_file_for_key",
-                                   return_value=(path, "sid", {})), \
-                 mock.patch.object(app, "openclaw_config", return_value=cfg), \
-                 mock.patch.object(app, "openclaw_chat", return_value="用户喜欢蓝色，明天去上海。") as chat:
-                reply = compact("wx-user")
+        with mock.patch.object(app, "openclaw_active_key", return_value="wx-user"), \
+             mock.patch.object(app, "_openclaw_session_by_key", return_value=item), \
+             mock.patch.object(app, "openclaw_config", return_value=cfg), \
+             mock.patch.object(app, "openclaw_chat",
+                               return_value="用户喜欢蓝色，明天去上海。") as chat, \
+             mock.patch.object(app, "_openclaw_gateway_rpc",
+                               side_effect=[{"ok": True, "compacted": True, "kept": 2},
+                                            {"ok": True, "messageId": "injected-1"}]) as rpc:
+            reply = compact("wx-user")
 
-            self.assertIn("已压缩上下文", reply)
-            self.assertEqual(chat.call_args_list[0].kwargs["session_id"], "compose:wx-user")
-            self.assertEqual(chat.call_count, 1)
-            with open(path, "r", encoding="utf-8") as f:
-                content = f.read()
-            self.assertNotIn('"u1"', content)
-            self.assertNotIn("我喜欢的颜色是什么", content)
-            self.assertIn("用户喜欢蓝色，明天去上海。", content)
-            self.assertIn('"type": "compaction"', content)
-            backups = [fn for fn in os.listdir(tmp) if fn.startswith("t.jsonl.bak-")]
-            self.assertEqual(len(backups), 1)
+        self.assertIn("已压缩上下文", reply)
+        self.assertEqual(chat.call_count, 1)
+        self.assertTrue(chat.call_args_list[0].kwargs["session_id"].startswith("compose:wx-user:"))
+        self.assertEqual(rpc.call_count, 2)
+        compact_method, compact_params = rpc.call_args_list[0].args[:2]
+        self.assertEqual(compact_method, "sessions.compact")
+        self.assertEqual(compact_params, {"key": "wx-user", "maxLines": 2})
+        inject_method, inject_params = rpc.call_args_list[1].args[:2]
+        self.assertEqual(inject_method, "chat.inject")
+        self.assertEqual(inject_params["sessionKey"], "wx-user")
+        self.assertEqual(inject_params["label"], "compaction-summary")
+        self.assertIn("用户喜欢蓝色，明天去上海。", inject_params["message"])
+        self.assertIn("【历史对话压缩摘要】", inject_params["message"])
+        with app.OPENCLAW_USAGE_LOCK:
+            self.assertNotIn("wx-user", app._OPENCLAW_LAST_USAGE)
+
+    def test_compact_fails_when_gateway_compact_fails(self):
+        compact = self._require_callable("openclaw_compact_session")
+        item = {"_transcript": [
+            {"role": "user", "content": "你好"},
+            {"role": "assistant", "content": "你好，有什么可以帮你？"},
+        ]}
+        cfg = {"enabled": True, "base_url": "http://127.0.0.1:18788/v1", "api_key": "k"}
+        with mock.patch.object(app, "openclaw_active_key", return_value="wx-user"), \
+             mock.patch.object(app, "_openclaw_session_by_key", return_value=item), \
+             mock.patch.object(app, "openclaw_config", return_value=cfg), \
+             mock.patch.object(app, "openclaw_chat", return_value="摘要内容"), \
+             mock.patch.object(app, "_openclaw_gateway_rpc",
+                               return_value={"ok": False, "reason": "boom"}):
+            with self.assertRaises(ValueError):
+                compact("wx-user")
+
+    def test_gateway_rpc_parses_json_stdout(self):
+        rpc = self._require_callable("_openclaw_gateway_rpc")
+        with mock.patch.object(app, "openclaw_config",
+                               return_value={"enabled": True, "api_key": "tok"}), \
+             mock.patch.object(app.subprocess, "run") as run:
+            run.return_value.returncode = 0
+            run.return_value.stdout = '{"ok": true, "kept": 2}\n'
+            run.return_value.stderr = "Config warnings...\n"
+            result = rpc("sessions.compact", {"key": "k", "maxLines": 2}, timeout=30)
+        self.assertEqual(result, {"ok": True, "kept": 2})
+        cmd = run.call_args_list[0].args[0]
+        self.assertEqual(cmd[0:3], ["docker", "exec", "openclaw"])
+        self.assertIn("sessions.compact", cmd)
+        self.assertIn("--params", cmd)
+        self.assertIn("ws://127.0.0.1:18789", cmd)
+        self.assertIn("--json", cmd)
 
     def test_compact_skips_when_session_has_no_transcript(self):
         compact = self._require_callable("openclaw_compact_session")

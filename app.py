@@ -24,6 +24,7 @@ import hashlib
 import os
 import re
 import secrets
+import subprocess
 import threading
 import time
 import urllib.parse
@@ -68,6 +69,13 @@ OPENCLAW_TRANSCRIPT_DIR = os.environ.get(
 OPENCLAW_CONFIG_FILE = os.environ.get(
     "WXBOT_OPENCLAW_CONFIG_FILE",
     "/root/openclaw/openclaw_space/openclaw.json",
+)
+# 网关 WebSocket RPC（原生压缩/注入）通过 openclaw 容器 CLI 调用；地址与容器名可覆盖。
+OPENCLAW_GATEWAY_WS_URL = os.environ.get(
+    "WXBOT_OPENCLAW_GATEWAY_WS_URL", "ws://127.0.0.1:18789"
+)
+OPENCLAW_GATEWAY_CONTAINER = os.environ.get(
+    "WXBOT_OPENCLAW_GATEWAY_CONTAINER", "openclaw"
 )
 # 兼容部署脚本和外部诊断工具使用的旧常量名。
 OPENCLAW_SESSION_FILE = OPENCLAW_SESSIONS_FILE
@@ -2551,12 +2559,47 @@ def _rewrite_compacted_transcript(path, summary, message_count):
     os.replace(tmp, path)
 
 
-def openclaw_compact_session(user_id):
-    """真正压缩当前会话：把旧对话整理成摘要写回同一会话的 transcript（就地压缩）。
+def _openclaw_gateway_rpc(method, params=None, timeout=120):
+    """通过 openclaw 容器 CLI 调用 Gateway RPC 方法（sessions.compact / chat.inject 等）。
 
-    网关不拦截 /compact，由本应用读取当前会话转录 → 生成摘要 → 保留会话头部记录，
-    用「压缩事件 + 摘要用户消息」替换旧对话并归档旧 transcript。不切换、不新建会话，
-    后续消息上下文即为 系统提示 + 摘要，token 占用随之变小。
+    返回网关返回的 JSON 对象；失败抛出 ValueError。
+    """
+    claw = openclaw_config()
+    token = str(claw.get("api_key") or "").strip()
+    ws_url = str((claw.get("gateway_ws_url") or "").strip()
+                 or OPENCLAW_GATEWAY_WS_URL or "").strip()
+    container = str(OPENCLAW_GATEWAY_CONTAINER or "openclaw").strip()
+    if not token or not ws_url:
+        raise ValueError("OpenClaw 未配置：缺少 Gateway token 或 WebSocket 地址")
+    cmd = [
+        "docker", "exec", container, "openclaw", "gateway", "call", method,
+        "--url", ws_url, "--token", token, "--json",
+        "--timeout", str(max(1000, int(timeout * 1000))),
+    ]
+    if params:
+        cmd += ["--params", json.dumps(params, ensure_ascii=False)]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=int(timeout) + 30)
+    except Exception as e:
+        raise ValueError("Gateway RPC {} 调用失败: {}".format(method, e))
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        raise ValueError("Gateway RPC {} 失败: {}".format(
+            method, (detail[-1] if detail else "未知错误")[:300]))
+    out = (proc.stdout or "").strip()
+    try:
+        return json.loads(out)
+    except Exception:
+        raise ValueError("Gateway RPC {} 返回异常: {}".format(method, out[-300:]))
+
+
+def openclaw_compact_session(user_id):
+    """真正压缩当前会话：生成摘要 → 网关原生截断 transcript → 摘要写回同一会话（就地压缩）。
+
+    压缩不换会话、不切 key：先由网关 sessions.compact 把当前会话转录截断到最近对话
+    （旧转录归档、网关内存状态同步重置、token 统计清零），再用 chat.inject 把摘要
+    写回同一会话作为后续回答依据。压缩后同一会话的上下文占用显著变小。
     """
     user_id = str(user_id or "").strip()
     key = openclaw_active_key(user_id)
@@ -2564,21 +2607,21 @@ def openclaw_compact_session(user_id):
         raise ValueError("缺少微信用户会话")
     claw = openclaw_config()
     item = _openclaw_session_by_key(key)
-    records = [r for r in (item or {}).get("_transcript") or [] if r.get("role") in ("user", "assistant")]
+    records = [r for r in (item or {}).get("_transcript") or []
+               if r.get("role") in ("user", "assistant")]
     if not item or len(records) < 2:
         return _with_context_status("当前会话内容很少，暂时不需要压缩。", key)
-    path, _session_id, _entry = _openclaw_transcript_file_for_key(key, claw)
-    if not path or not os.path.isfile(path):
-        raise ValueError("找不到当前会话的 transcript 文件")
     lines = []
     for rec in records:
         role = "用户" if rec.get("role") == "user" else "OpenClaw"
         lines.append("{}：{}".format(role, str(rec.get("content") or "").strip()))
     summary = ""
+    # 每次压缩用独立的一次性 compose 子会话生成摘要，避免 compose 历史无限膨胀
+    summary_session = "compose:" + key + ":" + secrets.token_hex(4)
     try:
         summary = openclaw_chat(
             "请把下面的微信对话记录压缩成一份简明摘要：\n\n" + "\n".join(lines),
-            session_id="compose:" + key, cfg=claw,
+            session_id=summary_session, cfg=claw,
             system_prompt=OPENCLAW_COMPACT_SYSTEM_PROMPT, timeout=40,
         )
     except Exception as e:
@@ -2586,7 +2629,29 @@ def openclaw_compact_session(user_id):
     summary = clean_wechat_reply(summary or "")
     if not summary or summary == "（没有返回内容）":
         raise ValueError("上下文摘要生成失败")
-    _rewrite_compacted_transcript(path, summary, len(records))
+    with _openclaw_session_lock(key):
+        # 1) 网关原生压缩：保留最近对话，归档旧转录，重置该会话 token 统计
+        compact = _openclaw_gateway_rpc(
+            "sessions.compact", {"key": key, "maxLines": 2}, timeout=60)
+        if not compact.get("ok"):
+            raise ValueError("网关上下文压缩失败: {}".format(
+                compact.get("reason") or compact.get("error") or "未知错误"))
+        # 2) 摘要写回同一会话（gateway 内部追加，不触发模型回复）
+        seed_text = (
+            "【历史对话压缩摘要】这是系统压缩旧对话后生成的记忆摘要，请长期记住并作为回答依据。"
+            "回答用户问题时结合这份摘要，不要主动复述这份摘要，也不要提及压缩过程。\n\n"
+            + summary
+        )
+        injected = _openclaw_gateway_rpc(
+            "chat.inject",
+            {"sessionKey": key, "message": seed_text, "label": "compaction-summary"},
+            timeout=30,
+        )
+        if not injected.get("ok"):
+            raise ValueError("摘要写回会话失败")
+        # 3) 丢弃压缩前的旧 usage 统计，后续消息显示压缩后的真实上下文
+        with OPENCLAW_USAGE_LOCK:
+            _OPENCLAW_LAST_USAGE.pop(str(key), None)
     return _with_context_status(
         "已压缩上下文：把之前 {} 条对话整理成摘要写回当前会话，后续对话从这里继续。".format(len(records)),
         key,
