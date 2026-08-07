@@ -2300,12 +2300,14 @@ def local_web_search(query, max_results=3):
         return ""
     lines = []
     seen = set()
+    n = 0
     for title, snippet, href in items:
         key = title[:40]
         if key in seen:
             continue
         seen.add(key)
-        lines.append("{} {}".format(len(lines) + 1, title))
+        n += 1
+        lines.append("{} {}".format(n, title))
         if snippet:
             lines.append("   {}".format(snippet))
     return "\n".join(lines)
@@ -2323,7 +2325,7 @@ def _openclaw_search_retry(prompt, key, cfg, original, retry_chat=True):
         try:
             retry = openclaw_chat(
                 prompt, session_id=key, cfg=cfg,
-                system_prompt=OPENCLAW_SEARCH_SYSTEM_PROMPT,
+                system_prompt=OPENCLAW_SEARCH_SYSTEM_PROMPT, timeout=40,
             )
             if not _looks_evasive_reply(retry):
                 return retry

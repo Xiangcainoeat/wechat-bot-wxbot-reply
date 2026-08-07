@@ -1097,6 +1097,22 @@ class OpenClawTests(unittest.TestCase):
             text = local_web_search("王者 夏日农友节")
         self.assertIn("夏日农友节内容一览", text)
         self.assertIn("8月8日来玩王者荣耀", text)
+        self.assertTrue(text.startswith("1 夏日农友节内容一览"))
+
+    def test_local_web_search_numbering_ignores_snippet_lines(self):
+        local_web_search = self._require_callable("local_web_search")
+        with mock.patch.object(
+            app, "_sogou_results",
+            return_value=[
+                ("标题一", "摘要一", "https://sogou.com/link?url=1"),
+                ("标题二", "摘要二", "https://sogou.com/link?url=2"),
+                ("标题三", "", "https://sogou.com/link?url=3"),
+            ],
+        ), mock.patch.object(app, "_bing_results", return_value=[]):
+            text = local_web_search("王者 夏日农友节")
+        self.assertIn("\n2 标题二", text)
+        self.assertIn("\n3 标题三", text)
+        self.assertNotIn("\n4 ", text)
 
 
 if __name__ == "__main__":
