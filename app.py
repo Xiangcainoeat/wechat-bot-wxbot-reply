@@ -28,6 +28,8 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+import base64
+import html
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -170,6 +172,23 @@ WECHAT_SYSTEM_PROMPT = (
     "必须先使用网页工具搜索核实后再回答，不要回复无法确认，也不要让用户自己去查。"
     "不要展示工具调用过程、工具参数、来源链接或内部等待文本，直接给出核实后的结论。"
     "如果用户问你是谁、基于什么智能体或运行环境，统一回答：我是 OpenClaw 智能体，当前使用 gpt-5.5。"
+)
+OPENCLAW_SEARCH_SYSTEM_PROMPT = (
+    "你正在通过微信向用户回复。输出必须是适合微信聊天窗口的纯文本，不要使用 Markdown、"
+    "加粗符号、反引号、井号标题、表格、项目符号或 emoji，用短段落和简单的数字编号表达，控制长度。"
+    "用户的问题需要核实最新信息：必须立即调用网页搜索工具搜索核实后再回答，"
+    "直接把核实到的内容发给用户，给出具体结论。"
+    "绝对不要回复无法确认、没看到、没找到，也不要建议用户自己去查；"
+    "不要展示工具调用过程、工具参数、来源链接或内部等待文本。"
+)
+# 敷衍回答标记：命中任一即认为 OpenClaw 没有真正搜索/回答问题。
+_EVASIVE_MARKERS = (
+    "无法确认", "没法确认", "无法实时确认", "不能确认", "无法核实", "无法实时核实",
+    "没看到", "没有看到", "没找到", "没有搜到", "没搜到", "未找到", "未搜到",
+    "暂未发现", "尚未官宣", "暂未官宣", "还没官宣",
+    "自己去查", "自己查", "自行查询", "自己去搜", "自己搜",
+    "以游戏内活动中心为准", "以游戏内为准", "以官方为准", "以实际为准",
+    "看官方微博", "关注官方微博", "官方微博和公众号", "官方公众号", "官方微博或公众号",
 )
 AI_CMDS = ("/ai", "/搜索", "/search")  # 需要授权的 OpenClaw 类命令
 SESSION_COMMANDS = {
@@ -2173,13 +2192,158 @@ def _openclaw_chat_request(prompt, session_id="", cfg=None, timeout=60,
     return clean_wechat_reply(content) or "（没有返回内容）"
 
 
+# ---------------- 本地搜索兜底（搜狗→Bing，无需 API key） ----------------
+_SEARCH_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120 Safari/537.36"
+)
+
+
+def _fetch_search_html(url, timeout=15):
+    req = urllib.request.Request(url, headers={
+        "User-Agent": _SEARCH_UA,
+        "Accept-Language": "zh-CN,zh;q=0.9",
+    })
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read().decode("utf-8", "ignore")
+
+
+def _sogou_results(query, max_results=3):
+    """搜狗网页搜索（中文覆盖好，偶发验证页返回空）。返回 [(标题, 摘要, URL)]。"""
+    url = "https://www.sogou.com/web?query=" + urllib.parse.quote(query)
+    body = _fetch_search_html(url)
+    items = []
+    for m in re.finditer(r'<h3[^>]*>\s*<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>', body, re.S):
+        title = html.unescape(re.sub(r"<[^>]+>", "", m.group(2))).strip()
+        if not title:
+            continue
+        href = html.unescape(m.group(1)).strip()
+        tail = body[m.end():m.end() + 4000]
+        snippet = ""
+        for pat in (
+            r'<div[^>]*class="[^"]*(?:str_info|space-txt|fz-mid|text-layout|fz-text)[^"]*"[^>]*>(.*?)</div>',
+            r'<p[^>]*class="[^"]*str_info[^"]*"[^>]*>(.*?)</p>',
+        ):
+            sm = re.search(pat, tail, re.S)
+            if sm:
+                snippet = html.unescape(re.sub(r"<[^>]+>", " ", sm.group(1)))
+                snippet = re.sub(r"\s+", " ", snippet).strip()
+                break
+        items.append((title, snippet, href))
+        if len(items) >= max_results:
+            break
+    return items
+
+
+def _bing_real_url(href):
+    """Bing 结果链接是跳转地址，解析 u= 参数还原真实 URL。"""
+    try:
+        m = re.search(r"[?&]u=([A-Za-z0-9_\-=%]+)", href or "")
+        if not m:
+            return href
+        b = m.group(1).replace("%3D", "=")
+        if b.startswith("a1"):
+            b = b[2:]
+        b += "=" * (-len(b) % 4)
+        u = urllib.parse.unquote(
+            base64.urlsafe_b64decode(b.encode("utf-8")).decode("utf-8", "ignore"))
+        return u if u.startswith("http") else href
+    except Exception:
+        return href
+
+
+def _bing_results(query, max_results=3):
+    """Bing 网页搜索（无需 key，稳定但中文覆盖一般）。返回 [(标题, 摘要, URL)]。"""
+    url = ("https://cn.bing.com/search?q=" + urllib.parse.quote(query)
+           + "&setlang=zh-hans&count=10")
+    body = _fetch_search_html(url)
+    items = []
+    for m in re.finditer(r'<li class="b_algo".*?</li>', body, re.S):
+        block = m.group(0)
+        hm = re.search(r'<h2[^>]*>\s*<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>', block, re.S)
+        if not hm:
+            continue
+        title = html.unescape(re.sub(r"<[^>]+>", "", hm.group(2))).strip()
+        if not title:
+            continue
+        pm = re.search(r"<p[^>]*>(.*?)</p>", block, re.S)
+        snippet = ""
+        if pm:
+            snippet = html.unescape(re.sub(r"<[^>]+>", "", pm.group(1))).strip()
+        href = _bing_real_url(html.unescape(hm.group(1)))
+        items.append((title, snippet, href))
+        if len(items) >= max_results:
+            break
+    return items
+
+
+def local_web_search(query, max_results=3):
+    """搜狗→Bing 本地搜索兜底；返回格式化纯文本，无结果返回空串。"""
+    query = re.sub(r"@\S+\s*", "", str(query or "")).strip()
+    if not query:
+        return ""
+    items = []
+    try:
+        items = _sogou_results(query, max_results)
+        if not items:  # 搜狗偶发验证页，重试一次
+            items = _sogou_results(query, max_results)
+    except Exception:
+        items = []
+    if not items:
+        try:
+            items = _bing_results(query, max_results)
+        except Exception:
+            items = []
+    if not items:
+        return ""
+    lines = []
+    seen = set()
+    for title, snippet, href in items:
+        key = title[:40]
+        if key in seen:
+            continue
+        seen.add(key)
+        lines.append("{} {}".format(len(lines) + 1, title))
+        if snippet:
+            lines.append("   {}".format(snippet))
+    return "\n".join(lines)
+
+
+def _looks_evasive_reply(text):
+    """判断 OpenClaw 回复是否为“无法确认/建议自己查”式敷衍回答。"""
+    text = str(text or "")
+    return any(marker in text for marker in _EVASIVE_MARKERS)
+
+
+def _openclaw_search_retry(prompt, key, cfg, original):
+    """OpenClaw 回复敷衍时：用强制搜索提示词重试一次，仍不行则本地搜索兜底。"""
+    try:
+        retry = openclaw_chat(
+            prompt, session_id=key, cfg=cfg,
+            system_prompt=OPENCLAW_SEARCH_SYSTEM_PROMPT,
+        )
+        if not _looks_evasive_reply(retry):
+            return retry
+    except Exception:
+        pass
+    try:
+        results = local_web_search(prompt)
+        if results:
+            return "AI 搜索通道暂时不稳定，已用本地搜索兜底，直接给你搜到的结果：\n" + results
+    except Exception:
+        pass
+    return original
+
+
 def ai_answer(prompt, session_id=""):
-    """所有微信 AI 问答统一使用 OpenClaw。"""
+    """所有微信 AI 问答统一使用 OpenClaw；敷衍/失败时强制搜索重试并本地搜索兜底。"""
     claw = openclaw_config()
     enabled = claw.get("enabled", False)
     if enabled and claw.get("base_url") and claw.get("api_key"):
         key = openclaw_active_key(session_id) if session_id else ""
         reply = openclaw_chat(prompt, session_id=key, cfg=claw)
+        if _looks_evasive_reply(reply):
+            reply = _openclaw_search_retry(prompt, key, claw, reply)
         return _with_context_status(reply, key) if key else reply
     raise ValueError("OpenClaw 未配置：请启用 Gateway 并填写地址和 token")
 

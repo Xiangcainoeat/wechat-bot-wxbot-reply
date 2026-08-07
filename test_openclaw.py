@@ -996,6 +996,86 @@ class OpenClawTests(unittest.TestCase):
         start_new.assert_called_once()
         self.assertNotIn(fixture["user_id"], json.dumps(payload, ensure_ascii=False))
 
+    def test_looks_evasive_reply_detects_evasive_patterns(self):
+        detect = self._require_callable("_looks_evasive_reply")
+        self.assertTrue(detect("我没看到官方提前官宣，以游戏内活动中心为准。"))
+        self.assertTrue(detect("我现在没法实时确认，你可以自己去查。"))
+        self.assertTrue(detect("暂未官宣，建议你关注官方微博和公众号。"))
+
+    def test_looks_evasive_reply_ignores_normal_answers(self):
+        detect = self._require_callable("_looks_evasive_reply")
+        self.assertFalse(detect("明天 8月8日 有无双祈愿活动，8月8日开启。"))
+        self.assertFalse(detect("今天上海晴到多云，28 度。"))
+
+    def test_ai_answer_retries_with_force_search_when_evasive(self):
+        ai_answer = self._require_callable("ai_answer")
+        with mock.patch.object(
+            app, "openclaw_config",
+            return_value={"enabled": True, "base_url": "http://127.0.0.1:18788/v1",
+                          "api_key": "k", "model": "wxbot/gpt-5.5"},
+        ), mock.patch.object(
+            app, "openclaw_active_key", return_value="wx-user",
+        ), mock.patch.object(
+            app, "local_web_search", return_value="",
+        ) as local_search, mock.patch.object(
+            app, "openclaw_chat", side_effect=[
+                "我没看到相关公告，你可以自己去查。",
+                "明天 8月8日 有无双祈愿活动，8月8日开启。",
+            ],
+        ) as chat:
+            result = ai_answer("王者明天抽奖活动")
+
+        self.assertIn("无双祈愿", result)
+        self.assertNotIn("我没看到", result)
+        self.assertEqual(chat.call_count, 2)
+        self.assertNotEqual(
+            chat.call_args_list[1].kwargs.get("system_prompt"),
+            app.WECHAT_SYSTEM_PROMPT,
+        )
+        local_search.assert_not_called()
+
+    def test_ai_answer_falls_back_to_local_search_when_retry_evasive(self):
+        ai_answer = self._require_callable("ai_answer")
+        with mock.patch.object(
+            app, "openclaw_config",
+            return_value={"enabled": True, "base_url": "http://127.0.0.1:18788/v1",
+                          "api_key": "k", "model": "wxbot/gpt-5.5"},
+        ), mock.patch.object(
+            app, "openclaw_active_key", return_value="wx-user",
+        ), mock.patch.object(
+            app, "local_web_search",
+            return_value="1. 夏日农友节内容一览\n   8月8日来玩王者荣耀",
+        ) as local_search, mock.patch.object(
+            app, "openclaw_chat", return_value="我没看到官方公告，建议你自己去查。",
+        ) as chat:
+            result = ai_answer("王者明天抽奖活动")
+
+        self.assertIn("夏日农友节", result)
+        self.assertIn("本地搜索", result)
+        self.assertEqual(chat.call_count, 2)
+        local_search.assert_called_once()
+
+    def test_local_web_search_uses_sogou_then_bing_fallback(self):
+        local_web_search = self._require_callable("local_web_search")
+        with mock.patch.object(app, "_sogou_results", return_value=[]), \
+             mock.patch.object(
+                 app, "_bing_results",
+                 return_value=[("Bing 标题", "Bing 摘要", "https://example.com/x")],
+             ):
+            text = local_web_search("@kindle 王者 夏日农友节")
+        self.assertIn("Bing 标题", text)
+        self.assertIn("Bing 摘要", text)
+
+    def test_local_web_search_formats_sogou_results(self):
+        local_web_search = self._require_callable("local_web_search")
+        with mock.patch.object(
+            app, "_sogou_results",
+            return_value=[("夏日农友节内容一览", "8月8日来玩王者荣耀", "https://sogou.com/link?url=x")],
+        ), mock.patch.object(app, "_bing_results", return_value=[]):
+            text = local_web_search("王者 夏日农友节")
+        self.assertIn("夏日农友节内容一览", text)
+        self.assertIn("8月8日来玩王者荣耀", text)
+
 
 if __name__ == "__main__":
     unittest.main()
