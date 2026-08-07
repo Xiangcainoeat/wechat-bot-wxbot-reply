@@ -544,7 +544,7 @@ def _openclaw_user_from_key(key):
     if not key.startswith(_OPENCLAW_INDEX_PREFIX):
         return None
     user_key = key[len(_OPENCLAW_INDEX_PREFIX):]
-    if user_key.startswith("route:"):
+    if user_key.startswith("route:") or user_key.startswith("compose:"):
         return None
     user_id = user_key.split(":session:", 1)[0]
     return identity_existing_user_id(user_id) or user_id
@@ -2380,7 +2380,7 @@ def _openclaw_search_retry(prompt, key, cfg, original, compose=True):
             try:
                 answer = openclaw_chat(
                     "用户问题：{}\n\n以下是搜索到的资料：\n{}".format(prompt, results),
-                    session_id=key, cfg=cfg,
+                    session_id="compose:" + key, cfg=cfg,
                     system_prompt=OPENCLAW_COMPOSE_SYSTEM_PROMPT, timeout=40,
                 )
                 if answer and not _looks_evasive_reply(answer):
