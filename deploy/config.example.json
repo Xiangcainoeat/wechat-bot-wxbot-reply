@@ -6,7 +6,7 @@
     "model": "gpt-5.5"
   },
   "openclaw": {
-    "enabled": false,
+    "enabled": true,
     "base_url": "http://127.0.0.1:18788/v1",
     "api_key": "",
     "model": "openclaw:wxbot"
