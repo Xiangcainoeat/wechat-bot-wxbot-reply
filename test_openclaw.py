@@ -59,6 +59,19 @@ class _ConcurrentOpenClawHandler(BaseHTTPRequestHandler):
         pass
 
 
+class _HtmlModelsHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = b"<!doctype html><title>OpenClaw Control</title>"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, _format, *_args):
+        pass
+
+
 class OpenClawTests(unittest.TestCase):
     def _patch_openclaw_paths(self, stack, *, registry=None, index=None, transcript_dir=None):
         """Keep session fixtures isolated regardless of the production constant spelling."""
@@ -199,6 +212,114 @@ class OpenClawTests(unittest.TestCase):
         request = urlopen.call_args.args[0]
         payload = json.loads(request.data.decode("utf-8"))
         self.assertEqual(payload["data"]["content"], "提醒")
+
+    def test_wechat_identity_is_shared_between_private_and_group_transport_ids(self):
+        identity_user_id = self._require_callable("identity_user_id")
+        with tempfile.TemporaryDirectory() as tmp:
+            identity_file = os.path.join(tmp, "identities.json")
+            payload = {
+                "name": "Z",
+                "alias": "",
+                "gender": 1,
+                "province": "海南",
+                "city": "三亚",
+                "signature": "顺顺利利",
+                "avatar": "http://bot/res?media=%2Fcgi-bin%2Fwebwxgeticon%3Fseq%3D781301151%26username%3D%40old",
+            }
+            with mock.patch.object(app, "IDENTITY_FILE", identity_file):
+                first = identity_user_id(dict(payload, id="@old-private"), "@old-private")
+                second = identity_user_id(dict(payload, id="@new-group"), "@new-group")
+
+        self.assertEqual(first, second)
+        self.assertNotEqual(first, "@new-group")
+
+    def test_same_name_without_stable_profile_is_not_merged(self):
+        identity_user_id = self._require_callable("identity_user_id")
+        with tempfile.TemporaryDirectory() as tmp:
+            identity_file = os.path.join(tmp, "identities.json")
+            with mock.patch.object(app, "IDENTITY_FILE", identity_file):
+                first = identity_user_id({"id": "@first", "name": "同名用户"}, "@first")
+                second = identity_user_id({"id": "@second", "name": "同名用户"}, "@second")
+
+        self.assertNotEqual(first, second)
+
+    def test_bot_send_resolves_identity_to_current_transport_id(self):
+        identity_user_id = self._require_callable("identity_user_id")
+        class _Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return b'{"success":true}'
+
+        with tempfile.TemporaryDirectory() as tmp:
+            identity_file = os.path.join(tmp, "identities.json")
+            payload = {
+                "name": "Z", "province": "海南", "city": "三亚",
+                "signature": "顺顺利利", "gender": 1,
+                "avatar": "http://bot/res?media=%2Fcgi-bin%2Fwebwxgeticon%3Fseq%3D781301151%26username%3D%40old",
+            }
+            with mock.patch.object(app, "IDENTITY_FILE", identity_file), \
+                 mock.patch.object(app, "bot_token", return_value="token"), \
+                 mock.patch.object(app.urllib.request, "urlopen", return_value=_Response()) as urlopen:
+                identity = identity_user_id(dict(payload, id="@stable"), "@stable")
+                identity_user_id(dict(payload, id="@current"), "@current")
+                ok, _ = app.bot_send(identity, "提醒", False)
+
+        self.assertTrue(ok)
+        request = urlopen.call_args.args[0]
+        payload = json.loads(request.data.decode("utf-8"))
+        self.assertEqual(payload["to"], {"id": "@current"})
+
+    def test_receive_pipeline_uses_identity_id_instead_of_transport_id(self):
+        source = {
+            "room": {"id": "@@room", "payload": {"topic": "测试群"}},
+            "from": {"payload": {"id": "@temporary", "name": "Z"}},
+            "to": {"payload": {"name": "kindle"}},
+        }
+        fields = {
+            "type": (None, b"text"),
+            "content": (None, "普通消息".encode("utf-8")),
+            "source": (None, json.dumps(source, ensure_ascii=False).encode("utf-8")),
+            "isMentioned": (None, b"0"),
+            "isMsgFromSelf": (None, b"0"),
+            "isSystemEvent": (None, b"0"),
+        }
+
+        class _Receiver:
+            def _json(self, value):
+                self.result = value
+
+        receiver = _Receiver()
+        with mock.patch.object(app, "identity_user_id", return_value="stable-user", create=True) as identify, \
+             mock.patch.object(app, "record_user") as record_user, \
+             mock.patch.object(app, "load_config", return_value={"auto_reply": False}), \
+             mock.patch.object(app, "save_record") as save_record:
+            app.Handler._on_receive(receiver, fields)
+
+        identify.assert_called_once_with(source["from"]["payload"], "@temporary")
+        record_user.assert_called_once_with("stable-user", "Z")
+        self.assertEqual(save_record.call_args.args[0]["fromId"], "stable-user")
+
+    def test_historical_messages_use_the_stable_identity_reference(self):
+        identity_user_id = self._require_callable("identity_user_id")
+        with tempfile.TemporaryDirectory() as tmp:
+            identity_file = os.path.join(tmp, "identities.json")
+            payload = {
+                "name": "Z", "gender": 1, "province": "海南", "city": "三亚",
+                "signature": "顺顺利利",
+            }
+            with mock.patch.object(app, "IDENTITY_FILE", identity_file):
+                stable = identity_user_id(dict(payload, id="@old"), "@old")
+                identity_user_id(dict(payload, id="@new"), "@new")
+                public = app._public_message_record({"fromId": "@new", "content": "你好"})
+
+        self.assertEqual(public["user_ref"], app._short_ref(stable, "u"))
 
     def test_outbox_messages_are_cleaned(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -427,7 +548,50 @@ class OpenClawTests(unittest.TestCase):
         })
         self.assertEqual(result["auto_reply"], True)
         self.assertEqual(result["openclaw"], {"enabled": True, "configured": True})
+        self.assertNotIn("ai", result)
         self.assertNotIn("api_key", json.dumps(result))
+
+    def test_admin_ai_tab_is_openclaw_configuration_only(self):
+        page = app.ADMIN_PAGE
+        self.assertIn("OpenClaw Gateway 配置", page)
+        self.assertIn("id=\"claw-base\"", page)
+        self.assertIn("/api/openclaw/config", page)
+        self.assertNotIn("id=\"ai-base\"", page)
+        self.assertNotIn("loadAI()", page)
+
+    def test_admin_session_action_uses_valid_javascript_quoted_arguments(self):
+        page = app.ADMIN_PAGE
+        self.assertIn("viewOpenClawSession(\\'", page)
+        self.assertIn("openClawSessionAction(\\'compact\\',\\'", page)
+        self.assertNotIn("viewOpenClawSession(''+", page)
+        self.assertNotIn("openClawSessionAction(''compact'',", page)
+
+    def test_admin_updates_openclaw_configuration_and_removes_legacy_ai(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = os.path.join(tmp, "config.json")
+            self._write_json(config_path, {
+                "ai": {"base_url": "https://legacy.example/v1", "api_key": "legacy", "model": "old"},
+                "openclaw": {"enabled": True, "base_url": "http://old-gateway/v1", "api_key": "old-token", "model": "openclaw:wxbot"},
+            })
+            with mock.patch.object(app, "CONFIG_FILE", config_path), \
+                 mock.patch.object(app, "valid_session", return_value=True):
+                get_status, current = self._public_api_request("GET", "/api/openclaw/config")
+                post_status, _ = self._public_api_request("POST", "/api/openclaw/config", {
+                    "enabled": True,
+                    "base_url": "http://new-gateway/v1",
+                    "api_key": "new-token",
+                    "model": "openclaw:wxbot",
+                    "session_index": "/sessions/index.json",
+                    "transcript_dir": "/sessions",
+                })
+                saved = app.load_config()
+
+        self.assertEqual(get_status, 200)
+        self.assertNotIn("old-token", json.dumps(current))
+        self.assertEqual(post_status, 200)
+        self.assertEqual(saved["openclaw"]["base_url"], "http://new-gateway/v1")
+        self.assertEqual(saved["openclaw"]["api_key"], "new-token")
+        self.assertNotIn("ai", saved)
 
     def test_openclaw_chat_sends_stable_user_and_returns_content(self):
         server = HTTPServer(("127.0.0.1", 0), _OpenClawHandler)
@@ -472,6 +636,86 @@ class OpenClawTests(unittest.TestCase):
 
         self.assertEqual(reply, "OpenClaw 回答")
         answer.assert_called_once_with("柯洁最近在干嘛", session_id="wx-user")
+
+    def test_wechat_login_proxy_extracts_qr_and_uses_same_origin_assets(self):
+        extract = self._require_callable("extract_wechat_login_qr")
+        html = (
+            '<script src="/static/qrcode.min.js"></script>'
+            '<script>qrcode.makeCode("https://login.weixin.qq.com/l/test-code");'
+            'new EventSource("/sse");</script>'
+        )
+        self.assertEqual(extract(html), "https://login.weixin.qq.com/l/test-code")
+        page = getattr(app, "WECHAT_LOGIN_PAGE", "")
+        self.assertIn("/wechat-login/qrcode.js", page)
+        self.assertIn("/api/wechat-login/qrcode", page)
+        self.assertNotIn('new EventSource("/sse")', page)
+
+    def test_admin_status_and_page_do_not_expose_long_ids(self):
+        long_user_id = "wxid_" + "B" * 72
+        long_room_id = "room_" + "C" * 72
+        old_last = app.STATS.get("last")
+        try:
+            app.STATS["last"] = {
+                "time": "2026-08-07 15:00:00",
+                "from": "用户",
+                "fromId": long_user_id,
+                "room": "群聊",
+                "roomId": long_room_id,
+                "content": "你好",
+                "reply": "**回答**",
+            }
+            with mock.patch.object(app, "valid_session", return_value=True), \
+                 mock.patch.object(app, "bot_status", return_value={"reachable": True, "logged_in": False, "raw": "unHealthy"}), \
+                 mock.patch.object(app, "bot_token", return_value="login-secret"):
+                status, payload = self._public_api_request("GET", "/api/status")
+        finally:
+            app.STATS["last"] = old_last
+
+        self.assertEqual(status, 200)
+        serialized = json.dumps(payload, ensure_ascii=False)
+        self.assertNotIn(long_user_id, serialized)
+        self.assertNotIn(long_room_id, serialized)
+        self.assertNotIn("login-secret", serialized)
+        self.assertEqual(payload["login_url"], "/wechat-login")
+        page = app.ADMIN_PAGE
+        self.assertNotIn("显示完整ID", page)
+        self.assertNotIn("toggleIds", page)
+        self.assertIn("tab-sessions", page)
+        self.assertIn("/api/openclaw/sessions", page)
+
+    def test_public_message_record_hides_transport_id_used_as_sender_name(self):
+        long_user_id = "wxid_" + "D" * 72
+        public = app._public_message_record({
+            "time": "2026-08-07 15:00:00",
+            "from": long_user_id,
+            "fromId": long_user_id,
+            "room": "私聊",
+            "roomId": "",
+            "content": "你好",
+            "reply": "回答",
+        })
+        serialized = json.dumps(public, ensure_ascii=False)
+        self.assertNotIn(long_user_id, serialized)
+        self.assertTrue(public["from"].startswith("u-"))
+        self.assertTrue(public["user_ref"].startswith("u-"))
+
+    def test_public_log_line_redacts_registered_transport_ids(self):
+        redact = self._require_callable("public_log_line")
+        long_user_id = "wxid_" + "E" * 72
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            app, "IDENTITY_FILE", os.path.join(tmp, "identities.json")
+        ):
+            app.identity_user_id({"id": long_user_id, "name": "用户"}, long_user_id)
+            line = redact('{"fromId":"' + long_user_id + '"}')
+        self.assertNotIn(long_user_id, line)
+        self.assertIn("u-", line)
+
+    def test_public_log_line_redacts_unregistered_room_ids(self):
+        redact = self._require_callable("public_log_line")
+        long_room_id = "@@" + "F" * 72
+        line = redact('{"roomId":"' + long_room_id + '"}')
+        self.assertNotIn(long_room_id, line)
+        self.assertIn("r-", line)
 
     def test_active_session_defaults_to_wechat_id(self):
         active_key = self._require_callable("openclaw_active_key")
@@ -539,6 +783,64 @@ class OpenClawTests(unittest.TestCase):
             "（上下文 12.4k / 128k，9.7%）",
         )
         self.assertEqual(format_usage(None, None), "")
+
+    def test_context_status_ignores_zero_gateway_usage_and_reads_session_index(self):
+        context_status = self._require_callable("_openclaw_context_status")
+        with tempfile.TemporaryDirectory() as tmp:
+            index = os.path.join(tmp, "sessions.json")
+            self._write_json(index, {
+                app._OPENCLAW_INDEX_PREFIX + "wx-user": {
+                    "totalTokens": 5800,
+                    "contextTokens": 128000,
+                },
+            })
+            with mock.patch.object(
+                app, "openclaw_config", return_value={"session_index": index}
+            ), mock.patch.dict(
+                app._OPENCLAW_LAST_USAGE,
+                {"wx-user": {
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                }},
+                clear=True,
+            ):
+                self.assertEqual(
+                    context_status("wx-user"),
+                    "（上下文 5.8k / 128k，4.5%）",
+                )
+
+    def test_openclaw_fetch_models_falls_back_to_native_config(self):
+        fetch_models = self._require_callable("openclaw_fetch_models")
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = os.path.join(tmp, "openclaw.json")
+            self._write_json(config_path, {
+                "models": {
+                    "providers": {
+                        "wxbot": {"models": [{"id": "gpt-5.5"}]},
+                        "bailian": {"models": [{"id": "qwen3.5-plus"}]},
+                    },
+                },
+            })
+            server = HTTPServer(("127.0.0.1", 0), _HtmlModelsHandler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                with mock.patch.object(
+                    app,
+                    "openclaw_config",
+                    return_value={
+                        "base_url": "http://127.0.0.1:{}/v1".format(server.server_port),
+                        "api_key": "gateway-token",
+                    },
+                ), mock.patch.object(app, "OPENCLAW_CONFIG_FILE", config_path, create=True):
+                    models = fetch_models(timeout=2)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
+        self.assertEqual(models, ["wxbot/gpt-5.5", "bailian/qwen3.5-plus"])
 
     def test_ai_answer_uses_active_session_key(self):
         with mock.patch.object(

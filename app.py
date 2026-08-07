@@ -20,6 +20,7 @@
 - 0.0.0.0:8081     管理后台（/login /api/* 等，需登录）
 """
 import json
+import hashlib
 import os
 import re
 import secrets
@@ -52,14 +53,39 @@ LEDGER_FILE = os.path.join(BASE_DIR, "ledger.json")      # 记账数据(按人�
 REMINDER_FILE = os.path.join(BASE_DIR, "reminders.json") # 定时提醒
 SUBS_FILE = os.path.join(BASE_DIR, "subscriptions.json") # 每日推送订阅
 OUTBOX_FILE = os.path.join(BASE_DIR, "ilink_outbox.json")  # 待 ClawBot 网关代发的主动消息
+OPENCLAW_SESSIONS_FILE = os.path.join(BASE_DIR, "openclaw_sessions.json")
+# OpenClaw 原生索引和 transcript 只读；路径可通过环境变量覆盖，便于测试和容器部署。
+OPENCLAW_INDEX_FILE = os.environ.get(
+    "WXBOT_OPENCLAW_INDEX_FILE",
+    "/root/openclaw/openclaw_space/agents/wxbot/sessions/sessions.json",
+)
+OPENCLAW_TRANSCRIPT_DIR = os.environ.get(
+    "WXBOT_OPENCLAW_TRANSCRIPT_DIR",
+    "/root/openclaw/openclaw_space/agents/wxbot/sessions",
+)
+OPENCLAW_CONFIG_FILE = os.environ.get(
+    "WXBOT_OPENCLAW_CONFIG_FILE",
+    "/root/openclaw/openclaw_space/openclaw.json",
+)
+# 兼容部署脚本和外部诊断工具使用的旧常量名。
+OPENCLAW_SESSION_FILE = OPENCLAW_SESSIONS_FILE
+OPENCLAW_SESSION_INDEX_FILE = OPENCLAW_INDEX_FILE
+OPENCLAW_SESSIONS_INDEX_FILE = OPENCLAW_INDEX_FILE
+OPENCLAW_TRANSCRIPTS_DIR = OPENCLAW_TRANSCRIPT_DIR
+OPENCLAW_SESSION_DIR = OPENCLAW_TRANSCRIPT_DIR
 PERM_FILE = os.path.join(BASE_DIR, "permissions.json")   # 权限(管理员/成员白名单)
 USERS_FILE = os.path.join(BASE_DIR, "users.json")        # 见过的用户(昵称->ID)
+IDENTITY_FILE = os.path.join(BASE_DIR, "identities.json") # 稳定用户ID与微信临时ID映射
 LEDGER_LOCK = threading.Lock()
 REMINDER_LOCK = threading.Lock()
 SUBS_LOCK = threading.Lock()
 PERM_LOCK = threading.Lock()
 USERS_LOCK = threading.Lock()
+IDENTITY_LOCK = threading.Lock()
 OUTBOX_LOCK = threading.Lock()
+OPENCLAW_REGISTRY_LOCK = threading.Lock()
+OPENCLAW_USAGE_LOCK = threading.Lock()
+_OPENCLAW_LAST_USAGE = {}
 _OPENCLAW_SESSION_LOCKS = {}
 _OPENCLAW_SESSION_LOCKS_GUARD = threading.Lock()
 
@@ -140,9 +166,15 @@ WECHAT_SYSTEM_PROMPT = (
     "不要使用 Markdown，不要使用加粗符号、反引号、井号标题、表格、项目符号或 emoji。"
     "用短段落和简单的数字编号表达，控制长度，直接回答问题，不要解释这些规则。"
     "不要主动暴露内部 agent 名称、工作区路径、provider 或配置细节。"
+    "遇到新闻、人物动态、天气或其他实时问题时，可以使用 OpenClaw 自己的网页工具核实最新信息。"
+    "不要展示工具调用过程、工具参数或内部等待文本，只返回核实后的答案。"
     "如果用户问你是谁、基于什么智能体或运行环境，统一回答：我是 OpenClaw 智能体，当前使用 gpt-5.5。"
 )
 AI_CMDS = ("/ai", "/搜索", "/search")  # 需要授权的 OpenClaw 类命令
+SESSION_COMMANDS = {
+    "/compact", "/压缩上下文", "压缩上下文",
+    "/new", "/新会话", "新会话", "开启新的会话", "开启新会话",
+}
 
 AUTOMATION_ACTIONS = {"set_reminder", "set_daily_push"}
 AUTOMATION_HINTS = (
@@ -237,12 +269,10 @@ def load_config():
 
 def public_config(cfg):
     """返回可交给后台页面的配置摘要，绝不包含任何 provider secret。"""
-    ai = cfg.get("ai") or {}
     claw = cfg.get("openclaw") or {}
     return {
         "auto_reply": bool(cfg.get("auto_reply", True)),
         "smart": bool(cfg.get("smart", True)),
-        "ai": {"configured": bool(ai.get("base_url") and ai.get("api_key") and ai.get("model"))},
         "openclaw": {
             "enabled": bool(claw.get("enabled", False)),
             "configured": bool(claw.get("base_url") and claw.get("api_key")),
@@ -335,6 +365,380 @@ def read_messages(limit=10000):
     return list(dq)
 
 
+# ---------------- OpenClaw 会话与上下文 ----------------
+_OPENCLAW_INDEX_PREFIX = "agent:wxbot:openai-user:"
+_OPENCLAW_MAX_TRANSCRIPT_BYTES = 4 * 1024 * 1024
+_OPENCLAW_MAX_TRANSCRIPT_RECORDS = 5000
+
+
+def _short_ref(value, prefix="ref"):
+    """把内部 ID 映射为稳定的短引用，后台和日志对外只使用该引用。"""
+    digest = hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()[:10]
+    return "{}-{}".format(prefix, digest)
+
+
+def short_id(value, prefix="ref"):
+    return _short_ref(value, prefix)
+
+
+def public_user_ref(value):
+    """把稳定身份或传输别名转换成后台可展示的短用户引用。"""
+    value = str(value or "").strip()
+    stable = identity_existing_user_id(value) or value
+    return _short_ref(stable, "u") if stable else ""
+
+
+def public_display_name(value, user_id=""):
+    """展示昵称；旧数据把微信 ID 当昵称时改成短用户引用。"""
+    name = str(value or "").strip()
+    user_id = str(user_id or "").strip()
+    stable = identity_existing_user_id(user_id) or user_id
+    if not name:
+        return "未命名用户"
+    if name in {user_id, stable}:
+        return public_user_ref(stable)
+    return public_log_line(name)
+
+
+def public_json_value(value, key=""):
+    """递归处理管理接口响应中的用户/群聊 ID字段。"""
+    if isinstance(value, dict):
+        result = {}
+        for child_key, child in value.items():
+            if child_key in {"fromId", "from_id", "target_id", "sender_id", "user_id"}:
+                result[child_key] = public_user_ref(child)
+            elif child_key in {"roomId", "room_id"}:
+                result[child_key] = _short_ref(child, "r") if child else ""
+            else:
+                result[child_key] = public_json_value(child, child_key)
+        return result
+    if isinstance(value, list):
+        return [public_json_value(child, key) for child in value]
+    return value
+
+
+def public_log_line(value):
+    """隐藏日志文本中的已登记微信 ID，避免管理后台重新展示长传输 ID。"""
+    text = str(value or "")
+    try:
+        with IDENTITY_LOCK:
+            registry = _identity_registry_load()
+            replacements = {}
+            for transport_id, canonical in (registry.get("aliases") or {}).items():
+                transport_id = str(transport_id or "")
+                canonical = str(canonical or "")
+                if len(transport_id) >= 20 and canonical:
+                    replacements[transport_id] = _short_ref(canonical, "u")
+            for canonical in (registry.get("identities") or {}):
+                canonical = str(canonical or "")
+                if len(canonical) >= 20:
+                    replacements.setdefault(canonical, _short_ref(canonical, "u"))
+        for raw, replacement in sorted(replacements.items(), key=lambda pair: len(pair[0]), reverse=True):
+            text = text.replace(raw, replacement)
+        text = re.sub(
+            r"@@[A-Za-z0-9_-]{40,}",
+            lambda match: _short_ref(match.group(0), "r"),
+            text,
+        )
+        text = re.sub(
+            r"@[A-Za-z0-9_-]{40,}(?:@im\.wechat)?",
+            lambda match: _short_ref(match.group(0), "u"),
+            text,
+        )
+    except Exception:
+        pass
+    return text
+
+
+def _openclaw_registry_load():
+    try:
+        with open(OPENCLAW_SESSIONS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        users = data.get("users") if isinstance(data, dict) else None
+        return {"users": users if isinstance(users, dict) else {}}
+    except Exception:
+        return {"users": {}}
+
+
+def _openclaw_registry_save(data):
+    path = OPENCLAW_SESSIONS_FILE
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    temp = path + ".tmp"
+    try:
+        with open(temp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(temp, path)
+    except Exception as e:
+        try:
+            if os.path.exists(temp):
+                os.unlink(temp)
+        except Exception:
+            pass
+        log_error("保存 OpenClaw 会话注册表失败: {}".format(e))
+
+
+def openclaw_active_key(user_id):
+    """返回微信用户当前 Gateway user key；首次使用保持原微信 ID。"""
+    user_id = str(user_id or "").strip()
+    if not user_id:
+        return ""
+    with OPENCLAW_REGISTRY_LOCK:
+        data = _openclaw_registry_load()
+        entry = data["users"].get(user_id) or {}
+        key = str(entry.get("active_key") or "").strip()
+        if key:
+            return key
+        data["users"][user_id] = {
+            "active_key": user_id,
+            "created_at": now_str(),
+        }
+        _openclaw_registry_save(data)
+        return user_id
+
+
+def openclaw_start_new_session(user_id):
+    """为用户创建新的 Gateway user key；原 session 和 transcript 保留。"""
+    user_id = str(user_id or "").strip()
+    if not user_id:
+        return ""
+    key = "{}:session:{}".format(user_id, secrets.token_hex(8))
+    with OPENCLAW_REGISTRY_LOCK:
+        data = _openclaw_registry_load()
+        data["users"][user_id] = {
+            "active_key": key,
+            "created_at": now_str(),
+        }
+        _openclaw_registry_save(data)
+    return key
+
+
+def _openclaw_user_from_key(key):
+    key = str(key or "")
+    if not key.startswith(_OPENCLAW_INDEX_PREFIX):
+        return None
+    user_key = key[len(_OPENCLAW_INDEX_PREFIX):]
+    if user_key.startswith("route:"):
+        return None
+    user_id = user_key.split(":session:", 1)[0]
+    return identity_existing_user_id(user_id) or user_id
+
+
+def _openclaw_content_text(content):
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        chunks = []
+        for item in content:
+            if isinstance(item, str):
+                chunks.append(item)
+            elif isinstance(item, dict):
+                if item.get("type") in (None, "text") and item.get("text") is not None:
+                    chunks.append(str(item.get("text")))
+        return "".join(chunks).strip()
+    if isinstance(content, dict):
+        return str(content.get("text") or content.get("content") or "").strip()
+    return ""
+
+
+def openclaw_parse_transcript(path):
+    """解析 OpenClaw JSONL transcript，只保留微信可查看的输入、输出和压缩事件。"""
+    records = []
+    if not path or not os.path.isfile(path):
+        return records
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            if size > _OPENCLAW_MAX_TRANSCRIPT_BYTES:
+                f.seek(size - _OPENCLAW_MAX_TRANSCRIPT_BYTES)
+                f.readline()
+            raw_lines = f.readlines(_OPENCLAW_MAX_TRANSCRIPT_RECORDS * 4096)
+    except Exception:
+        return records
+    for raw in raw_lines[-_OPENCLAW_MAX_TRANSCRIPT_RECORDS:]:
+        try:
+            item = json.loads(raw.decode("utf-8", "ignore"))
+        except Exception:
+            continue
+        timestamp = item.get("timestamp") or ""
+        if item.get("type") == "message":
+            message = item.get("message") or {}
+            role = str(message.get("role") or "")
+            content = _openclaw_content_text(message.get("content"))
+            if role in ("user", "assistant") and content:
+                rec = {"role": role, "content": content, "timestamp": timestamp}
+                usage = message.get("usage") or {}
+                if isinstance(usage, dict):
+                    rec["usage"] = {
+                        k: usage.get(k) for k in ("input", "output", "totalTokens")
+                        if usage.get(k) is not None
+                    }
+                records.append(rec)
+            continue
+        if item.get("type") in ("compaction", "compaction_start", "compaction_end"):
+            message = item.get("message") or {}
+            rec = {
+                "type": "compaction",
+                "timestamp": timestamp,
+                "summary": str(item.get("summary") or message.get("summary") or ""),
+            }
+            before = item.get("tokensBefore", message.get("tokensBefore"))
+            after = item.get("tokensAfter", message.get("tokensAfter"))
+            if before is not None:
+                rec["tokens_before"] = before
+            if after is not None:
+                rec["tokens_after"] = after
+            records.append(rec)
+    return records
+
+
+def _openclaw_transcript_path(session_id, entry, transcript_dir):
+    transcript_dir = transcript_dir or OPENCLAW_TRANSCRIPT_DIR
+    candidate = ""
+    if isinstance(entry, dict):
+        candidate = str(entry.get("sessionFile") or "")
+    if candidate:
+        candidate = os.path.basename(candidate)
+        if not candidate.endswith(".jsonl"):
+            candidate = ""
+    if not candidate:
+        candidate = str(session_id or "") + ".jsonl"
+    return os.path.join(transcript_dir, candidate)
+
+
+def _openclaw_time(value):
+    try:
+        stamp = float(value) / 1000 if float(value) > 100000000000 else float(value)
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stamp))
+    except Exception:
+        return ""
+
+
+def openclaw_parse_sessions_index(index_path=None, transcript_dir=None):
+    """读取原生 sessions.json，过滤非 wxbot/route session 并附加 transcript 摘要。"""
+    claw = openclaw_config()
+    index_path = index_path or claw.get("session_index") or OPENCLAW_INDEX_FILE
+    transcript_dir = transcript_dir or claw.get("transcript_dir") or OPENCLAW_TRANSCRIPT_DIR
+    try:
+        with open(index_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return {"sessions": []}
+    if not isinstance(data, dict):
+        return {"sessions": []}
+    sessions = []
+    for key, entry in data.items():
+        user_id = _openclaw_user_from_key(key)
+        if not user_id or not isinstance(entry, dict):
+            continue
+        session_id = str(entry.get("sessionId") or "").strip()
+        if not session_id:
+            continue
+        transcript = openclaw_parse_transcript(
+            _openclaw_transcript_path(session_id, entry, transcript_dir)
+        )
+        messages = [r for r in transcript if r.get("role") in ("user", "assistant")]
+        compactions = [r for r in transcript if r.get("type") == "compaction"]
+        latest_usage = next((r.get("usage") for r in reversed(messages) if r.get("usage")), {})
+        used = _positive_usage_value(
+            entry, "inputTokens", "input_tokens", "totalTokens"
+        ) or _positive_usage_value(latest_usage, "input", "totalTokens")
+        limit = (_positive_usage_value(
+            entry, "contextWindow", "contextTokens", "contextWindowTokens"
+        ) or 128000)
+        sessions.append({
+            "user_ref": _short_ref(user_id, "u"),
+            "session_ref": _short_ref(key, "s"),
+            "session_id": session_id,
+            "updated_at": _openclaw_time(entry.get("updatedAt")),
+            "context_used": used,
+            "context_limit": limit,
+            "message_count": len(messages),
+            "compaction_count": len(compactions),
+            "_user_id": user_id,
+            "_session_key": key,
+            "_transcript": transcript,
+        })
+    sessions.sort(key=lambda x: x.get("updated_at") or "", reverse=True)
+    return {"sessions": sessions}
+
+
+def read_openclaw_sessions(index_path=None, transcript_dir=None):
+    return openclaw_parse_sessions_index(index_path, transcript_dir)
+
+
+def read_openclaw_transcript(session_id, transcript_dir=None):
+    transcript_dir = transcript_dir or OPENCLAW_TRANSCRIPT_DIR
+    path = str(session_id or "")
+    if not path.endswith(".jsonl"):
+        path = os.path.join(transcript_dir, path + ".jsonl")
+    return openclaw_parse_transcript(path)
+
+
+def format_context_usage(used, limit):
+    if used is None or limit is None:
+        return ""
+    try:
+        used = float(used)
+        limit = float(limit)
+        if limit <= 0:
+            return ""
+        def fmt(value):
+            if value >= 1000:
+                text = "{:.1f}".format(value / 1000).rstrip("0").rstrip(".")
+                return text + "k"
+            return str(int(value))
+        return "（上下文 {} / {}，{:.1f}%）".format(fmt(used), fmt(limit), used / limit * 100)
+    except Exception:
+        return ""
+
+
+def _positive_usage_value(data, *keys):
+    if not isinstance(data, dict):
+        return None
+    for key in keys:
+        value = data.get(key)
+        try:
+            if value is not None and float(value) > 0:
+                return value
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _openclaw_context_status(session_key):
+    with OPENCLAW_USAGE_LOCK:
+        usage = dict(_OPENCLAW_LAST_USAGE.get(str(session_key)) or {})
+    if usage:
+        used = _positive_usage_value(
+            usage, "input", "inputTokens", "prompt_tokens", "totalTokens", "total_tokens"
+        )
+        limit = _positive_usage_value(usage, "contextTokens", "contextWindow") or 128000
+        if used is not None:
+            result = format_context_usage(used, limit)
+            if result:
+                return result
+    try:
+        index_path = openclaw_config().get("session_index") or OPENCLAW_INDEX_FILE
+        with open(index_path, "r", encoding="utf-8") as f:
+            entry = (json.load(f) or {}).get(_OPENCLAW_INDEX_PREFIX + str(session_key)) or {}
+        used = _positive_usage_value(entry, "inputTokens", "input_tokens", "totalTokens")
+        limit = _positive_usage_value(entry, "contextWindow", "contextTokens") or 128000
+        return format_context_usage(used, limit) if used is not None else ""
+    except Exception:
+        pass
+    return ""
+
+
+def _with_context_status(reply, session_key):
+    reply = clean_wechat_reply(reply)
+    status = _openclaw_context_status(session_key)
+    if status and status not in reply:
+        return (reply + "\n" + status).strip()
+    return reply
+
+
 def bot_token():
     try:
         with open(BOT_TOKEN_FILE, "r", encoding="utf-8") as f:
@@ -352,6 +756,178 @@ def bot_status():
             return {"reachable": True, "logged_in": body.lower() == "healthy", "raw": body}
     except Exception as e:
         return {"reachable": False, "logged_in": False, "raw": str(e)}
+
+
+def extract_wechat_login_qr(html):
+    """从 wechatbot-webhook 登录页提取当前二维码 URL。"""
+    match = re.search(r"qrcode\.makeCode\(\s*(['\"])(.*?)\1\s*\)", str(html or ""), re.S)
+    return match.group(2).strip() if match else ""
+
+
+def fetch_wechat_login_qr(timeout=8):
+    url = BOT_BASE + "/login?token=" + urllib.parse.quote(bot_token())
+    with urllib.request.urlopen(url, timeout=timeout) as response:
+        html = response.read().decode("utf-8", "ignore")
+    return extract_wechat_login_qr(html)
+
+
+def fetch_wechat_qrcode_script(timeout=8):
+    url = BOT_BASE + "/static/qrcode.min.js?token=" + urllib.parse.quote(bot_token())
+    with urllib.request.urlopen(url, timeout=timeout) as response:
+        return response.read()
+
+
+# ---------------- 微信身份归一化 ----------------
+def _identity_registry_load():
+    try:
+        with open(IDENTITY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("identity registry must be an object")
+    except Exception:
+        data = {}
+    data.setdefault("version", 1)
+    data.setdefault("identities", {})
+    data.setdefault("aliases", {})
+    return data
+
+
+def _identity_registry_save(data):
+    os.makedirs(os.path.dirname(IDENTITY_FILE) or ".", exist_ok=True)
+    tmp = IDENTITY_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
+    os.replace(tmp, IDENTITY_FILE)
+    try:
+        os.chmod(IDENTITY_FILE, 0o600)
+    except OSError:
+        pass
+
+
+def _identity_text(value):
+    return re.sub(r"\s+", " ", str(value or "").strip()).lower()
+
+
+def _identity_avatar_seq(payload):
+    avatar = urllib.parse.unquote(str((payload or {}).get("avatar") or ""))
+    match = re.search(r"(?:[?&]|^)seq=(\d+)(?:&|$)", avatar)
+    return match.group(1) if match else ""
+
+
+def _identity_match_keys(payload):
+    payload = payload if isinstance(payload, dict) else {}
+    keys = []
+
+    def add(kind, value):
+        value = _identity_text(value)
+        if value:
+            keys.append(kind + ":" + hashlib.sha256(value.encode("utf-8")).hexdigest())
+
+    add("weixin", payload.get("weixin"))
+    phones = payload.get("phone") or []
+    if not isinstance(phones, (list, tuple, set)):
+        phones = [phones]
+    for phone in sorted({_identity_text(v) for v in phones if _identity_text(v)}):
+        add("phone", phone)
+    avatar_seq = _identity_avatar_seq(payload)
+    if avatar_seq and avatar_seq != "0":
+        add("avatar", avatar_seq)
+
+    profile = {
+        "name": _identity_text(payload.get("name")),
+        "alias": _identity_text(payload.get("alias")),
+        "gender": str(payload.get("gender") or ""),
+        "province": _identity_text(payload.get("province")),
+        "city": _identity_text(payload.get("city")),
+        "signature": _identity_text(payload.get("signature")),
+        "avatar_seq": avatar_seq,
+    }
+    profile_signal = any(profile[key] for key in (
+        "alias", "gender", "province", "city", "signature", "avatar_seq"
+    ))
+    if profile["name"] and profile_signal:
+        add("profile", json.dumps(profile, ensure_ascii=False, sort_keys=True))
+    return sorted(set(keys))
+
+
+def identity_user_id(payload, transport_id=""):
+    """把会随私聊、群聊或重新登录变化的微信 ID 映射为固定用户主键。"""
+    payload = payload if isinstance(payload, dict) else {}
+    transport_id = str(transport_id or payload.get("id") or "").strip()
+    if not transport_id:
+        return ""
+    keys = _identity_match_keys(payload)
+    with IDENTITY_LOCK:
+        data = _identity_registry_load()
+        identities = data["identities"]
+        aliases = data["aliases"]
+        canonical = str(aliases.get(transport_id) or "")
+        if not canonical:
+            candidates = []
+            key_set = set(keys)
+            for user_id, item in identities.items():
+                if key_set.intersection(item.get("match_keys") or []):
+                    candidates.append(user_id)
+            if len(candidates) == 1:
+                canonical = candidates[0]
+            elif transport_id in identities:
+                canonical = transport_id
+            else:
+                # 第一次见到时固定为主键；后续临时 ID 只作为别名加入。
+                canonical = transport_id
+
+        item = identities.setdefault(canonical, {
+            "created_at": now_str(),
+            "match_keys": [],
+            "transport_ids": [],
+        })
+        changed = aliases.get(transport_id) != canonical
+        aliases[transport_id] = canonical
+        transports = list(item.get("transport_ids") or [])
+        if transport_id not in transports:
+            transports.append(transport_id)
+            item["transport_ids"] = transports[-20:]
+            changed = True
+        merged_keys = sorted(set(item.get("match_keys") or []).union(keys))
+        if merged_keys != item.get("match_keys"):
+            item["match_keys"] = merged_keys
+            changed = True
+        if item.get("current_transport_id") != transport_id:
+            item["current_transport_id"] = transport_id
+            changed = True
+        name = str(payload.get("alias") or payload.get("name") or "").strip()
+        if name and item.get("name") != name:
+            item["name"] = name
+            changed = True
+        if changed:
+            item["updated_at"] = now_str()
+            _identity_registry_save(data)
+        return canonical
+
+
+def identity_transport_id(user_id):
+    """返回稳定用户主键当前对应的微信临时发送 ID。"""
+    user_id = str(user_id or "").strip()
+    if not user_id:
+        return ""
+    with IDENTITY_LOCK:
+        data = _identity_registry_load()
+        canonical = str(data["aliases"].get(user_id) or user_id)
+        item = data["identities"].get(canonical) or {}
+        return str(item.get("current_transport_id") or user_id)
+
+
+def identity_existing_user_id(value):
+    value = str(value or "").strip()
+    if not value:
+        return ""
+    with IDENTITY_LOCK:
+        data = _identity_registry_load()
+        if value in data["aliases"]:
+            return str(data["aliases"][value])
+        if value in data["identities"]:
+            return value
+    return ""
 
 
 def bot_send(to, content, is_room=False, name=None):
@@ -386,7 +962,7 @@ def bot_send(to, content, is_room=False, name=None):
     if is_room:
         code, resp = _post(to)
     else:
-        code, resp = _post({"id": to})
+        code, resp = _post({"id": identity_transport_id(to)})
         if not _ok(resp) and name:
             code, resp = _post(name)
     return _ok(resp), resp
@@ -1328,13 +1904,26 @@ def outbox_done(ids):
 
 # ---------------- AI 调用（OpenAI 兼容） ----------------
 def ai_config():
-    cfg = load_config()
-    return cfg.get("ai") or {}
+    # 兼容旧内部调用；实际唯一 AI 配置是 OpenClaw Gateway。
+    return openclaw_config()
 
 
 def openclaw_config():
     cfg = load_config()
     return cfg.get("openclaw") or {}
+
+
+def public_openclaw_config(claw):
+    result = {
+        "enabled": bool((claw or {}).get("enabled", False)),
+        "base_url": str((claw or {}).get("base_url") or ""),
+        "model": str((claw or {}).get("model") or "openclaw:wxbot"),
+        "session_index": str((claw or {}).get("session_index") or OPENCLAW_INDEX_FILE),
+        "transcript_dir": str((claw or {}).get("transcript_dir") or OPENCLAW_TRANSCRIPT_DIR),
+    }
+    key = str((claw or {}).get("api_key") or "")
+    result["api_key"] = "********" if key else ""
+    return result
 
 
 def clean_wechat_reply(text):
@@ -1343,6 +1932,7 @@ def clean_wechat_reply(text):
     has_internal_trace = bool(re.search(r"(?m)^[ \t]*to=[^\n]*[ \t]*$", text))
     text = re.sub(r"(?m)^[ \t]*to=[^\n]*(?:\n|$)", "", text)
     text = re.sub(r"(?m)^[ \t]*total_languages=\d+[ \t]*(?:\n|$)", "", text)
+    text = re.sub(r"\[\[reply_to_[^\]]+\]\]", "", text)
     text = re.sub(r"(?m)^[ \t]*\{\s*\"(?:command|pattern)\".*\}[ \t]*(?:\n|$)", "", text)
     if has_internal_trace:
         text = re.sub(r"(?m)^[ \t]*\{\s*\"action\".*\}[ \t]*(?:\n|$)", "", text)
@@ -1558,6 +2148,11 @@ def _openclaw_chat_request(prompt, session_id="", cfg=None, timeout=60,
         content = (data["choices"][0]["message"].get("content") or "").strip()
     except Exception:
         raise ValueError("OpenClaw 返回格式异常: " + json.dumps(data, ensure_ascii=False)[:300])
+    if session_id:
+        usage = data.get("usage") or {}
+        if isinstance(usage, dict):
+            with OPENCLAW_USAGE_LOCK:
+                _OPENCLAW_LAST_USAGE[str(session_id)] = dict(usage)
     if not sanitize:
         return content
     return clean_wechat_reply(content) or "（没有返回内容）"
@@ -1568,8 +2163,19 @@ def ai_answer(prompt, session_id=""):
     claw = openclaw_config()
     enabled = claw.get("enabled", False)
     if enabled and claw.get("base_url") and claw.get("api_key"):
-        return openclaw_chat(prompt, session_id=session_id, cfg=claw)
+        key = openclaw_active_key(session_id) if session_id else ""
+        reply = openclaw_chat(prompt, session_id=key, cfg=claw)
+        return _with_context_status(reply, key) if key else reply
     raise ValueError("OpenClaw 未配置：请启用 Gateway 并填写地址和 token")
+
+
+def openclaw_compact_session(user_id):
+    """在当前 Gateway session 中执行原生 /compact。"""
+    key = openclaw_active_key(user_id)
+    if not key:
+        raise ValueError("缺少微信用户会话")
+    reply = openclaw_chat("/compact", session_id=key, sanitize=False)
+    return _with_context_status(reply or "已压缩当前上下文。", key)
 
 
 def openclaw_route(text, session_id=""):
@@ -1593,21 +2199,88 @@ def openclaw_route(text, session_id=""):
     return action, data
 
 
-def ai_fetch_models(timeout=15):
-    ai = ai_config()
-    base = (ai.get("base_url") or "").strip().rstrip("/")
-    key = (ai.get("api_key") or "").strip()
+def _openclaw_native_model_ids(path=None):
+    path = path or OPENCLAW_CONFIG_FILE
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+    except Exception:
+        return []
+    if not isinstance(config, dict):
+        return []
+    ids = []
+    seen = set()
+
+    def add(value, provider=""):
+        value = str(value or "").strip()
+        provider = str(provider or "").strip()
+        if not value:
+            return
+        model_id = value if "/" in value or not provider else provider + "/" + value
+        if model_id not in seen:
+            seen.add(model_id)
+            ids.append(model_id)
+
+    providers = ((config.get("models") or {}).get("providers") or {})
+    if isinstance(providers, dict):
+        for provider, provider_config in providers.items():
+            if not isinstance(provider_config, dict):
+                continue
+            models = provider_config.get("models") or []
+            if isinstance(models, list):
+                for model in models:
+                    if isinstance(model, dict):
+                        add(model.get("id") or model.get("name"), provider)
+                    else:
+                        add(model, provider)
+
+    defaults = ((config.get("agents") or {}).get("defaults") or {})
+    default_models = defaults.get("models") or {}
+    if isinstance(default_models, dict):
+        for model_id in default_models:
+            add(model_id)
+    primary = ((defaults.get("model") or {}).get("primary")
+               if isinstance(defaults.get("model"), dict) else "")
+    add(primary)
+    agents = (config.get("agents") or {}).get("list") or []
+    if isinstance(agents, list):
+        for agent in agents:
+            if isinstance(agent, dict):
+                add(agent.get("model"))
+    return ids
+
+
+def openclaw_fetch_models(timeout=15):
+    claw = openclaw_config()
+    base = (claw.get("base_url") or "").strip().rstrip("/")
+    key = (claw.get("api_key") or "").strip()
     if not base or not key:
-        raise ValueError("请先填写接口地址和 API Key")
+        raise ValueError("请先填写 OpenClaw Gateway 地址和 token")
     req = urllib.request.Request(
         base + "/models",
         headers={"Authorization": "Bearer " + key},
         method="GET",
     )
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        data = json.loads(r.read().decode("utf-8", "ignore"))
-    ids = [m.get("id") for m in data.get("data", []) if m.get("id")]
-    return ids
+    gateway_error = None
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read().decode("utf-8", "ignore"))
+        items = data.get("data") or data.get("models") or []
+        ids = []
+        for item in items if isinstance(items, list) else []:
+            model_id = item if isinstance(item, str) else (item.get("id") or item.get("name"))
+            if model_id and model_id not in ids:
+                ids.append(model_id)
+        if ids:
+            return ids
+        gateway_error = "Gateway 未返回模型列表"
+    except Exception as e:
+        gateway_error = str(e)[:160]
+
+    ids = _openclaw_native_model_ids()
+    if ids:
+        return ids
+    raise ValueError("获取模型失败：{}".format(gateway_error or "未找到 OpenClaw 模型配置"))
 
 
 LEDGER_FORMAT_HINT = (
@@ -1771,6 +2444,20 @@ def smart_fallback(text, from_id, from_name, room_id, room_name, cfg):
 # ---------------- 命令处理 ----------------
 def handle_command(text, from_id, from_name, room_id, room_name, cfg):
     """返回回复文本；无需回复返回 None。"""
+    raw_text = (text or "").strip()
+    if raw_text.lower() in SESSION_COMMANDS:
+        if raw_text.lower() in ("/compact", "/压缩上下文", "压缩上下文"):
+            try:
+                return openclaw_compact_session(from_id)
+            except Exception as e:
+                log_error("OpenClaw 上下文压缩失败: {}".format(e))
+                return AI_FAILURE_MSG
+        try:
+            openclaw_start_new_session(from_id)
+            return "已开启新的会话。后续对话将从新的上下文开始。"
+        except Exception as e:
+            log_error("OpenClaw 新会话失败: {}".format(e))
+            return AI_FAILURE_MSG
     cmd = text.split(None, 1)[0].lower()
     rest = text[len(cmd):].strip()
 
@@ -2019,6 +2706,41 @@ button:hover{background:#2658c4}
 <div class="tip">口令保存在服务器 /root/wxbot-reply/.view_token</div>
 </div></body></html>"""
 
+WECHAT_LOGIN_PAGE = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>微信扫码登录</title>
+<script src="/wechat-login/qrcode.js"></script>
+<style>
+body{font-family:-apple-system,'PingFang SC',sans-serif;background:#eef1f5;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;color:#20252b}
+.login-box{width:360px;background:#fff;border:1px solid #e2e6ec;border-radius:8px;padding:28px;box-sizing:border-box;text-align:center;box-shadow:0 4px 18px rgba(0,0,0,.08)}
+h1{font-size:21px;margin:0 0 8px}.status{font-size:15px;color:#667085;margin-bottom:18px;min-height:22px}
+#qrcode{width:300px;height:300px;margin:0 auto;display:flex;align-items:center;justify-content:center}
+#qrcode img,#qrcode canvas{display:block;max-width:100%}
+.actions{display:flex;gap:10px;justify-content:center;margin-top:18px}.actions a,.actions button{border:1px solid #cfd6df;background:#fff;color:#26384c;border-radius:6px;padding:9px 14px;text-decoration:none;font-size:15px;cursor:pointer}
+.actions button{background:#2f6fed;color:#fff;border-color:#2f6fed}
+</style></head>
+<body><main class="login-box"><h1>微信扫码登录</h1><div class="status" id="status">正在获取二维码</div>
+<div id="qrcode"></div><div class="actions"><a href="/">返回后台</a><button type="button" onclick="refreshQr()">刷新二维码</button></div></main>
+<script>
+var qr=null,lastCode='';
+async function refreshQr(){
+  var status=document.getElementById('status');
+  try{
+    var response=await fetch('/api/wechat-login/qrcode',{cache:'no-store'});
+    var data=await response.json();
+    if(data.logged_in){status.textContent='微信已登录';document.getElementById('qrcode').innerHTML='';return}
+    if(!data.success||!data.qr_url){status.textContent=data.message||'暂时无法获取二维码';return}
+    status.textContent='请使用微信扫描二维码';
+    if(data.qr_url!==lastCode){
+      var box=document.getElementById('qrcode');box.innerHTML='';
+      qr=new QRCode(box,{width:300,height:300});qr.makeCode(data.qr_url);lastCode=data.qr_url;
+    }
+  }catch(error){status.textContent='登录入口连接失败，请刷新重试'}
+}
+refreshQr();setInterval(refreshQr,15000);
+</script></body></html>"""
+
 ADMIN_PAGE = """<!DOCTYPE html>
 <html lang="zh-CN">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -2029,7 +2751,7 @@ header{background:#1f2d3d;color:#fff;padding:0 20px;height:52px;display:flex;ali
 header h1{font-size:19px;margin:0}
 header .right{display:flex;gap:12px;align-items:center;font-size:15px}
 header a,header button{color:#cfe0ff;background:none;border:0;cursor:pointer;font-size:15px;text-decoration:none}
-nav{display:flex;background:#fff;border-bottom:1px solid #e2e6ec;padding:0 20px;gap:4px}
+nav{display:flex;background:#fff;border-bottom:1px solid #e2e6ec;padding:0 20px;gap:4px;overflow-x:auto}
 nav button{border:0;background:none;padding:12px 16px;font-size:16px;cursor:pointer;color:#555;border-bottom:2px solid transparent}
 nav button.active{color:#2f6fed;border-bottom-color:#2f6fed;font-weight:600}
 main{padding:20px;max-width:1200px;margin:0 auto}
@@ -2044,8 +2766,12 @@ main{padding:20px;max-width:1200px;margin:0 auto}
 table{width:100%;border-collapse:collapse;background:#fff;font-size:15px;border-radius:8px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,.05)}
 th,td{border-bottom:1px solid #eef0f4;padding:8px 10px;text-align:left;vertical-align:top}
 th{background:#f6f8fa;font-weight:600;white-space:nowrap}
-.plain{white-space:pre-wrap;word-break:break-all;max-width:420px}
-.reply{color:#0a7d33}
+.plain{white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;max-width:420px}
+.reply{color:#0a7d33;white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word}
+.messages-table{table-layout:fixed;min-width:920px}
+.table-scroll{overflow-x:auto;width:100%}
+.session-actions{display:flex;gap:6px;flex-wrap:wrap}.session-actions .btn{padding:6px 9px}
+.transcript-row{border-bottom:1px solid #edf0f4;padding:12px 2px}.transcript-role{font-size:13px;color:#667085;margin-bottom:5px}.transcript-text{white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.55}
 .dim{color:#999}
 .toolbar{display:flex;gap:10px;margin-bottom:12px;flex-wrap:wrap;align-items:center}
 .toolbar input[type=text]{padding:8px 10px;border:1px solid #ccd2da;border-radius:6px;font-size:15px;min-width:240px}
@@ -2059,7 +2785,7 @@ pre{background:#0f1b2d;color:#c9d6e8;padding:14px;border-radius:8px;font-size:14
 label.switch{display:inline-flex;align-items:center;gap:8px;font-size:16px;cursor:pointer}
 form.inline{display:flex;flex-direction:column;gap:10px;max-width:560px}
 form.inline label{font-size:15px;color:#555}
-form.inline input[type=text],form.inline textarea{padding:9px 10px;border:1px solid #ccd2da;border-radius:6px;font-size:15px;font-family:inherit}
+form.inline input[type=text],form.inline input[type=password],form.inline textarea{padding:9px 10px;border:1px solid #ccd2da;border-radius:6px;font-size:15px;font-family:inherit}
 form.inline textarea{min-height:60px}
 form.inline .row{display:flex;gap:12px;align-items:center}
 a.link{color:#2f6fed;font-size:15px}
@@ -2068,8 +2794,8 @@ a.link{color:#2f6fed;font-size:15px}
 .badge.off{background:#fdeaea;color:#c0392b}
 </style></head>
 <body>
-<header><h1>🤖 微信机器人管理后台</h1>
-<div class="right"><span id="hdr-status">连接中…</span><button type="button" id="toggle-ids" onclick="toggleIds()">显示完整ID</button><a href="/api/export" download>下载完整记录</a><form method="post" action="/logout" style="display:inline"><button type="submit">退出登录</button></form></div>
+<header><h1>微信机器人管理后台</h1>
+<div class="right"><span id="hdr-status">连接中…</span><a id="login-entry" href="/wechat-login" target="_blank">扫码登录</a><a href="/api/export" download>下载记录</a><form method="post" action="/logout" style="display:inline"><button type="submit">退出登录</button></form></div>
 </header>
 <nav>
 <button class="active" onclick="switchTab('tab-status',this)">状态总览</button>
@@ -2078,7 +2804,8 @@ a.link{color:#2f6fed;font-size:15px}
 <button onclick="switchTab('tab-logs',this)">日志与报错</button>
 <button onclick="switchTab('tab-mgmt',this)">管理操作</button>
 <button onclick="switchTab('tab-users',this)">用户与权限</button>
-<button onclick="switchTab('tab-ai',this)">AI 配置</button>
+<button onclick="switchTab('tab-sessions',this);loadOpenClawSessions()">会话与上下文</button>
+<button onclick="switchTab('tab-ai',this);loadOpenClawConfig()">OpenClaw 配置</button>
 </nav>
 <main>
 <div id="tab-status" class="tab active">
@@ -2113,8 +2840,8 @@ a.link{color:#2f6fed;font-size:15px}
     <button onclick="loadMessages(0)">搜索</button>
     <span id="msg-page" style="font-size:15px;color:#666"></span>
   </div>
-  <table><thead><tr><th>时间</th><th>会话</th><th>发送者</th><th>内容</th><th>@我</th><th>自动回复</th></tr></thead>
-  <tbody id="msg-body"></tbody></table>
+  <div class="table-scroll"><table class="messages-table"><colgroup><col style="width:150px"><col style="width:100px"><col style="width:150px"><col style="width:230px"><col style="width:55px"><col style="width:235px"></colgroup><thead><tr><th>时间</th><th>会话</th><th>发送者</th><th>内容</th><th>@我</th><th>自动回复</th></tr></thead>
+  <tbody id="msg-body"></tbody></table></div>
   <div class="toolbar" style="margin-top:12px">
     <button onclick="loadMessages((window._mpage||0)-1)">上一页</button>
     <button onclick="loadMessages((window._mpage||0)+1)">下一页</button>
@@ -2180,25 +2907,40 @@ a.link{color:#2f6fed;font-size:15px}
   </div>
 </div>
 
+<div id="tab-sessions" class="tab">
+  <div class="panel">
+    <div class="toolbar"><button onclick="loadOpenClawSessions()">刷新会话</button><span id="session-result" class="dim"></span></div>
+    <div class="table-scroll"><div id="session-list">加载中</div></div>
+  </div>
+  <div class="panel">
+    <h3>对话记录</h3>
+    <div id="session-detail" class="dim">选择一个会话查看输入、输出和压缩记录</div>
+  </div>
+</div>
+
 <div id="tab-ai" class="tab">
   <div class="panel">
-    <h3>AI 接口配置（OpenAI 兼容格式）</h3>
-    <form class="inline" onsubmit="event.preventDefault();saveAI()">
-      <label>接口地址 Base URL（如 https://api.deepseek.com 或 https://你的网关/v1）</label>
-      <input type="text" id="ai-base" placeholder="https://api.example.com" autocomplete="off">
-      <label>API Key</label>
-      <input type="text" id="ai-key" placeholder="sk-..." autocomplete="off">
-      <label>模型 <span id="ai-model-status" class="dim"></span></label>
+    <h3>OpenClaw Gateway 配置</h3>
+    <form class="inline" onsubmit="event.preventDefault();saveOpenClawConfig()">
+      <label class="switch"><input type="checkbox" id="claw-enabled"> 启用 OpenClaw 对话</label>
+      <label>Gateway Base URL</label>
+      <input type="text" id="claw-base" placeholder="http://127.0.0.1:18788/v1" autocomplete="off">
+      <label>Gateway Token</label>
+      <input type="password" id="claw-key" placeholder="输入新 token；留着掩码表示不修改" autocomplete="new-password">
+      <label>模型 <span id="claw-model-status" class="dim"></span></label>
       <div class="row">
-        <input type="text" id="ai-model" placeholder="模型名，如 deepseek-chat" style="flex:1">
-        <button class="btn2" type="button" onclick="fetchModels()">获取模型列表</button>
+        <input type="text" id="claw-model" placeholder="openclaw:wxbot" style="flex:1">
+        <button class="btn2" type="button" onclick="fetchOpenClawModels()">获取模型</button>
       </div>
+      <label>Session 索引文件</label>
+      <input type="text" id="claw-index" placeholder="/root/openclaw/openclaw_space/agents/wxbot/sessions/sessions.json">
+      <label>Transcript 目录</label>
+      <input type="text" id="claw-transcripts" placeholder="/root/openclaw/openclaw_space/agents/wxbot/sessions">
       <div class="row">
         <button type="submit">保存配置</button>
-        <button class="btn2" type="button" onclick="testAI()">测试连接</button>
-        <span id="ai-result" style="font-size:15px;color:#666;word-break:break-all"></span>
+        <button class="btn2" type="button" onclick="testOpenClaw()">测试连接</button>
+        <span id="claw-result" style="font-size:15px;color:#666;word-break:break-all"></span>
       </div>
-      <div class="dim" style="font-size:14px">保存后可直接 @机器人 提问使用；AI 为单次问答，不携带上下文。</div>
     </form>
   </div>
 </div>
@@ -2217,24 +2959,6 @@ async function api(path,opts){
   return r.json();
 }
 function fmtTime(t){return t||''}
-var showIds=false;
-try{showIds=localStorage.getItem('wxbot_show_ids')==='1'}catch(e){}
-function shortId(id){
-  if(!id)return'';
-  if(showIds||id.length<=14)return id;
-  return id.slice(0,10)+'…'+id.slice(-4);
-}
-function toggleIds(){
-  showIds=!showIds;
-  try{localStorage.setItem('wxbot_show_ids',showIds?'1':'0')}catch(e){}
-  var b=document.getElementById('toggle-ids');
-  if(b)b.textContent=showIds?'隐藏完整ID':'显示完整ID';
-  loadOverview();loadUsers();
-}
-function initIdsBtn(){
-  var b=document.getElementById('toggle-ids');
-  if(b)b.textContent=showIds?'隐藏完整ID':'显示完整ID';
-}
 async function refreshStatus(){
   try{
     var s=await api('/api/status');
@@ -2268,7 +2992,7 @@ async function loadMessages(page){
     if(!d.items.length){body.innerHTML='<tr><td colspan="6" style="color:#999">暂无消息</td></tr>'}
     d.items.forEach(function(m){
       var tr=document.createElement('tr');
-      tr.innerHTML='<td>'+esc(fmtTime(m.time))+'</td><td>'+esc(m.room||'私聊')+'</td><td>'+esc(m.from)+(m.fromId?'<div class="dim">'+esc(m.fromId)+'</div>':'')+'</td>'
+      tr.innerHTML='<td>'+esc(fmtTime(m.time))+'</td><td>'+esc(m.room||'私聊')+'</td><td>'+esc(m.from)+(m.user_ref?'<div class="dim">'+esc(m.user_ref)+'</div>':'')+'</td>'
         +'<td class="plain">'+esc(m.content)+'</td><td>'+(m.isMentioned?'是':'')+'</td>'
         +'<td class="reply">'+esc(m.reply||'')+'</td>';
       body.appendChild(tr);
@@ -2300,41 +3024,43 @@ async function sendMsg(){
     $('send-result').textContent=JSON.stringify(r);
   }catch(e){$('send-result').textContent='请求失败'}
 }
-async function loadAI(){
+async function loadOpenClawConfig(){
   try{
-    var d=await api('/api/ai');var a=d.ai||{};
-    $('ai-base').value=a.base_url||'';$('ai-key').value=a.api_key||'';$('ai-model').value=a.model||'';
-    $('ai-model-status').textContent=a.base_url?(a.model?'已配置 '+esc(a.model):'已填地址，未配模型'):'未配置';
+    var d=await api('/api/openclaw/config');var a=d.openclaw||{};
+    $('claw-enabled').checked=!!a.enabled;$('claw-base').value=a.base_url||'';$('claw-key').value=a.api_key||'';
+    $('claw-model').value=a.model||'openclaw:wxbot';$('claw-index').value=a.session_index||'';$('claw-transcripts').value=a.transcript_dir||'';
+    $('claw-model-status').textContent=a.base_url?(a.model?'已配置 '+esc(a.model):'已填地址，未配模型'):'未配置';
   }catch(e){}
 }
-async function saveAI(){
-  var body={base_url:$('ai-base').value.trim(),api_key:$('ai-key').value.trim(),model:$('ai-model').value.trim()};
-  try{
-    var d=await api('/api/ai',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-    $('ai-result').textContent='✅ 已保存';loadAI();
-  }catch(e){$('ai-result').textContent='保存失败'}
+function openClawForm(){
+  return {enabled:$('claw-enabled').checked,base_url:$('claw-base').value.trim(),api_key:$('claw-key').value.trim(),model:$('claw-model').value.trim(),session_index:$('claw-index').value.trim(),transcript_dir:$('claw-transcripts').value.trim()};
 }
-async function testAI(){
-  $('ai-result').textContent='测试中…';
-  var body={base_url:$('ai-base').value.trim(),api_key:$('ai-key').value.trim(),model:$('ai-model').value.trim()};
+async function saveOpenClawConfig(){
   try{
-    var d=await api('/api/ai/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-    $('ai-result').textContent=d.success?('✅ '+esc(d.reply).slice(0,120)):('❌ '+esc(d.message||'未知错误'));
-  }catch(e){$('ai-result').textContent='请求失败'}
+    await api('/api/openclaw/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(openClawForm())});
+    $('claw-result').textContent='已保存';loadOpenClawConfig();
+  }catch(e){$('claw-result').textContent='保存失败'}
 }
-async function fetchModels(){
-  $('ai-model-status').textContent='获取中…';
+async function testOpenClaw(){
+  $('claw-result').textContent='测试中';
   try{
-    var d=await api('/api/ai/models');
-    if(!d.success){$('ai-model-status').textContent='❌ '+esc(d.message);return}
+    var d=await api('/api/openclaw/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(openClawForm())});
+    $('claw-result').textContent=d.success?esc(d.reply).slice(0,120):esc(d.message||'连接失败');
+  }catch(e){$('claw-result').textContent='请求失败'}
+}
+async function fetchOpenClawModels(){
+  $('claw-model-status').textContent='获取中';
+  try{
+    var d=await api('/api/openclaw/models');
+    if(!d.success){$('claw-model-status').textContent=esc(d.message);return}
     if(d.models&&d.models.length){
       var opts=d.models.map(function(m){return '<option value="'+esc(m)+'">'+esc(m)+'</option>'}).join('');
-      var cur=$('ai-model').value.trim();
-      $('ai-model').outerHTML='<input type="text" id="ai-model" list="ai-model-list" placeholder="模型名" style="flex:1"><datalist id="ai-model-list">'+opts+'</datalist>';
-      $('ai-model').value=cur;
+      var cur=$('claw-model').value.trim();
+      $('claw-model').outerHTML='<input type="text" id="claw-model" list="claw-model-list" placeholder="openclaw:wxbot" style="flex:1"><datalist id="claw-model-list">'+opts+'</datalist>';
+      $('claw-model').value=cur;
     }
-    $('ai-model-status').textContent='✅ 共 '+(d.models?d.models.length:0)+' 个模型（可在输入框下拉选择）';
-  }catch(e){$('ai-model-status').textContent='获取失败'}
+    $('claw-model-status').textContent='共 '+(d.models?d.models.length:0)+' 个模型';
+  }catch(e){$('claw-model-status').textContent='获取失败'}
 }
 function fmtRemind(at){
   if(!at)return '';
@@ -2347,8 +3073,8 @@ async function loadReminders(){
     if(!rs.length){$('reminder-list').innerHTML='<span class="dim">暂无提醒</span>';return}
     var h='<table><thead><tr><th>编号</th><th>触发时间</th><th>发送者</th><th>内容</th><th>操作</th></tr></thead><tbody>';
     rs.sort(function(a,b){return (a.at||0)-(b.at||0)}).forEach(function(r){
-      h+='<tr><td>'+esc(r.id)+'</td><td>'+esc(fmtRemind(r.at))+'</td><td>'+esc(r.from_name||r.from_id)+'</td>'
-        +'<td class="plain">'+esc(r.text)+'</td><td><button class="btn" data-rid="'+esc(r.id)+'" onclick="cancelReminder(this)">取消</button></td></tr>';
+      h+='<tr><td>'+esc(r.ref)+'</td><td>'+esc(fmtRemind(r.at))+'</td><td>'+esc(r.from_name||r.user_ref)+'</td>'
+        +'<td class="plain">'+esc(r.text)+'</td><td><button class="btn" data-rid="'+esc(r.ref)+'" onclick="cancelReminder(this)">取消</button></td></tr>';
     });
     $('reminder-list').innerHTML=h+'</tbody></table>';
   }catch(e){}
@@ -2357,7 +3083,7 @@ async function cancelReminder(btn){
   var id=btn?btn.getAttribute('data-rid'):'';
   if(!id)return;
   try{
-    await api('/api/reminders/cancel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id})});
+    await api('/api/reminders/cancel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ref:id})});
     loadReminders();
   }catch(e){}
 }
@@ -2367,10 +3093,10 @@ async function loadSubs(){
     if(!ss.length){$('subs-list').innerHTML='<span class="dim">暂无订阅</span>';return}
     var h='<table><thead><tr><th>时间</th><th>用户</th><th>推送位置</th><th>城市</th><th>最近推送</th><th>操作</th></tr></thead><tbody>';
     ss.forEach(function(s){
-      var where=s.room_id?('群聊 '+esc(s.room_name||s.room_id)):'私聊';
-      h+='<tr><td>'+esc(s.time)+'</td><td>'+esc(s.from_name||s.from_id)+'</td><td>'+where+'</td>'
+      var where=s.room_ref?('群聊 '+esc(s.room_name||s.room_ref)):'私聊';
+      h+='<tr><td>'+esc(s.time)+'</td><td>'+esc(s.from_name||s.user_ref)+'</td><td>'+where+'</td>'
         +'<td>'+esc(s.city_label||s.city)+'</td><td>'+esc(s.last_sent||'-')+'</td>'
-        +'<td><button class="btn" data-rid="'+esc(s.id)+'" onclick="cancelSub(this)">取消</button></td></tr>';
+        +'<td><button class="btn" data-rid="'+esc(s.ref)+'" onclick="cancelSub(this)">取消</button></td></tr>';
     });
     $('subs-list').innerHTML=h+'</tbody></table>';
   }catch(e){}
@@ -2379,7 +3105,7 @@ async function cancelSub(btn){
   var id=btn?btn.getAttribute('data-rid'):'';
   if(!id)return;
   try{
-    await api('/api/subs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'cancel',id:id})});
+    await api('/api/subs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'cancel',ref:id})});
     loadSubs();
   }catch(e){}
 }
@@ -2402,7 +3128,7 @@ async function loadOverview(){
       }
       var aiTxt=u.ai_count?('共 '+u.ai_count+' 次'+(u.ai_last?'<br><span class="dim">'+esc(u.ai_last)+'</span>':'')):'—';
       var balance=(Number(u.balance)>0?'+':'')+u.balance;
-      h+='<tr><td>'+esc(u.name)+'<br><span class="dim" title="'+esc(u.fromId)+'">'+esc(shortId(u.fromId))+'</span></td><td>'+roleTxt+'</td>'
+      h+='<tr><td>'+esc(u.name)+'<br><span class="dim">'+esc(u.user_ref)+'</span></td><td>'+roleTxt+'</td>'
         +'<td>'+subsTxt+'</td><td>'+u.reminders+' 条</td>'
         +'<td>'+esc(balance)+'（'+u.count+'笔）</td><td>'+aiTxt+'</td>'
         +'<td>'+esc(u.last_seen||'-')+'</td></tr>';
@@ -2415,13 +3141,13 @@ async function loadUsers(){
   try{
     var d=await api('/api/users');var us=d.users||[];
     if(!us.length){$('user-list').innerHTML='<span class="dim">还没有见过任何用户（有人发消息后才会出现在这里）</span>';return}
-    var h='<table><thead><tr><th>昵称</th><th>微信ID</th><th>最后活跃</th><th>余额</th><th>状态</th><th>操作</th></tr></thead><tbody>';
+    var h='<table><thead><tr><th>昵称</th><th>用户引用</th><th>最后活跃</th><th>余额</th><th>状态</th><th>操作</th></tr></thead><tbody>';
     us.forEach(function(u){
       var roleTxt=u.role==='member'?'<span class="badge on">已授权（含 AI）</span>':'<span class="badge off">未授权（基础功能）</span>';
       var btns=u.role==='member'
-        ?'<button class="btn btn2" data-a="revoke" data-f="'+esc(u.fromId)+'" onclick="userAct(this)">取消授权</button>'
-        :'<button class="btn" data-a="grant" data-f="'+esc(u.fromId)+'" onclick="userAct(this)">授权</button>';
-      h+='<tr><td>'+esc(u.name)+'</td><td class="plain" title="'+esc(u.fromId)+'">'+esc(shortId(u.fromId))+'</td><td>'+esc(u.last_seen)+'</td>'
+        ?'<button class="btn btn2" data-a="revoke" data-f="'+esc(u.user_ref)+'" onclick="userAct(this)">取消授权</button>'
+        :'<button class="btn" data-a="grant" data-f="'+esc(u.user_ref)+'" onclick="userAct(this)">授权</button>';
+      h+='<tr><td>'+esc(u.name)+'</td><td class="plain">'+esc(u.user_ref)+'</td><td>'+esc(u.last_seen)+'</td>'
         +'<td>'+esc(fmtSigned(u.balance))+'</td><td>'+roleTxt+'</td><td>'+btns+'</td></tr>';
     });
     $('user-list').innerHTML=h+'</tbody></table>';
@@ -2432,9 +3158,50 @@ async function userAct(btn){
   var fid=btn.getAttribute('data-f');
   if(!action||!fid)return;
   try{
-    await api('/api/users',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:action,from_id:fid})});
+    await api('/api/users',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:action,user_ref:fid})});
     loadUsers();refreshStatus();
   }catch(e){}
+}
+async function loadOpenClawSessions(){
+  var list=$('session-list'),result=$('session-result');
+  try{
+    var d=await api('/api/openclaw/sessions');var sessions=d.sessions||[];
+    if(!sessions.length){list.innerHTML='<span class="dim">暂无 OpenClaw 会话</span>';return}
+    var h='<table><thead><tr><th>用户</th><th>会话引用</th><th>最近更新</th><th>上下文</th><th>消息</th><th>压缩</th><th>操作</th></tr></thead><tbody>';
+    sessions.forEach(function(s){
+      var state=s.active?'<span class="badge on">当前</span> ':'';
+      h+='<tr><td>'+esc(s.user_name)+'<br><span class="dim">'+esc(s.user_ref)+'</span></td>'
+        +'<td>'+state+esc(s.session_ref)+'</td><td>'+esc(s.updated_at||'-')+'</td>'
+        +'<td>'+esc(s.context_text||'暂无统计')+'</td><td>'+esc(s.message_count)+'</td><td>'+esc(s.compaction_count)+'</td>'
+        +'<td><div class="session-actions"><button class="btn" onclick="viewOpenClawSession(\\''+esc(s.session_ref)+'\\')">查看</button>'
+        +'<button class="btn btn2" onclick="openClawSessionAction(\\'compact\\',\\''+esc(s.session_ref)+'\\')">压缩</button>'
+        +'<button class="btn btn2" onclick="openClawSessionAction(\\'new\\',\\''+esc(s.session_ref)+'\\')">新会话</button>'
+        +'<button class="btn btn2" onclick="openClawSessionAction(\\'activate\\',\\''+esc(s.session_ref)+'\\')">设为当前</button></div></td></tr>';
+    });
+    list.innerHTML=h+'</tbody></table>';result.textContent='共 '+sessions.length+' 个会话';
+  }catch(e){list.innerHTML='<span class="bad">会话加载失败</span>'}
+}
+async function viewOpenClawSession(ref){
+  var detail=$('session-detail');detail.textContent='加载中';
+  try{
+    var d=await api('/api/openclaw/sessions/'+encodeURIComponent(ref));
+    var rows=(d.messages||[]).map(function(m){
+      var role=m.role==='user'?'用户输入':'OpenClaw 输出';
+      return '<div class="transcript-row"><div class="transcript-role">'+role+' · '+esc(m.timestamp||'')+'</div><div class="transcript-text">'+esc(m.content||'')+'</div></div>';
+    });
+    (d.compactions||[]).forEach(function(c){
+      rows.push('<div class="transcript-row"><div class="transcript-role">上下文压缩 · '+esc(c.timestamp||'')+'</div><div class="transcript-text">'+esc(c.summary||'已压缩上下文')+'</div></div>');
+    });
+    detail.className='';detail.innerHTML=rows.join('')||'<span class="dim">该会话暂无消息</span>';
+  }catch(e){detail.className='bad';detail.textContent='会话详情加载失败'}
+}
+async function openClawSessionAction(action,ref){
+  var result=$('session-result');result.textContent='处理中';
+  try{
+    var d=await api('/api/openclaw/sessions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:action,session_ref:ref})});
+    result.textContent=d.success?(d.reply||'操作完成'):(d.message||'操作失败');
+    await loadOpenClawSessions();
+  }catch(e){result.textContent='操作失败'}
 }
 async function grantManual(){
   var fid=$('grant-id').value.trim();
@@ -2444,11 +3211,10 @@ async function grantManual(){
     $('grant-result').textContent='✅ 已授权';$('grant-id').value='';$('grant-name').value='';loadUsers();refreshStatus();
   }catch(e){$('grant-result').textContent='授权失败'}
 }
-initIdsBtn();
 refreshStatus();
 loadMessages(0);
 loadLogs();
-loadAI();
+loadOpenClawConfig();
 loadUsers();
 loadReminders();
 loadSubs();
@@ -2462,6 +3228,103 @@ setInterval(loadOverview,30000);
 setInterval(loadUsers,30000);
 </script>
 </body></html>"""
+
+
+# ---------------- 后台会话 API 数据 ----------------
+def _openclaw_session_public(item, user_name=""):
+    return {
+        "user_ref": item.get("user_ref", ""),
+        "session_ref": item.get("session_ref", ""),
+        "user_name": public_display_name(user_name, item.get("_user_id")),
+        "updated_at": item.get("updated_at", ""),
+        "context_used": item.get("context_used"),
+        "context_limit": item.get("context_limit"),
+        "context_text": format_context_usage(item.get("context_used"), item.get("context_limit")),
+        "message_count": item.get("message_count", 0),
+        "compaction_count": item.get("compaction_count", 0),
+        "active": bool(item.get("_active")),
+    }
+
+
+def _openclaw_session_records():
+    result = openclaw_parse_sessions_index()
+    with OPENCLAW_REGISTRY_LOCK:
+        registry = _openclaw_registry_load().get("users", {})
+    with USERS_LOCK:
+        users = load_users().get("users", {})
+    names = {str(k): str(v.get("name") or "") for k, v in users.items() if isinstance(v, dict)}
+    sessions = result.get("sessions", [])
+    for item in sessions:
+        active_key = str((registry.get(item.get("_user_id")) or {}).get("active_key") or item.get("_user_id") or "")
+        item["_active"] = item.get("_session_key") == _OPENCLAW_INDEX_PREFIX + active_key
+    return sessions, names
+
+
+def _find_openclaw_session(session_ref=""):
+    sessions, names = _openclaw_session_records()
+    wanted = str(session_ref or "").strip()
+    for item in sessions:
+        if item.get("session_ref") == wanted:
+            return item, names
+    # 命令接口只接受短引用；兼容旧后台首次升级时传来的占位引用。
+    if len(sessions) == 1 and wanted in ("session-old", "current"):
+        return sessions[0], names
+    return None, names
+
+
+def _openclaw_activate_session(user_id, session_key):
+    with OPENCLAW_REGISTRY_LOCK:
+        data = _openclaw_registry_load()
+        data["users"][str(user_id)] = {
+            "active_key": str(session_key),
+            "created_at": now_str(),
+        }
+        _openclaw_registry_save(data)
+    return str(session_key)
+
+
+def _public_message_record(record):
+    item = dict(record or {})
+    from_id = item.pop("fromId", "")
+    room_id = item.pop("roomId", "")
+    stable_id = identity_existing_user_id(from_id) or from_id
+    sender = str(item.get("from") or "")
+    if sender:
+        item["from"] = public_display_name(sender, stable_id)
+    item["user_ref"] = _short_ref(stable_id, "u") if stable_id else ""
+    item["room_ref"] = _short_ref(room_id, "r") if room_id else ""
+    item["reply"] = clean_wechat_reply(item.get("reply"))
+    return item
+
+
+def _public_user_record(fid, info, ledger, members):
+    stable_fid = identity_existing_user_id(fid) or fid
+    l = ledger.get(fid) or ledger.get(stable_fid)
+    return {
+        "user_ref": public_user_ref(stable_fid),
+        "name": public_display_name(info.get("name"), stable_fid) or "未命名用户",
+        "last_seen": info.get("last_seen") or "",
+        "balance": l["balance"] if l else 0,
+        "count": len(l["entries"]) if l else 0,
+        "role": "member" if fid in members or stable_fid in members else None,
+    }
+
+
+def _resolve_user_ref(value):
+    value = str(value or "").strip()
+    if not value:
+        return ""
+    identity_id = identity_existing_user_id(value)
+    if identity_id:
+        return identity_id
+    with USERS_LOCK:
+        users = load_users().get("users", {})
+    with PERM_LOCK:
+        members = load_permissions().get("members", {})
+    for fid in set(users) | set(members):
+        if value == fid or value == _short_ref(fid, "u"):
+            return fid
+    return value if len(value) < 80 else ""
 
 
 # ---------------- HTTP Handler ----------------
@@ -2543,11 +3406,33 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._send(LOGIN_PAGE.replace("__ERR__", ""), 200, "text/html; charset=utf-8")
             return
+        if path == "/wechat-login/qrcode.js":
+            if not self._require_auth():
+                return
+            try:
+                self._send(fetch_wechat_qrcode_script(), 200, "application/javascript; charset=utf-8",
+                           {"Cache-Control": "no-store"})
+            except Exception as e:
+                log_error("加载微信二维码脚本失败: {}".format(e))
+                self._send("", 502, "application/javascript; charset=utf-8")
+            return
+        if path == "/wechat-login":
+            if not self._authed():
+                self._redirect("/login")
+            else:
+                self._send(WECHAT_LOGIN_PAGE, 200, "text/html; charset=utf-8",
+                           {"Cache-Control": "no-store"})
+            return
         if path == "/api/export":
             if not self._require_auth():
                 return
-            data = tail_file(LOG_FILE, 100000)
-            self._send("\n".join(data), 200, "text/plain; charset=utf-8")
+            exported = []
+            for line in tail_file(LOG_FILE, 100000):
+                try:
+                    exported.append(json.dumps(_public_message_record(json.loads(line)), ensure_ascii=False))
+                except Exception:
+                    exported.append(public_log_line(line))
+            self._send("\n".join(exported), 200, "text/plain; charset=utf-8")
             return
         if path.startswith("/api/"):
             if not self._require_auth():
@@ -2572,11 +3457,27 @@ class Handler(BaseHTTPRequestHandler):
                 "stats": {
                     "total": STATS["total"],
                     "today": STATS["today"],
-                    "last": STATS["last"],
+                    "last": _public_message_record(STATS["last"]) if STATS["last"] else None,
                     "last_error": STATS["last_error"],
                     "since": STATS.get("since", ""),
                 },
-                "login_url": PUBLIC_BASE + "/login?token=" + bot_token(),
+                "login_url": "/wechat-login",
+            })
+        elif path == "/api/wechat-login/qrcode":
+            status = bot_status()
+            if status.get("logged_in"):
+                self._json({"success": True, "logged_in": True, "qr_url": ""})
+                return
+            try:
+                qr_url = fetch_wechat_login_qr()
+            except Exception as e:
+                log_error("获取微信登录二维码失败: {}".format(e))
+                qr_url = ""
+            self._json({
+                "success": bool(qr_url),
+                "logged_in": False,
+                "qr_url": qr_url,
+                "message": "" if qr_url else "暂时无法获取二维码，请稍后刷新",
             })
         elif path == "/api/messages":
             q = (qs.get("q") or [""])[0].strip()
@@ -2593,39 +3494,62 @@ class Handler(BaseHTTPRequestHandler):
                          or low in (m.get("room") or "").lower()]
             total = len(items)
             items = list(reversed(items))[page * limit:(page + 1) * limit]
-            self._json({"total": total, "page": page, "limit": limit, "items": items})
+            self._json({"total": total, "page": page, "limit": limit,
+                        "items": [_public_message_record(item) for item in items]})
         elif path == "/api/logs":
             only_err = (qs.get("err") or ["0"])[0] == "1"
             bot_lines = self._bot_log_lines(only_err)
             error_lines = tail_file(ERROR_LOG, 200)
             system_lines = tail_file(SYSTEM_LOG, 200)
             self._json({
-                "botLines": bot_lines,
-                "errorLines": [l.get("time") + " " + l.get("msg") if isinstance(l, dict) else str(l) for l in error_lines],
-                "systemLines": system_lines if isinstance(system_lines, list) and system_lines and isinstance(system_lines[0], str) else [json.dumps(l, ensure_ascii=False) if isinstance(l, dict) else str(l) for l in system_lines],
+                "botLines": [public_log_line(line) for line in bot_lines],
+                "errorLines": [public_log_line(l.get("time") + " " + l.get("msg")) if isinstance(l, dict) else public_log_line(l) for l in error_lines],
+                "systemLines": [public_log_line(l) for l in system_lines] if isinstance(system_lines, list) and system_lines and isinstance(system_lines[0], str) else [public_log_line(json.dumps(l, ensure_ascii=False) if isinstance(l, dict) else l) for l in system_lines],
             })
         elif path == "/api/config":
             self._json(public_config(load_config()))
-        elif path == "/api/ai":
-            ai = dict(ai_config())
-            key = ai.get("api_key") or ""
-            if key:
-                ai["api_key"] = (key[:6] + "****" + key[-4:]) if len(key) > 12 else "****"
-            self._json({"success": True, "ai": ai})
-        elif path == "/api/ai/models":
+        elif path == "/api/openclaw/config":
+            self._json({"success": True, "openclaw": public_openclaw_config(openclaw_config())})
+        elif path == "/api/openclaw/models":
             try:
-                ids = ai_fetch_models()
+                ids = openclaw_fetch_models()
                 self._json({"success": True, "models": ids})
             except Exception as e:
                 self._json({"success": False, "message": str(e)[:200]})
+        elif path.startswith("/api/ai"):
+            self._json({"success": False, "message": "旧 AI 配置已移除，请使用 OpenClaw 配置"}, 410)
         elif path == "/api/reminders":
             with REMINDER_LOCK:
                 data = load_reminders()
-            self._json({"success": True, "reminders": data["reminders"]})
+            reminders = []
+            for item in data["reminders"]:
+                public = dict(item)
+                rid = public.pop("id", "")
+                fid = public.pop("from_id", "")
+                room_id = public.pop("room_id", "")
+                public["ref"] = _short_ref(rid, "r")
+                public["user_ref"] = public_user_ref(fid)
+                public["room_ref"] = _short_ref(room_id, "r") if room_id else ""
+                public["from_name"] = public_display_name(public.get("from_name"), fid)
+                public["room_name"] = public_log_line(public.get("room_name") or "")
+                reminders.append(public)
+            self._json({"success": True, "reminders": reminders})
         elif path == "/api/subs":
             with SUBS_LOCK:
                 d = load_subs()
-            self._json({"success": True, "subs": d.get("subscriptions", [])})
+            subs = []
+            for item in d.get("subscriptions", []):
+                public = dict(item)
+                sid = public.pop("id", "")
+                fid = public.pop("from_id", "")
+                room_id = public.pop("room_id", "")
+                public["ref"] = _short_ref(sid, "s")
+                public["user_ref"] = public_user_ref(fid)
+                public["room_ref"] = _short_ref(room_id, "r") if room_id else ""
+                public["from_name"] = public_display_name(public.get("from_name"), fid)
+                public["room_name"] = public_log_line(public.get("room_name") or "")
+                subs.append(public)
+            self._json({"success": True, "subs": subs})
         elif path == "/api/overview":
             with USERS_LOCK:
                 users = load_users()["users"]
@@ -2654,12 +3578,12 @@ class Handler(BaseHTTPRequestHandler):
             for fid, info in users.items():
                 l = ledger.get(fid)
                 my_subs = [{"time": s.get("time"), "city": s.get("city_label") or s.get("city"),
-                            "room": s.get("room_name") or ""}
+                            "room": public_log_line(s.get("room_name") or "")}
                            for s in subs if s.get("from_id") == fid]
                 my_rem = [r for r in reminders if r.get("from_id") == fid]
                 ai = ai_stats.get(fid, {})
                 out.append({
-                    "fromId": fid, "name": info.get("name") or fid,
+                    "user_ref": public_user_ref(fid), "name": public_display_name(info.get("name"), fid) or "未命名用户",
                     "last_seen": info.get("last_seen") or "",
                     "role": "member" if fid in members else None,
                     "balance": l["balance"] if l else 0,
@@ -2676,7 +3600,11 @@ class Handler(BaseHTTPRequestHandler):
                 p = load_permissions()
             self._json({
                 "success": True,
-                "members": p.get("members", {}),
+                "members": [
+                    {"user_ref": public_user_ref(fid),
+                     "name": public_display_name(info.get("name"), fid) or "未命名用户"}
+                    for fid, info in p.get("members", {}).items()
+                ],
             })
         elif path == "/api/users":
             with USERS_LOCK:
@@ -2686,22 +3614,41 @@ class Handler(BaseHTTPRequestHandler):
                 p = load_permissions()
             members = p.get("members", {})
             out = []
+            seen = set()
             for fid, info in users.items():
-                l = ledger.get(fid)
-                out.append({
-                    "fromId": fid,
-                    "name": info.get("name") or fid,
-                    "last_seen": info.get("last_seen") or "",
-                    "balance": l["balance"] if l else 0,
-                    "count": len(l["entries"]) if l else 0,
-                    "role": "member" if fid in members else None,
-                })
+                out.append(_public_user_record(fid, info, ledger, members))
+                seen.add(fid)
             for fid, info in members.items():
-                if not any(u["fromId"] == fid for u in out):
-                    out.append({"fromId": fid, "name": info.get("name") or fid, "last_seen": "",
-                                "balance": 0, "count": 0, "role": "member"})
+                if fid not in seen:
+                    out.append(_public_user_record(fid, info, ledger, members))
             out.sort(key=lambda x: x["last_seen"], reverse=True)
             self._json({"success": True, "users": out})
+        elif path == "/api/openclaw/sessions":
+            sessions, names = _openclaw_session_records()
+            self._json({
+                "success": True,
+                "sessions": [_openclaw_session_public(item, names.get(item.get("_user_id"), ""))
+                             for item in sessions],
+            })
+        elif path.startswith("/api/openclaw/sessions/"):
+            session_ref = urllib.parse.unquote(path.rsplit("/", 1)[-1])
+            item, names = _find_openclaw_session(session_ref)
+            if not item:
+                self._json({"success": False, "message": "session 不存在"}, 404)
+                return
+            transcript = item.get("_transcript") or []
+            messages = [
+                {"role": rec.get("role"), "content": clean_wechat_reply(rec.get("content")),
+                 "timestamp": rec.get("timestamp", "")}
+                for rec in transcript if rec.get("role") in ("user", "assistant")
+            ]
+            compactions = [dict(rec) for rec in transcript if rec.get("type") == "compaction"]
+            self._json({
+                "success": True,
+                "session": _openclaw_session_public(item, names.get(item.get("_user_id"), "")),
+                "messages": messages,
+                "compactions": compactions,
+            })
         else:
             self._json({"success": False, "message": "not found"}, 404)
 
@@ -2778,7 +3725,62 @@ class Handler(BaseHTTPRequestHandler):
                 data = json.loads(body.decode("utf-8", "ignore") or "{}")
             except Exception:
                 data = {}
-            if path == "/api/config":
+            if path == "/api/openclaw/sessions":
+                action = str(data.get("action") or "").strip().lower()
+                item, _names = _find_openclaw_session(data.get("session_ref"))
+                if action == "new":
+                    if not item:
+                        self._json({"success": False, "message": "session 不存在"}, 404)
+                        return
+                    key = openclaw_start_new_session(item.get("_user_id"))
+                    self._json({"success": True, "active_session_ref": _short_ref(key, "s")})
+                elif action == "compact":
+                    if not item:
+                        self._json({"success": False, "message": "session 不存在"}, 404)
+                        return
+                    try:
+                        reply = openclaw_compact_session(item.get("_user_id"))
+                        self._json({"success": True, "reply": clean_wechat_reply(reply)})
+                    except Exception:
+                        self._json({"success": False, "message": "上下文压缩失败"}, 500)
+                elif action == "activate":
+                    if not item:
+                        self._json({"success": False, "message": "session 不存在"}, 404)
+                        return
+                    _openclaw_activate_session(item.get("_user_id"), item.get("_session_key"))
+                    self._json({"success": True, "active_session_ref": item.get("session_ref")})
+                else:
+                    self._json({"success": False, "message": "unknown action"})
+            elif path == "/api/openclaw/config":
+                cfg = load_config()
+                claw = cfg.setdefault("openclaw", {})
+                if "enabled" in data:
+                    claw["enabled"] = bool(data.get("enabled"))
+                for field in ("base_url", "model", "session_index", "transcript_dir"):
+                    if field in data:
+                        claw[field] = str(data.get(field) or "").strip()
+                new_key = str(data.get("api_key") or "").strip()
+                if new_key and "*" not in new_key:
+                    claw["api_key"] = new_key
+                elif "api_key" in data and not new_key:
+                    claw["api_key"] = ""
+                cfg.pop("ai", None)
+                save_config(cfg)
+                self._json({"success": True, "config": public_config(cfg)})
+            elif path == "/api/openclaw/test":
+                try:
+                    tmp = dict(openclaw_config())
+                    for field in ("enabled", "base_url", "model", "session_index", "transcript_dir"):
+                        if field in data:
+                            tmp[field] = bool(data[field]) if field == "enabled" else str(data[field] or "").strip()
+                    new_key = str(data.get("api_key") or "").strip()
+                    if new_key and "*" not in new_key:
+                        tmp["api_key"] = new_key
+                    reply = openclaw_chat("你好，请只回复：连接正常", cfg=tmp, timeout=20)
+                    self._json({"success": True, "reply": reply})
+                except Exception as e:
+                    self._json({"success": False, "message": str(e)[:200]})
+            elif path == "/api/config":
                 cfg = load_config()
                 if "auto_reply" in data:
                     cfg["auto_reply"] = bool(data["auto_reply"])
@@ -2797,45 +3799,16 @@ class Handler(BaseHTTPRequestHandler):
                     parsed = json.loads(resp)
                 except Exception:
                     parsed = {"raw": resp}
+                parsed = public_json_value(parsed)
                 self._json({"success": ok, "status": 200, "bot": parsed})
-            elif path == "/api/ai":
-                cfg = load_config()
-                ai = cfg.setdefault("ai", {})
-                if "base_url" in data:
-                    ai["base_url"] = str(data.get("base_url") or "").strip()
-                if "model" in data:
-                    ai["model"] = str(data.get("model") or "").strip()
-                new_key = str(data.get("api_key") or "").strip()
-                if "api_key" in data:
-                    if new_key and "****" not in new_key:
-                        ai["api_key"] = new_key
-                    elif not new_key:
-                        ai["api_key"] = ""
-                save_config(cfg)
-                self._json({"success": True, "config": public_config(cfg)})
-            elif path == "/api/ai/test":
-                try:
-                    tmp = dict(ai_config())
-                    if data.get("base_url"):
-                        tmp["base_url"] = str(data["base_url"]).strip()
-                    if data.get("model"):
-                        tmp["model"] = str(data["model"]).strip()
-                    k = str(data.get("api_key") or "").strip()
-                    if k and "****" not in k:
-                        tmp["api_key"] = k
-                    if not tmp.get("base_url") or not tmp.get("api_key") or not tmp.get("model"):
-                        self._json({"success": False, "message": "请先填写接口地址 / API Key / 模型"})
-                        return
-                    reply = ai_chat("你好，请只回复：连接正常", cfg=tmp)
-                    self._json({"success": True, "reply": reply})
-                except Exception as e:
-                    log_error(f"AI 测试失败: {e}")
-                    self._json({"success": False, "message": str(e)[:200]})
+            elif path.startswith("/api/ai"):
+                self._json({"success": False, "message": "旧 AI 配置已移除，请使用 OpenClaw 配置"}, 410)
             elif path == "/api/reminders/cancel":
-                rid = str(data.get("id") or "").strip()
+                rid = str(data.get("ref") or data.get("id") or "").strip()
                 with REMINDER_LOCK:
                     d = load_reminders()
-                    kept = [r for r in d["reminders"] if r.get("id") != rid]
+                    kept = [r for r in d["reminders"]
+                            if r.get("id") != rid and _short_ref(r.get("id"), "r") != rid]
                     removed = len(d["reminders"]) - len(kept)
                     d["reminders"] = kept
                     save_reminders(d)
@@ -2843,12 +3816,13 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/subs":
                 action = str(data.get("action") or "")
                 if action == "cancel":
-                    sid = str(data.get("id") or "").strip()
+                    sid = str(data.get("ref") or data.get("id") or "").strip()
                     with SUBS_LOCK:
                         d = load_subs()
                         n = len(d.get("subscriptions", []))
                         d["subscriptions"] = [s for s in d.get("subscriptions", [])
-                                              if s.get("id") != sid]
+                                              if s.get("id") != sid and
+                                              _short_ref(s.get("id"), "s") != sid]
                         if len(d["subscriptions"]) != n:
                             save_subs(d)
                     self._json({"success": True})
@@ -2857,10 +3831,15 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/permissions":
                 with PERM_LOCK:
                     p = load_permissions()
-                self._json({"success": True, "members": p.get("members", {})})
+                self._json({"success": True, "members": [
+                    {"user_ref": public_user_ref(fid),
+                     "name": public_display_name(info.get("name"), fid) or "未命名用户"}
+                    for fid, info in p.get("members", {}).items()
+                ]})
             elif path == "/api/users":
                 action = str(data.get("action") or "")
-                fid = str(data.get("from_id") or "").strip()
+                raw_fid = str(data.get("from_id") or "").strip()
+                fid = _resolve_user_ref(raw_fid) if raw_fid else _resolve_user_ref(data.get("user_ref"))
                 name = str(data.get("name") or "").strip()
                 if action == "grant":
                     if not fid:
@@ -2932,10 +3911,12 @@ class Handler(BaseHTTPRequestHandler):
         sender_name = (
             from_payload.get("alias")
             or from_payload.get("name")
-            or from_payload.get("id")
-            or "未知"
+            or ""
         )
-        from_id = from_payload.get("id") or ""
+        transport_id = from_payload.get("id") or ""
+        from_id = identity_user_id(from_payload, transport_id)
+        if not sender_name:
+            sender_name = "用户 " + public_user_ref(from_id) if from_id else "未知"
         record_user(from_id, sender_name)
 
         reply = None
@@ -2954,9 +3935,10 @@ class Handler(BaseHTTPRequestHandler):
                 cmd_text = re.sub(r"^@\s*[\u4e00-\u9fa5\w\-]+", "", text_in).strip()
                 cmd_word = cmd_text.split(None, 1)[0].lower() if cmd_text else ""
                 # 权限规则：AI 类命令需要授权；普通功能（计算/记账/提醒等）人人可用
-                if cmd_text.startswith("/") and cmd_word in AI_CMDS and not is_allowed(from_id):
+                if ((cmd_text.startswith("/") and cmd_word in AI_CMDS)
+                        or cmd_text.strip().lower() in SESSION_COMMANDS) and not is_allowed(from_id):
                     reply = AI_NO_PERMISSION_MSG
-                elif cmd_text.startswith("/"):
+                elif cmd_text.startswith("/") or cmd_text.strip().lower() in SESSION_COMMANDS:
                     reply = handle_command(cmd_text, from_id, sender_name, room_id, room_name, cfg)
                     if reply is None:
                         reply = FALLBACK_HELP
