@@ -182,6 +182,12 @@ OPENCLAW_COMPOSE_SYSTEM_PROMPT = (
     "建议以游戏内活动中心或官方公告为准。"
     "不要提及搜索过程、资料格式或来源链接，不要回复需要查一下、稍等之类的话。"
 )
+OPENCLAW_COMPACT_SYSTEM_PROMPT = (
+    "你是上下文压缩助手。请把用户提供的微信对话记录压缩成一份简明摘要。"
+    "只保留：用户身份与称呼偏好、已经确认过的事实与结论、问答要点、进行中的任务与待办、用户偏好。"
+    "按要点列出，控制在 600 字以内，不要编造对话里没有的信息，"
+    "不要输出 Markdown、加粗符号、井号标题或 emoji，不要提及压缩过程。"
+)
 # 敷衍回答标记：命中任一即认为 OpenClaw 没有真正搜索/回答问题。
 _EVASIVE_MARKERS = (
     "无法确认", "没法确认", "无法实时确认", "不能确认", "无法核实", "无法实时核实",
@@ -2429,13 +2435,63 @@ def ai_answer(prompt, session_id=""):
     raise ValueError("OpenClaw 未配置：请启用 Gateway 并填写地址和 token")
 
 
+def _openclaw_session_by_key(session_key):
+    """按完整 Gateway session key 查找会话记录（含 transcript）。"""
+    result = openclaw_parse_sessions_index()
+    for item in result.get("sessions", []):
+        if item.get("_session_key") == session_key:
+            return item
+    return None
+
+
 def openclaw_compact_session(user_id):
-    """在当前 Gateway session 中执行原生 /compact。"""
+    """真正压缩上下文：把当前会话转录整理成摘要，开新会话注入摘要并切换 active key。
+
+    网关不拦截 /compact，因此由本应用读取转录 → 生成摘要 → 新会话注入摘要，
+    旧会话与 transcript 保留（后台仍可查看历史）。
+    """
+    user_id = str(user_id or "").strip()
     key = openclaw_active_key(user_id)
     if not key:
         raise ValueError("缺少微信用户会话")
-    reply = openclaw_chat("/compact", session_id=key, sanitize=False)
-    return _with_context_status(reply or "已压缩当前上下文。", key)
+    claw = openclaw_config()
+    item = _openclaw_session_by_key(key)
+    if not item:
+        return _with_context_status("当前会话还没有内容，暂时不需要压缩。", key)
+    records = [r for r in (item.get("_transcript") or []) if r.get("role") in ("user", "assistant")]
+    if len(records) < 2:
+        return _with_context_status("当前会话内容很少，暂时不需要压缩。", key)
+    lines = []
+    for rec in records:
+        role = "用户" if rec.get("role") == "user" else "OpenClaw"
+        lines.append("{}：{}".format(role, str(rec.get("content") or "").strip()))
+    summary = ""
+    try:
+        summary = openclaw_chat(
+            "请把下面的微信对话记录压缩成一份简明摘要：\n\n" + "\n".join(lines),
+            session_id="compose:" + key, cfg=claw,
+            system_prompt=OPENCLAW_COMPACT_SYSTEM_PROMPT, timeout=40,
+        )
+    except Exception as e:
+        log_error("OpenClaw 摘要生成失败: {}".format(e))
+    summary = clean_wechat_reply(summary or "")
+    if not summary or summary == "（没有返回内容）":
+        raise ValueError("上下文摘要生成失败")
+    new_key = "{}:session:{}".format(user_id, secrets.token_hex(8))
+    seed = (
+        "【历史对话压缩摘要】这是系统压缩旧对话后生成的记忆摘要，请长期记住并作为回答依据。"
+        "回答用户问题时结合这份摘要，不要主动复述这份摘要，也不要提及压缩过程。\n\n"
+        + summary
+    )
+    openclaw_chat(seed, session_id=new_key, cfg=claw, timeout=40)
+    with OPENCLAW_REGISTRY_LOCK:
+        data = _openclaw_registry_load()
+        data["users"][user_id] = {"active_key": new_key, "created_at": now_str()}
+        _openclaw_registry_save(data)
+    return _with_context_status(
+        "已压缩上下文：把之前 {} 条对话整理成摘要，并开启新会话继续（原会话历史保留在后台）。".format(len(records)),
+        new_key,
+    )
 
 
 def openclaw_route(text, session_id=""):
@@ -2651,6 +2707,30 @@ def dispatch_route(tool, args, text, from_id, from_name, room_id, room_name, rou
     return None
 
 
+
+def _looks_like_compact_request(text):
+    """自然语言是否在要求压缩上下文（排除"什么是上下文压缩"这类提问）。"""
+    t = (text or "").strip()
+    if not t or len(t) > 60:
+        return False
+    if re.search(r"(?:什么是|啥是|什么叫|介绍一下|讲讲|科普|解释|原理|怎么|如何|为什么)", t):
+        return False
+    return bool(re.search(r"(?:压缩|精简)", t)
+                and re.search(r"(?:上下文|历史|记忆|对话|聊天)", t))
+
+
+def _looks_like_new_session_request(text):
+    """自然语言是否在要求开启新对话（排除"什么是新会话"这类提问）。"""
+    t = (text or "").strip()
+    if not t or len(t) > 40:
+        return False
+    if re.search(r"(?:什么是|啥是|介绍一下|讲讲|解释|怎么|如何|为什么)", t):
+        return False
+    if re.search(r"(?:开启|新开|新建|重新开|重新开始|再开|换个|开)(?:一个|个|一条|一次)?(?:新的?)?(?:对话|会话|聊天)", t):
+        return True
+    return t in ("新对话", "新会话", "开新对话", "开新会话", "新开对话", "新开会话", "重新对话")
+
+
 def smart_fallback(text, from_id, from_name, room_id, room_name, cfg):
     """普通消息由 OpenClaw 回答；提醒和推送由 OpenClaw 判断后交给本地执行。"""
     text = (text or "").strip()
@@ -2658,6 +2738,19 @@ def smart_fallback(text, from_id, from_name, room_id, room_name, cfg):
         return None
     if not is_allowed(from_id):
         return AI_NO_PERMISSION_MSG
+    if _looks_like_new_session_request(text):
+        try:
+            openclaw_start_new_session(from_id)
+            return "已开启新的会话。后续对话将从新的上下文开始。"
+        except Exception as e:
+            log_error("OpenClaw 新会话失败: {}".format(e))
+            return AI_FAILURE_MSG
+    if _looks_like_compact_request(text):
+        try:
+            return openclaw_compact_session(from_id)
+        except Exception as e:
+            log_error("OpenClaw 上下文压缩失败: {}".format(e))
+            return AI_FAILURE_MSG
 
     def answer_openclaw():
         try:
@@ -3453,6 +3546,10 @@ async function viewOpenClawSession(ref){
       rows.push('<div class="transcript-row"><div class="transcript-role">上下文压缩 · '+esc(c.timestamp||'')+'</div><div class="transcript-text">'+esc(c.summary||'已压缩上下文')+'</div></div>');
     });
     detail.className='';detail.innerHTML=rows.join('')||'<span class="dim">该会话暂无消息</span>';
+    detail.scrollIntoView({behavior:'smooth',block:'start'});
+    detail.style.transition='background .6s';detail.style.background='#fff4d6';
+    setTimeout(function(){detail.style.background=''},900);
+    $('session-result').textContent='已加载 '+((d.messages||[]).length)+' 条消息（'+((d.compactions||[]).length)+' 次压缩）';
   }catch(e){detail.className='bad';detail.textContent='会话详情加载失败'}
 }
 async function openClawSessionAction(action,ref){

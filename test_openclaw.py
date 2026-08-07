@@ -910,12 +910,78 @@ class OpenClawTests(unittest.TestCase):
         active.assert_called_once_with("wx-user")
         self.assertEqual(chat.call_args.kwargs["session_id"], "wx-user:session:new")
 
-    def test_compact_command_dispatches_to_current_openclaw_session(self):
+    def test_compact_command_summarizes_and_switches_to_new_seeded_session(self):
+        compact = self._require_callable("openclaw_compact_session")
+        item = {"_transcript": [
+            {"role": "user", "content": "你好，记住我喜欢蓝色"},
+            {"role": "assistant", "content": "好的，记住了。"},
+        ]}
+        cfg = {"enabled": True, "base_url": "http://127.0.0.1:18788/v1", "api_key": "k"}
+        with mock.patch.object(app, "openclaw_active_key", return_value="wx-user"), \
+             mock.patch.object(app, "_openclaw_session_by_key", return_value=item), \
+             mock.patch.object(app, "openclaw_config", return_value=cfg), \
+             mock.patch.object(app, "openclaw_chat",
+                               side_effect=["用户喜欢蓝色。", "好的，已记住。"]) as chat, \
+             mock.patch.object(app, "_openclaw_registry_load",
+                               return_value={"users": {"wx-user": {"active_key": "wx-user"}}}), \
+             mock.patch.object(app, "_openclaw_registry_save") as save:
+            reply = compact("wx-user")
+
+        self.assertIn("已压缩上下文", reply)
+        self.assertIn("摘要", reply)
+        self.assertEqual(chat.call_args_list[0].kwargs["session_id"], "compose:wx-user")
+        new_key = chat.call_args_list[1].kwargs["session_id"]
+        self.assertTrue(new_key.startswith("wx-user:session:"))
+        self.assertIn("历史对话压缩摘要", chat.call_args_list[1].args[0])
+        saved = save.call_args.args[0]
+        self.assertEqual(saved["users"]["wx-user"]["active_key"], new_key)
+
+    def test_compact_skips_when_session_has_no_transcript(self):
         compact = self._require_callable("openclaw_compact_session")
         with mock.patch.object(app, "openclaw_active_key", return_value="wx-user"), \
-             mock.patch.object(app, "openclaw_chat", return_value="已压缩当前上下文。") as chat:
-            self.assertEqual(compact("wx-user"), "已压缩当前上下文。")
-        chat.assert_called_once_with("/compact", session_id="wx-user", sanitize=False)
+             mock.patch.object(app, "_openclaw_session_by_key", return_value=None), \
+             mock.patch.object(app, "openclaw_config",
+                               return_value={"enabled": True, "base_url": "http://x/v1", "api_key": "k"}):
+            reply = compact("wx-user")
+        self.assertIn("暂时不需要压缩", reply)
+
+    def test_looks_like_compact_request_detects_intent_not_questions(self):
+        detect = self._require_callable("_looks_like_compact_request")
+        self.assertTrue(detect("压缩一下上下文"))
+        self.assertTrue(detect("帮我压缩上下文"))
+        self.assertTrue(detect("把上下文压缩一下"))
+        self.assertTrue(detect("帮我精简一下历史对话"))
+        self.assertTrue(detect("压缩对话"))
+        self.assertFalse(detect("什么是上下文压缩"))
+        self.assertFalse(detect("介绍一下上下文压缩的原理"))
+        self.assertFalse(detect("压缩包怎么打开"))
+        self.assertFalse(detect("今天天气怎么样"))
+
+    def test_looks_like_new_session_request_detects_intent_not_questions(self):
+        detect = self._require_callable("_looks_like_new_session_request")
+        self.assertTrue(detect("开启新的会话"))
+        self.assertTrue(detect("帮我开个新对话"))
+        self.assertTrue(detect("重新开一个会话"))
+        self.assertTrue(detect("新开一个对话"))
+        self.assertFalse(detect("什么是新会话"))
+        self.assertFalse(detect("新会话和旧会话有什么区别"))
+        self.assertFalse(detect("你好"))
+
+    def test_smart_fallback_compacts_on_natural_language_request(self):
+        with mock.patch.object(app, "is_allowed", return_value=True), \
+             mock.patch.object(app, "openclaw_compact_session",
+                               return_value="已压缩上下文。") as compact:
+            reply = app.smart_fallback("压缩一下上下文", "wx-user", "用户", "", "", {"smart": True})
+        self.assertEqual(reply, "已压缩上下文。")
+        compact.assert_called_once_with("wx-user")
+
+    def test_smart_fallback_starts_new_session_on_natural_language(self):
+        with mock.patch.object(app, "is_allowed", return_value=True), \
+             mock.patch.object(app, "openclaw_start_new_session",
+                               return_value="wx-user:session:new") as start_new:
+            reply = app.smart_fallback("帮我开启一个新对话", "wx-user", "用户", "", "", {"smart": True})
+        self.assertEqual(reply, "已开启新的会话。后续对话将从新的上下文开始。")
+        start_new.assert_called_once_with("wx-user")
 
     def test_compact_and_new_session_commands_are_handled(self):
         with mock.patch.object(
