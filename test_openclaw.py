@@ -1001,6 +1001,7 @@ class OpenClawTests(unittest.TestCase):
         self.assertTrue(detect("我没看到官方提前官宣，以游戏内活动中心为准。"))
         self.assertTrue(detect("我现在没法实时确认，你可以自己去查。"))
         self.assertTrue(detect("暂未官宣，建议你关注官方微博和公众号。"))
+        self.assertTrue(detect("你把活动名、截图，或者公告链接发我一下，我直接帮你看。"))
 
     def test_looks_evasive_reply_ignores_normal_answers(self):
         detect = self._require_callable("_looks_evasive_reply")
