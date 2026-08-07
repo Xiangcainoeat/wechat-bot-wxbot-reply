@@ -1011,6 +1011,21 @@ class OpenClawTests(unittest.TestCase):
         self.assertTrue(detect("你把活动名、截图，或者公告链接发我一下，我直接帮你看。"))
         self.assertTrue(detect("我查一下王者荣耀明天的最新活动信息。"))
         self.assertTrue(detect("需要查一下最新公告才能确认，稍等。"))
+        self.assertTrue(detect("<tool_calls>\n<invoke name=\"session_status\">\n<parameter name=\"action\" value=\"status\"/>\n</invoke>\n</tool_calls>"))
+
+    def test_clean_wechat_reply_strips_tool_call_markup(self):
+        clean = self._require_callable("clean_wechat_reply")
+        raw = ("<tool_calls>\n"
+               "<invoke name=\"browser\">\n"
+               "<parameter name=\"action\" value=\"open\"/>\n"
+               "<parameter name=\"url\" value=\"https://example.com\"/>\n"
+               "</invoke>\n"
+               "</tool_calls>\n根据搜索到的资料，明天活动是夏日农友节。")
+        result = clean(raw)
+        self.assertNotIn("<tool_calls>", result)
+        self.assertNotIn("<invoke", result)
+        self.assertNotIn("<parameter", result)
+        self.assertIn("夏日农友节", result)
 
     def test_looks_evasive_reply_ignores_normal_answers(self):
         detect = self._require_callable("_looks_evasive_reply")

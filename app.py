@@ -2016,6 +2016,9 @@ def public_openclaw_config(claw):
 def clean_wechat_reply(text):
     """清掉模型偶尔输出的 Markdown 装饰和 emoji，保留适合微信的纯文本。"""
     text = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"(?is)<tool_calls>.*?</tool_calls>", "", text)
+    text = re.sub(r"(?m)^[ \t]*<[ /]?(?:invoke|parameter|result)[^>]*>[ \t]*(?:\n|$)", "", text)
+    text = re.sub(r"<[ /]?tool_calls>", "", text)
     has_internal_trace = bool(re.search(r"(?m)^[ \t]*to=[^\n]*[ \t]*$", text))
     text = re.sub(r"(?m)^[ \t]*to=[^\n]*(?:\n|$)", "", text)
     text = re.sub(r"(?m)^[ \t]*total_languages=\d+[ \t]*(?:\n|$)", "", text)
@@ -2367,6 +2370,8 @@ def local_web_search(query, max_results=3):
 def _looks_evasive_reply(text):
     """判断 OpenClaw 回复是否为“无法确认/建议自己查”式敷衍回答。"""
     text = str(text or "")
+    if "<tool_calls" in text or "<invoke name=" in text or "<parameter name=" in text:
+        return True
     return any(marker in text for marker in _EVASIVE_MARKERS)
 
 
