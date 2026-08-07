@@ -810,6 +810,50 @@ class OpenClawTests(unittest.TestCase):
                     "（上下文 5.8k / 128k，4.5%）",
                 )
 
+    def test_context_status_sums_input_and_cache_read_tokens(self):
+        context_status = self._require_callable("_openclaw_context_status")
+        with mock.patch.dict(
+            app._OPENCLAW_LAST_USAGE,
+            {"wx-user": {
+                "input": 3088,
+                "cacheRead": 1792,
+                "output": 1952,
+                "totalTokens": 6832,
+            }},
+            clear=True,
+        ):
+            self.assertEqual(
+                context_status("wx-user"),
+                "（上下文 4.9k / 128k，3.8%）",
+            )
+
+    def test_sessions_index_context_uses_input_plus_cache_read_from_transcript(self):
+        parse_index = self._require_callable("openclaw_parse_sessions_index")
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self._session_fixture(tmp)
+            # 覆盖 fixture 的最后一条助手回复，带 input+cacheRead 的真实 usage。
+            with open(fixture["transcript"], "a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "type": "message",
+                    "timestamp": "2026-08-07T11:00:00Z",
+                    "message": {
+                        "role": "assistant",
+                        "content": "最新回复",
+                        "usage": {
+                            "input": 3088,
+                            "cacheRead": 1792,
+                            "output": 1952,
+                            "totalTokens": 6832,
+                        },
+                    },
+                }) + "\n")
+            sessions = parse_index(
+                index_path=fixture["index"], transcript_dir=fixture["transcript_dir"]
+            )
+            items = sessions.get("sessions", sessions) if isinstance(sessions, dict) else sessions
+            self.assertEqual(len(items), 1)
+            self.assertEqual(items[0].get("context_used"), 3088 + 1792)
+
     def test_openclaw_fetch_models_falls_back_to_native_config(self):
         fetch_models = self._require_callable("openclaw_fetch_models")
         with tempfile.TemporaryDirectory() as tmp:

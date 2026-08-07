@@ -166,8 +166,9 @@ WECHAT_SYSTEM_PROMPT = (
     "不要使用 Markdown，不要使用加粗符号、反引号、井号标题、表格、项目符号或 emoji。"
     "用短段落和简单的数字编号表达，控制长度，直接回答问题，不要解释这些规则。"
     "不要主动暴露内部 agent 名称、工作区路径、provider 或配置细节。"
-    "遇到新闻、人物动态、天气或其他实时问题时，可以使用 OpenClaw 自己的网页工具核实最新信息。"
-    "不要展示工具调用过程、工具参数或内部等待文本，只返回核实后的答案。"
+    "遇到新闻、人物动态、天气、赛事、活动、价格或其他需要核实最新信息的问题时，"
+    "必须先使用网页工具搜索核实后再回答，不要回复无法确认，也不要让用户自己去查。"
+    "不要展示工具调用过程、工具参数、来源链接或内部等待文本，直接给出核实后的结论。"
     "如果用户问你是谁、基于什么智能体或运行环境，统一回答：我是 OpenClaw 智能体，当前使用 gpt-5.5。"
 )
 AI_CMDS = ("/ai", "/搜索", "/search")  # 需要授权的 OpenClaw 类命令
@@ -571,7 +572,7 @@ def openclaw_parse_transcript(path):
                 usage = message.get("usage") or {}
                 if isinstance(usage, dict):
                     rec["usage"] = {
-                        k: usage.get(k) for k in ("input", "output", "totalTokens")
+                        k: usage.get(k) for k in ("input", "output", "cacheRead", "totalTokens")
                         if usage.get(k) is not None
                     }
                 records.append(rec)
@@ -641,9 +642,10 @@ def openclaw_parse_sessions_index(index_path=None, transcript_dir=None):
         messages = [r for r in transcript if r.get("role") in ("user", "assistant")]
         compactions = [r for r in transcript if r.get("type") == "compaction"]
         latest_usage = next((r.get("usage") for r in reversed(messages) if r.get("usage")), {})
-        used = _positive_usage_value(
-            entry, "inputTokens", "input_tokens", "totalTokens"
-        ) or _positive_usage_value(latest_usage, "input", "totalTokens")
+        used = (_context_used_from_usage(latest_usage)
+                or _positive_usage_value(
+                    entry, "totalTokens", "inputTokens", "input_tokens"
+                ))
         limit = (_positive_usage_value(
             entry, "contextWindow", "contextTokens", "contextWindowTokens"
         ) or 128000)
@@ -707,13 +709,26 @@ def _positive_usage_value(data, *keys):
     return None
 
 
+def _context_used_from_usage(usage):
+    """从 Gateway/OpenClaw usage 取当前上下文 token 数：input + cacheRead。
+
+    OpenClaw 把缓存命中的提示词 token 单独记在 cacheRead，input 只含新 token；
+    只取 input 会少算一部分上下文，造成上下文“变小”的假象。
+    """
+    if not isinstance(usage, dict):
+        return None
+    fresh = _positive_usage_value(usage, "input", "inputTokens", "prompt_tokens")
+    cached = _positive_usage_value(usage, "cacheRead", "cacheReadTokens", "cached_tokens")
+    if fresh is not None and cached is not None:
+        return fresh + cached
+    return fresh
+
+
 def _openclaw_context_status(session_key):
     with OPENCLAW_USAGE_LOCK:
         usage = dict(_OPENCLAW_LAST_USAGE.get(str(session_key)) or {})
     if usage:
-        used = _positive_usage_value(
-            usage, "input", "inputTokens", "prompt_tokens", "totalTokens", "total_tokens"
-        )
+        used = _context_used_from_usage(usage)
         limit = _positive_usage_value(usage, "contextTokens", "contextWindow") or 128000
         if used is not None:
             result = format_context_usage(used, limit)
@@ -723,7 +738,7 @@ def _openclaw_context_status(session_key):
         index_path = openclaw_config().get("session_index") or OPENCLAW_INDEX_FILE
         with open(index_path, "r", encoding="utf-8") as f:
             entry = (json.load(f) or {}).get(_OPENCLAW_INDEX_PREFIX + str(session_key)) or {}
-        used = _positive_usage_value(entry, "inputTokens", "input_tokens", "totalTokens")
+        used = _positive_usage_value(entry, "totalTokens", "inputTokens", "input_tokens")
         limit = _positive_usage_value(entry, "contextWindow", "contextTokens") or 128000
         return format_context_usage(used, limit) if used is not None else ""
     except Exception:
