@@ -1055,6 +1055,27 @@ class OpenClawTests(unittest.TestCase):
         self.assertEqual(chat.call_count, 2)
         local_search.assert_called_once()
 
+    def test_ai_answer_falls_back_to_local_search_when_gateway_raises(self):
+        ai_answer = self._require_callable("ai_answer")
+        with mock.patch.object(
+            app, "openclaw_config",
+            return_value={"enabled": True, "base_url": "http://127.0.0.1:18788/v1",
+                          "api_key": "k", "model": "wxbot/gpt-5.5"},
+        ), mock.patch.object(
+            app, "openclaw_active_key", return_value="wx-user",
+        ), mock.patch.object(
+            app, "local_web_search",
+            return_value="1. 夏日农友节内容一览\n   8月8日来玩王者荣耀",
+        ) as local_search, mock.patch.object(
+            app, "openclaw_chat", side_effect=TimeoutError("timed out"),
+        ) as chat:
+            result = ai_answer("王者明天抽奖活动")
+
+        self.assertIn("夏日农友节", result)
+        self.assertIn("本地搜索", result)
+        chat.assert_called_once()
+        local_search.assert_called_once()
+
     def test_local_web_search_uses_sogou_then_bing_fallback(self):
         local_web_search = self._require_callable("local_web_search")
         with mock.patch.object(app, "_sogou_results", return_value=[]), \

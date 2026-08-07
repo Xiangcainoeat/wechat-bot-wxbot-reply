@@ -2315,24 +2315,25 @@ def _looks_evasive_reply(text):
     return any(marker in text for marker in _EVASIVE_MARKERS)
 
 
-def _openclaw_search_retry(prompt, key, cfg, original):
-    """OpenClaw 回复敷衍时：用强制搜索提示词重试一次，仍不行则本地搜索兜底。"""
-    try:
-        retry = openclaw_chat(
-            prompt, session_id=key, cfg=cfg,
-            system_prompt=OPENCLAW_SEARCH_SYSTEM_PROMPT,
-        )
-        if not _looks_evasive_reply(retry):
-            return retry
-    except Exception:
-        pass
+def _openclaw_search_retry(prompt, key, cfg, original, retry_chat=True):
+    """OpenClaw 回复敷衍/失败时：先强制搜索重试一次，仍不行则本地搜索兜底。"""
+    if retry_chat:
+        try:
+            retry = openclaw_chat(
+                prompt, session_id=key, cfg=cfg,
+                system_prompt=OPENCLAW_SEARCH_SYSTEM_PROMPT,
+            )
+            if not _looks_evasive_reply(retry):
+                return retry
+        except Exception:
+            pass
     try:
         results = local_web_search(prompt)
         if results:
             return "AI 搜索通道暂时不稳定，已用本地搜索兜底，直接给你搜到的结果：\n" + results
     except Exception:
         pass
-    return original
+    return original or AI_FAILURE_MSG
 
 
 def ai_answer(prompt, session_id=""):
@@ -2341,9 +2342,13 @@ def ai_answer(prompt, session_id=""):
     enabled = claw.get("enabled", False)
     if enabled and claw.get("base_url") and claw.get("api_key"):
         key = openclaw_active_key(session_id) if session_id else ""
-        reply = openclaw_chat(prompt, session_id=key, cfg=claw)
-        if _looks_evasive_reply(reply):
-            reply = _openclaw_search_retry(prompt, key, claw, reply)
+        try:
+            reply = openclaw_chat(prompt, session_id=key, cfg=claw)
+        except Exception:
+            reply = ""
+        if not reply or _looks_evasive_reply(reply):
+            reply = _openclaw_search_retry(
+                prompt, key, claw, reply, retry_chat=bool(reply))
         return _with_context_status(reply, key) if key else reply
     raise ValueError("OpenClaw 未配置：请启用 Gateway 并填写地址和 token")
 
