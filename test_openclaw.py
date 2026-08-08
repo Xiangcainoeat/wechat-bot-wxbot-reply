@@ -626,11 +626,9 @@ class OpenClawTests(unittest.TestCase):
         )
 
     def test_ai_answer_does_not_fall_back_when_openclaw_is_not_configured(self):
-        with mock.patch.object(app, "openclaw_config", return_value={}), \
-             mock.patch.object(app, "ai_chat") as direct:
+        with mock.patch.object(app, "openclaw_config", return_value={}):
             with self.assertRaisesRegex(ValueError, "OpenClaw 未配置"):
                 app.ai_answer("问题", session_id="wx-user-2")
-        direct.assert_not_called()
 
     def test_legacy_search_command_is_answered_by_openclaw(self):
         with mock.patch.object(app, "ai_answer", return_value="OpenClaw 回答") as answer:
@@ -927,6 +925,40 @@ class OpenClawTests(unittest.TestCase):
         active.assert_called_once_with("wx-user")
         self.assertEqual(chat.call_args.kwargs["session_id"], "wx-user:session:new")
 
+    def test_ai_answer_returns_openclaw_reply_directly_without_fallback(self):
+        ai_answer = self._require_callable("ai_answer")
+        with mock.patch.object(
+            app, "openclaw_config",
+            return_value={"enabled": True, "base_url": "http://127.0.0.1:18788/v1",
+                          "api_key": "k", "model": "openclaw:wxbot"},
+        ), mock.patch.object(app, "openclaw_active_key", return_value="wx-user"), \
+             mock.patch.object(
+                 app, "openclaw_chat",
+                 return_value="我没看到官方公告，建议你自己去查。",
+             ) as chat:
+            result = ai_answer("王者明天抽奖活动")
+
+        # 即使回复偏敷衍也原样返回，不触发本地搜索兜底
+        self.assertIn("官方公告", result)
+        self.assertNotIn("本地搜索", result)
+        self.assertNotIn("搜索结果", result)
+        chat.assert_called_once()
+
+    def test_ai_answer_propagates_gateway_failure_without_fallback(self):
+        ai_answer = self._require_callable("ai_answer")
+        with mock.patch.object(
+            app, "openclaw_config",
+            return_value={"enabled": True, "base_url": "http://127.0.0.1:18788/v1",
+                          "api_key": "k", "model": "openclaw:wxbot"},
+        ), mock.patch.object(app, "openclaw_active_key", return_value="wx-user"), \
+             mock.patch.object(
+                 app, "openclaw_chat", side_effect=TimeoutError("timed out"),
+             ) as chat:
+            with self.assertRaises(TimeoutError):
+                ai_answer("王者明天抽奖活动")
+
+        chat.assert_called_once()
+
     def test_compact_uses_gateway_native_compaction_in_place(self):
         compact = self._require_callable("openclaw_compact_session")
         item = {"_transcript": [
@@ -1136,22 +1168,6 @@ class OpenClawTests(unittest.TestCase):
         start_new.assert_called_once()
         self.assertNotIn(fixture["user_id"], json.dumps(payload, ensure_ascii=False))
 
-    def test_looks_evasive_reply_detects_evasive_patterns(self):
-        detect = self._require_callable("_looks_evasive_reply")
-        self.assertTrue(detect("我没看到官方提前官宣，以游戏内活动中心为准。"))
-        self.assertTrue(detect("我现在没法实时确认，你可以自己去查。"))
-        self.assertTrue(detect("暂未官宣，建议你关注官方微博和公众号。"))
-        self.assertTrue(detect("你把活动名、截图，或者公告链接发我一下，我直接帮你看。"))
-        self.assertTrue(detect("我查一下王者荣耀明天的最新活动信息。"))
-        self.assertTrue(detect("需要查一下最新公告才能确认，稍等。"))
-        self.assertTrue(detect("<tool_calls>\n<invoke name=\"session_status\">\n<parameter name=\"action\" value=\"status\"/>\n</invoke>\n</tool_calls>"))
-        dsml = ("<" + BS + "DSML" + BS + "tool_calls>\n"
-                "<" + BS + "DSML" + BS + "invoke name=\"browser_text\">\n"
-                "<" + BS + "DSML" + BS + "parameter name=\"query\" string=\"true\">王者荣耀 明天 活动 2025</" + BS + "DSML" + BS + "parameter>\n"
-                "</" + BS + "DSML" + BS + "invoke>\n"
-                "</" + BS + "DSML" + BS + "tool_calls>")
-        self.assertTrue(detect(dsml))
-
     def test_clean_wechat_reply_strips_tool_call_markup(self):
         clean = self._require_callable("clean_wechat_reply")
         raw = ("<tool_calls>\n"
@@ -1193,101 +1209,6 @@ class OpenClawTests(unittest.TestCase):
         self.assertNotIn("DSML", inline)
         self.assertEqual(inline.strip(), "答案结束")
 
-    def test_ai_answer_falls_back_when_raw_reply_is_tool_call(self):
-        ai_answer = self._require_callable("ai_answer")
-        with mock.patch.object(
-            app, "openclaw_config",
-            return_value={"enabled": True, "base_url": "http://127.0.0.1:18788/v1",
-                          "api_key": "k", "model": "openclaw:wxbot"},
-        ), mock.patch.object(
-            app, "openclaw_active_key", return_value="wx-user",
-        ), mock.patch.object(
-            app, "local_web_search",
-            return_value="1. 夏日农友节\n   8月8日开启",
-        ), mock.patch.object(
-            app, "openclaw_chat", side_effect=[
-                "<tool_calls>\n<invoke name=\"exec\">\n"
-                "<parameter name=\"cmd\" string=\"true\">curl x</parameter>\n"
-                "</invoke>\n</tool_calls>",
-                "明天是夏日农友节开启日，可领暴击夺宝券。",
-            ],
-        ) as chat:
-            result = ai_answer("王者明天活动")
-
-        self.assertIn("夏日农友节", result)
-        self.assertNotIn("<tool_calls>", result)
-        self.assertNotIn("<invoke", result)
-        self.assertEqual(chat.call_count, 2)
-
-    def test_ai_answer_falls_back_when_raw_reply_is_dsml_tool_call(self):
-        ai_answer = self._require_callable("ai_answer")
-        bs = "\uff5c\uff5c"
-        dsml = ("<" + bs + "DSML" + bs + "tool_calls>\n"
-                "<" + bs + "DSML" + bs + "invoke name=\"exec\">\n"
-                "<" + bs + "DSML" + bs + "parameter name=\"cmd\" string=\"true\">curl x</" + bs + "DSML" + bs + "parameter>\n"
-                "</" + bs + "DSML" + bs + "invoke>\n"
-                "</" + bs + "DSML" + bs + "tool_calls>")
-        with mock.patch.object(
-            app, "openclaw_config",
-            return_value={"enabled": True, "base_url": "http://127.0.0.1:18788/v1",
-                          "api_key": "k", "model": "openclaw:wxbot"},
-        ), mock.patch.object(
-            app, "openclaw_active_key", return_value="wx-user",
-        ), mock.patch.object(
-            app, "local_web_search",
-            return_value="1. 夏日农友节\n   8月8日开启",
-        ), mock.patch.object(
-            app, "openclaw_chat", side_effect=[
-                dsml,
-                "明天是夏日农友节开启日，可领暴击夺宝券。",
-            ],
-        ) as chat:
-            result = ai_answer("王者明天活动")
-
-        self.assertIn("夏日农友节", result)
-        self.assertNotIn("DSML", result)
-        self.assertNotIn(bs, result)
-        self.assertEqual(chat.call_count, 2)
-
-    def test_looks_evasive_reply_ignores_normal_answers(self):
-        detect = self._require_callable("_looks_evasive_reply")
-        self.assertFalse(detect("明天 8月8日 有无双祈愿活动，8月8日开启。"))
-        self.assertFalse(detect("今天上海晴到多云，28 度。"))
-        self.assertFalse(detect("你喜欢的颜色是蓝色。你明天要去上海出差。需要我帮你查一下明天的天气，或者设置出发提醒吗？"))
-        self.assertFalse(detect("可以的，你想让我帮你查询一下上海的天气吗？"))
-
-    def test_ai_answer_composes_answer_from_local_search_when_evasive(self):
-        ai_answer = self._require_callable("ai_answer")
-        with mock.patch.object(
-            app, "openclaw_config",
-            return_value={"enabled": True, "base_url": "http://127.0.0.1:18788/v1",
-                          "api_key": "k", "model": "wxbot/gpt-5.5"},
-        ), mock.patch.object(
-            app, "openclaw_active_key", return_value="wx-user",
-        ), mock.patch.object(
-            app, "local_web_search",
-            return_value="1. 无双祈愿活动 8月8日开启\n   妲己九尾天狐返场",
-        ) as local_search, mock.patch.object(
-            app, "openclaw_chat", side_effect=[
-                "我没看到相关公告，你可以自己去查。",
-                "明天 8月8日 有无双祈愿活动，8月8日开启。",
-            ],
-        ) as chat:
-            result = ai_answer("王者明天抽奖活动")
-
-        self.assertIn("无双祈愿", result)
-        self.assertNotIn("我没看到", result)
-        self.assertEqual(chat.call_count, 2)
-        self.assertNotEqual(
-            chat.call_args_list[1].kwargs.get("system_prompt"),
-            app.WECHAT_SYSTEM_PROMPT,
-        )
-        self.assertEqual(
-            chat.call_args_list[1].kwargs.get("system_prompt"),
-            app.OPENCLAW_COMPOSE_SYSTEM_PROMPT,
-        )
-        local_search.assert_called_once()
-
     def test_usage_breakdown_handles_deepseek_and_openclaw_formats(self):
         breakdown = self._require_callable("_usage_breakdown")
         deepseek = {
@@ -1319,85 +1240,3 @@ class OpenClawTests(unittest.TestCase):
         self.assertIn("上下文 265 / 128k", result)
         self.assertIn("缓存命中 256 / 未命中 9", result)
 
-    def test_ai_answer_falls_back_to_local_search_when_retry_evasive(self):
-        ai_answer = self._require_callable("ai_answer")
-        with mock.patch.object(
-            app, "openclaw_config",
-            return_value={"enabled": True, "base_url": "http://127.0.0.1:18788/v1",
-                          "api_key": "k", "model": "wxbot/gpt-5.5"},
-        ), mock.patch.object(
-            app, "openclaw_active_key", return_value="wx-user",
-        ), mock.patch.object(
-            app, "local_web_search",
-            return_value="1. 夏日农友节内容一览\n   8月8日来玩王者荣耀",
-        ) as local_search, mock.patch.object(
-            app, "openclaw_chat", return_value="我没看到官方公告，建议你自己去查。",
-        ) as chat:
-            result = ai_answer("王者明天抽奖活动")
-
-        self.assertIn("夏日农友节", result)
-        self.assertIn("本地搜索", result)
-        self.assertEqual(chat.call_count, 2)
-        local_search.assert_called_once()
-
-    def test_ai_answer_falls_back_to_local_search_when_gateway_raises(self):
-        ai_answer = self._require_callable("ai_answer")
-        with mock.patch.object(
-            app, "openclaw_config",
-            return_value={"enabled": True, "base_url": "http://127.0.0.1:18788/v1",
-                          "api_key": "k", "model": "wxbot/gpt-5.5"},
-        ), mock.patch.object(
-            app, "openclaw_active_key", return_value="wx-user",
-        ), mock.patch.object(
-            app, "local_web_search",
-            return_value="1. 夏日农友节内容一览\n   8月8日来玩王者荣耀",
-        ) as local_search, mock.patch.object(
-            app, "openclaw_chat", side_effect=TimeoutError("timed out"),
-        ) as chat:
-            result = ai_answer("王者明天抽奖活动")
-
-        self.assertIn("夏日农友节", result)
-        self.assertIn("本地搜索", result)
-        chat.assert_called_once()
-        local_search.assert_called_once()
-
-    def test_local_web_search_uses_sogou_then_bing_fallback(self):
-        local_web_search = self._require_callable("local_web_search")
-        with mock.patch.object(app, "_sogou_results", return_value=[]), \
-             mock.patch.object(
-                 app, "_bing_results",
-                 return_value=[("Bing 标题", "Bing 摘要", "https://example.com/x")],
-             ):
-            text = local_web_search("@kindle 王者 夏日农友节")
-        self.assertIn("Bing 标题", text)
-        self.assertIn("Bing 摘要", text)
-
-    def test_local_web_search_formats_sogou_results(self):
-        local_web_search = self._require_callable("local_web_search")
-        with mock.patch.object(
-            app, "_sogou_results",
-            return_value=[("夏日农友节内容一览", "8月8日来玩王者荣耀", "https://sogou.com/link?url=x")],
-        ), mock.patch.object(app, "_bing_results", return_value=[]):
-            text = local_web_search("王者 夏日农友节")
-        self.assertIn("夏日农友节内容一览", text)
-        self.assertIn("8月8日来玩王者荣耀", text)
-        self.assertTrue(text.startswith("1 夏日农友节内容一览"))
-
-    def test_local_web_search_numbering_ignores_snippet_lines(self):
-        local_web_search = self._require_callable("local_web_search")
-        with mock.patch.object(
-            app, "_sogou_results",
-            return_value=[
-                ("标题一", "摘要一", "https://sogou.com/link?url=1"),
-                ("标题二", "摘要二", "https://sogou.com/link?url=2"),
-                ("标题三", "", "https://sogou.com/link?url=3"),
-            ],
-        ), mock.patch.object(app, "_bing_results", return_value=[]):
-            text = local_web_search("王者 夏日农友节")
-        self.assertIn("\n2 标题二", text)
-        self.assertIn("\n3 标题三", text)
-        self.assertNotIn("\n4 ", text)
-
-
-if __name__ == "__main__":
-    unittest.main()

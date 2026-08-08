@@ -29,8 +29,6 @@ import threading
 import time
 import urllib.parse
 import urllib.request
-import base64
-import html
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -181,41 +179,11 @@ WECHAT_SYSTEM_PROMPT = (
     "不要展示工具调用过程、工具参数、来源链接或内部等待文本，直接给出核实后的结论。"
     "如果用户问你是谁、基于什么智能体或运行环境，统一回答：我是 OpenClaw 智能体。"
 )
-OPENCLAW_COMPOSE_SYSTEM_PROMPT = (
-    "你正在通过微信向用户回复。输出必须是适合微信聊天窗口的纯文本，不要使用 Markdown、"
-    "加粗符号、反引号、井号标题、表格、项目符号或 emoji，用短段落和简单的数字编号表达，控制长度。"
-    "以下是刚搜索到的资料，请直接根据这些资料回答用户的问题。"
-    "只能使用资料中明确出现的事实，资料里没有的活动名、日期、玩法、奖品一律不要编造。"
-    "如果资料里没有用户问的活动的明确信息，直接告诉用户：根据搜索到的资料暂时没有找到明确预告，"
-    "建议以游戏内活动中心或官方公告为准。"
-    "不要提及搜索过程、资料格式或来源链接，不要回复需要查一下、稍等之类的话。"
-)
 OPENCLAW_COMPACT_SYSTEM_PROMPT = (
     "你是上下文压缩助手。请把用户提供的微信对话记录压缩成一份简明摘要。"
     "只保留：用户身份与称呼偏好、已经确认过的事实与结论、问答要点、进行中的任务与待办、用户偏好。"
     "按要点列出，控制在 600 字以内，不要编造对话里没有的信息，"
     "不要输出 Markdown、加粗符号、井号标题或 emoji，不要提及压缩过程。"
-)
-# 敷衍回答标记：命中任一即认为 OpenClaw 没有真正搜索/回答问题。
-_EVASIVE_MARKERS = (
-    "无法确认", "没法确认", "无法实时确认", "不能确认", "无法核实", "无法实时核实",
-    "没看到", "没有看到", "没找到", "没有搜到", "没搜到", "未找到", "未搜到",
-    "暂未发现", "尚未官宣", "暂未官宣", "还没官宣",
-    "自己去查", "自己查", "自行查询", "自己去搜", "自己搜",
-    "回头查", "稍等", "稍后", "才能确认",
-    "发我一下", "发给我", "你发我", "把活动名", "链接发我", "截图发我",
-    "去官网", "自己去官网", "去官方网站",
-    "以游戏内活动中心为准", "以游戏内为准", "以官方为准", "以实际为准",
-    "看官方微博", "关注官方微博", "官方微博和公众号", "官方公众号", "官方微博或公众号",
-)
-# 需要先查证/核实才能回答的措辞（“我查一下”“需要查一下”），但“帮你查一下”这类主动帮忙不算敷衍。
-_EVASIVE_REGEX = (
-    r"我(?:先|去|再)?查(?:一下|一?下|询)?",
-    r"需要(?:先)?查(?:一下|询)?",
-    r"(?:得|还得|必须)查一下",
-    r"查一下(?:才能|再|就能|最新|官方|公告)",
-    r"我(?:去|先|再)?核实一下|核实一下(?:才能|再|就能)",
-    r"我(?:去|先|再)?确认一下|确认一下(?:才能|再|就能)",
 )
 AI_CMDS = ("/ai", "/搜索", "/search")  # 需要授权的 OpenClaw 类命令
 SESSION_COMMANDS = {
@@ -2020,11 +1988,6 @@ def outbox_done(ids):
 
 
 # ---------------- AI 调用（OpenAI 兼容） ----------------
-def ai_config():
-    # 兼容旧内部调用；实际唯一 AI 配置是 OpenClaw Gateway。
-    return openclaw_config()
-
-
 def openclaw_config():
     cfg = load_config()
     return cfg.get("openclaw") or {}
@@ -2174,38 +2137,6 @@ def format_weather(label, w):
     return "\n".join(lines)
 
 
-def ai_chat(prompt, cfg=None, timeout=40):
-    ai = cfg if cfg is not None else ai_config()
-    base = (ai.get("base_url") or "").strip().rstrip("/")
-    key = (ai.get("api_key") or "").strip()
-    model = (ai.get("model") or "").strip()
-    if not base or not key or not model:
-        raise ValueError("AI 未配置：请在管理后台「AI 配置」填写接口地址 / API Key / 模型")
-    url = base if base.endswith("/chat/completions") else base + "/chat/completions"
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "stream": False,
-    }
-    req = urllib.request.Request(
-        url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={"Content-Type": "application/json", "Authorization": "Bearer " + key},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            data = json.loads(r.read().decode("utf-8", "ignore"))
-    except urllib.error.HTTPError as e:
-        raise ValueError("HTTP Error {}".format(e.code))
-    except urllib.error.URLError as e:
-        raise ValueError("连接失败: {}".format(e.reason))
-    try:
-        content = (data["choices"][0]["message"].get("content") or "").strip()
-    except Exception:
-        raise ValueError("AI 返回格式异常")
-    return clean_wechat_reply(content) or "（无回复）"
-
-
 def _openclaw_session_lock(session_id):
     with _OPENCLAW_SESSION_LOCKS_GUARD:
         lock = _OPENCLAW_SESSION_LOCKS.get(session_id)
@@ -2287,176 +2218,20 @@ def _openclaw_chat_request(prompt, session_id="", cfg=None, timeout=60,
     return clean_wechat_reply(content) or "（没有返回内容）"
 
 
-# ---------------- 本地搜索兜底（搜狗→Bing，无需 API key） ----------------
-_SEARCH_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/120 Safari/537.36"
-)
-
-
-def _fetch_search_html(url, timeout=15):
-    req = urllib.request.Request(url, headers={
-        "User-Agent": _SEARCH_UA,
-        "Accept-Language": "zh-CN,zh;q=0.9",
-    })
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.read().decode("utf-8", "ignore")
-
-
-def _sogou_results(query, max_results=3):
-    """搜狗网页搜索（中文覆盖好，偶发验证页返回空）。返回 [(标题, 摘要, URL)]。"""
-    url = "https://www.sogou.com/web?query=" + urllib.parse.quote(query)
-    body = _fetch_search_html(url)
-    items = []
-    for m in re.finditer(r'<h3[^>]*>\s*<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>', body, re.S):
-        title = html.unescape(re.sub(r"<[^>]+>", "", m.group(2))).strip()
-        if not title:
-            continue
-        href = html.unescape(m.group(1)).strip()
-        tail = body[m.end():m.end() + 4000]
-        snippet = ""
-        for pat in (
-            r'<div[^>]*class="[^"]*(?:str_info|space-txt|fz-mid|text-layout|fz-text)[^"]*"[^>]*>(.*?)</div>',
-            r'<p[^>]*class="[^"]*str_info[^"]*"[^>]*>(.*?)</p>',
-        ):
-            sm = re.search(pat, tail, re.S)
-            if sm:
-                snippet = html.unescape(re.sub(r"<[^>]+>", " ", sm.group(1)))
-                snippet = re.sub(r"\s+", " ", snippet).strip()
-                break
-        items.append((title, snippet, href))
-        if len(items) >= max_results:
-            break
-    return items
-
-
-def _bing_real_url(href):
-    """Bing 结果链接是跳转地址，解析 u= 参数还原真实 URL。"""
-    try:
-        m = re.search(r"[?&]u=([A-Za-z0-9_\-=%]+)", href or "")
-        if not m:
-            return href
-        b = m.group(1).replace("%3D", "=")
-        if b.startswith("a1"):
-            b = b[2:]
-        b += "=" * (-len(b) % 4)
-        u = urllib.parse.unquote(
-            base64.urlsafe_b64decode(b.encode("utf-8")).decode("utf-8", "ignore"))
-        return u if u.startswith("http") else href
-    except Exception:
-        return href
-
-
-def _bing_results(query, max_results=3):
-    """Bing 网页搜索（无需 key，稳定但中文覆盖一般）。返回 [(标题, 摘要, URL)]。"""
-    url = ("https://cn.bing.com/search?q=" + urllib.parse.quote(query)
-           + "&setlang=zh-hans&count=10")
-    body = _fetch_search_html(url)
-    items = []
-    for m in re.finditer(r'<li class="b_algo".*?</li>', body, re.S):
-        block = m.group(0)
-        hm = re.search(r'<h2[^>]*>\s*<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>', block, re.S)
-        if not hm:
-            continue
-        title = html.unescape(re.sub(r"<[^>]+>", "", hm.group(2))).strip()
-        if not title:
-            continue
-        pm = re.search(r"<p[^>]*>(.*?)</p>", block, re.S)
-        snippet = ""
-        if pm:
-            snippet = html.unescape(re.sub(r"<[^>]+>", "", pm.group(1))).strip()
-        href = _bing_real_url(html.unescape(hm.group(1)))
-        items.append((title, snippet, href))
-        if len(items) >= max_results:
-            break
-    return items
-
-
-def local_web_search(query, max_results=3):
-    """搜狗→Bing 本地搜索兜底；返回格式化纯文本，无结果返回空串。"""
-    query = re.sub(r"@\S+\s*", "", str(query or "")).strip()
-    if not query:
-        return ""
-    items = []
-    try:
-        items = _sogou_results(query, max_results)
-        if not items:  # 搜狗偶发验证页，重试一次
-            items = _sogou_results(query, max_results)
-    except Exception:
-        items = []
-    if not items:
-        try:
-            items = _bing_results(query, max_results)
-        except Exception:
-            items = []
-    if not items:
-        return ""
-    lines = []
-    seen = set()
-    n = 0
-    for title, snippet, href in items:
-        key = title[:40]
-        if key in seen:
-            continue
-        seen.add(key)
-        n += 1
-        lines.append("{} {}".format(n, title))
-        if snippet:
-            lines.append("   {}".format(snippet))
-    return "\n".join(lines)
-
-
-def _looks_evasive_reply(text):
-    """判断 OpenClaw 回复是否为“无法确认/建议自己查”式敷衍回答。"""
-    text = str(text or "")
-    if "<tool_calls" in text or "<invoke name=" in text or "<parameter name=" in text:
-        return True
-    if re.search(r"<\uff5c\uff5cDSML\uff5c\uff5c(?:tool_calls|invoke|parameter|result)\b", text):
-        return True
-    if any(re.search(pattern, text) for pattern in _EVASIVE_REGEX):
-        return True
-    return any(marker in text for marker in _EVASIVE_MARKERS)
-
-
-def _openclaw_search_retry(prompt, key, cfg, original, compose=True):
-    """OpenClaw 回复敷衍/失败时：本地搜索资料，让模型直接整合出完整回答。"""
-    try:
-        results = local_web_search(prompt)
-        if not results:
-            return original or AI_FAILURE_MSG
-        if compose:
-            try:
-                answer = openclaw_chat(
-                    "用户问题：{}\n\n以下是搜索到的资料：\n{}".format(prompt, results),
-                    session_id="compose:" + key, cfg=cfg,
-                    system_prompt=OPENCLAW_COMPOSE_SYSTEM_PROMPT, timeout=40,
-                )
-                if (answer and "（没有返回内容）" not in answer
-                        and not _looks_evasive_reply(answer)):
-                    return answer
-            except Exception:
-                pass
-        return "AI 搜索通道暂时不稳定，已用本地搜索兜底，直接给你搜到的结果：\n" + results
-    except Exception:
-        pass
-    return original or AI_FAILURE_MSG
-
-
 def ai_answer(prompt, session_id=""):
-    """所有微信 AI 问答统一使用 OpenClaw；敷衍/失败时本地搜索并整合完整回答。"""
+    """所有微信 AI 问答统一直连 OpenClaw，不设任何本地兜底。
+
+    模型由 OpenClaw 后台配置决定（配置什么就走什么）；本应用只负责把用户消息
+    发给 OpenClaw Gateway，并原样返回其回答。
+    """
     claw = openclaw_config()
     enabled = claw.get("enabled", False)
     if enabled and claw.get("base_url") and claw.get("api_key"):
         key = openclaw_active_key(session_id) if session_id else ""
-        try:
-            raw_reply = openclaw_chat(prompt, session_id=key, cfg=claw, sanitize=False)
-        except Exception:
-            raw_reply = ""
+        raw_reply = openclaw_chat(prompt, session_id=key, cfg=claw, sanitize=False)
         reply = clean_wechat_reply(raw_reply)
-        if (not raw_reply or not reply
-                or _looks_evasive_reply(raw_reply) or _looks_evasive_reply(reply)):
-            reply = _openclaw_search_retry(
-                prompt, key, claw, reply or raw_reply, compose=bool(raw_reply))
+        if not reply:
+            raise ValueError("OpenClaw 返回内容为空")
         return _with_context_status(reply, key) if key else reply
     raise ValueError("OpenClaw 未配置：请启用 Gateway 并填写地址和 token")
 
