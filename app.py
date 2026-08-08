@@ -24,6 +24,7 @@ import hashlib
 import os
 import re
 import secrets
+import shutil
 import subprocess
 import threading
 import time
@@ -75,6 +76,32 @@ OPENCLAW_GATEWAY_WS_URL = os.environ.get(
 OPENCLAW_GATEWAY_CONTAINER = os.environ.get(
     "WXBOT_OPENCLAW_GATEWAY_CONTAINER", "openclaw"
 )
+# OpenClaw 网关 OpenAI 兼容入口：固定走本机网关（相当于常驻挂载），后台不再让用户配置。
+OPENCLAW_GATEWAY_BASE_URL = os.environ.get(
+    "WXBOT_OPENCLAW_GATEWAY_BASE_URL", "http://127.0.0.1:18788/v1"
+)
+# 后台「模型提供商配置」默认写入的 OpenClaw provider 标识。
+OPENCLAW_DEFAULT_PROVIDER = os.environ.get(
+    "WXBOT_OPENCLAW_DEFAULT_PROVIDER", "deepseek"
+)
+# ---------------- 智能体（多后端切换） ----------------
+# 智能体 = 行为后端：openclaw 走本机 OpenClaw 网关（agent 工具循环 + 会话）；
+# codex 走服务器上部署的 Codex CLI（codex exec / resume，按 thread 续聊）。
+AGENT_OPENCLAW = "openclaw"
+AGENT_CODEX = "codex"
+AGENT_DEFAULT = os.environ.get("WXBOT_DEFAULT_AGENT", AGENT_OPENCLAW)
+AGENT_DISPLAY = {AGENT_OPENCLAW: "OpenClaw", AGENT_CODEX: "Codex"}
+AGENT_SWITCH_CMDS = ("/智能体", "/agent", "/切换智能体")
+AGENT_PREFS_FILE = os.path.join(BASE_DIR, "agent_prefs.json")  # 每用户智能体/Codex thread/用量
+# Codex CLI 后端参数（服务器部署时覆盖）。
+CODEX_BINARY = os.environ.get("WXBOT_CODEX_BINARY", "codex")
+CODEX_WORKDIR = os.environ.get("WXBOT_CODEX_WORKDIR", "/root/codex-chat")
+CODEX_SANDBOX = os.environ.get("WXBOT_CODEX_SANDBOX", "read-only")
+CODEX_TIMEOUT = int(os.environ.get("WXBOT_CODEX_TIMEOUT", "150"))
+CODEX_CONTEXT_LIMIT = int(os.environ.get("WXBOT_CODEX_CONTEXT_LIMIT", "272000"))
+# Codex 自身配置文件（后台「智能体」页写 provider/模型/token 到此处）。
+CODEX_CONFIG_FILE = os.environ.get("WXBOT_CODEX_CONFIG", "/root/.codex/config.toml")
+
 # 兼容部署脚本和外部诊断工具使用的旧常量名。
 OPENCLAW_SESSION_FILE = OPENCLAW_SESSIONS_FILE
 OPENCLAW_SESSION_INDEX_FILE = OPENCLAW_INDEX_FILE
@@ -173,11 +200,18 @@ WECHAT_SYSTEM_PROMPT = (
     "你正在通过微信向用户回复。输出必须是适合微信聊天窗口的纯文本。"
     "不要使用 Markdown，不要使用加粗符号、反引号、井号标题、表格、项目符号或 emoji。"
     "用短段落和简单的数字编号表达，控制长度，直接回答问题，不要解释这些规则。"
-    "不要主动暴露内部 agent 名称、工作区路径、provider 或配置细节。"
-    "遇到新闻、人物动态、天气、赛事、活动、价格或其他需要核实最新信息的问题时，"
-    "必须先使用网页工具搜索核实后再回答，不要回复无法确认，也不要让用户自己去查。"
-    "不要展示工具调用过程、工具参数、来源链接或内部等待文本，直接给出核实后的结论。"
+    "不要主动暴露内部 agent 名称、工作区路径、provider、工具或配置细节。"
+    "遇到新闻、天气、赛事、活动、价格等需要核实最新信息的问题时，"
+    "你应该使用网页搜索工具搜索核实后再回答，不要编造，也不要只回复一句无法确认；"
+    "工具由系统自动执行，你只需要直接给出最终结论。"
+    "不要输出工具调用标记（如 <tool_calls>、<invoke>、DSML 标签）或代码块。"
     "如果用户问你是谁、基于什么智能体或运行环境，统一回答：我是 OpenClaw 智能体。"
+)
+OPENCLAW_DIRECT_SYSTEM_PROMPT = (
+    "你是通过微信回答用户问题的助手。请直接用简洁的纯文本回答用户的问题，"
+    "只输出最终回答，不要输出工具调用标记（如 <tool_calls>、<invoke>、DSML 标签）或代码块，"
+    "不要提及工具、搜索或内部过程。需要核实最新信息时可以使用网页搜索工具，"
+    "必要时简要说明以官方渠道为准，不要编造具体数字或日期。"
 )
 OPENCLAW_COMPACT_SYSTEM_PROMPT = (
     "你是上下文压缩助手。请把用户提供的微信对话记录压缩成一份简明摘要。"
@@ -185,7 +219,7 @@ OPENCLAW_COMPACT_SYSTEM_PROMPT = (
     "按要点列出，控制在 600 字以内，不要编造对话里没有的信息，"
     "不要输出 Markdown、加粗符号、井号标题或 emoji，不要提及压缩过程。"
 )
-AI_CMDS = ("/ai", "/搜索", "/search")  # 需要授权的 OpenClaw 类命令
+AI_CMDS = ("/ai", "/搜索", "/search", "/上网", "/智能体", "/agent", "/切换智能体")  # 需要授权的 AI 类命令
 SESSION_COMMANDS = {
     "/compact", "/压缩上下文", "压缩上下文",
     "/new", "/新会话", "新会话", "开启新的会话", "开启新会话",
@@ -221,7 +255,7 @@ FALLBACK_HELP = (
     "【需授权】（/权限 <密码> 开通）\n"
     "5. AI 路由：OpenClaw 识别提醒和推送并执行\n"
     "   例：“明天早上8点提醒我开会”“每天八点推送北京市朝阳区天气”\n"
-    "6. AI 问答：直接问我任何问题，统一由 OpenClaw 回答\n"
+    "6. AI 问答：直接问我任何问题（可 /智能体 codex 切换回答后端）\n"
     "\n"
     "详细用法：/说明"
 )
@@ -246,7 +280,9 @@ DETAIL_HELP = (
     "6. AI 路由：OpenClaw 识别提醒和每日推送，信息不全时会追问补齐\n"
     "   例：“明天早上8点提醒我开会” → 自动设提醒\n"
     "   例：“每天八点推送北京市朝阳区天气” → 自动开每日推送\n"
-    "7. AI 问答：直接问我任何问题（闲聊、问答、查资料都可以），统一由 OpenClaw 回答\n"
+    "7. AI 问答：直接问我任何问题（闲聊、问答、查资料都可以）\n"
+    "8. 智能体切换：/智能体 codex 或 /智能体 openclaw 切换回答后端；/智能体 查看当前；\n"
+    "   /智能体 默认 恢复全局默认；也可直接说“切换到codex”\n"
     "\n"
     "记账例外：账本必须用 /记账 + / - 精确格式，AI 不会代记"
 )
@@ -473,6 +509,167 @@ def _openclaw_registry_load():
         return {"users": users if isinstance(users, dict) else {}}
     except Exception:
         return {"users": {}}
+
+
+# ---------------- 智能体偏好（每用户切换 / Codex thread / Codex 用量） ----------------
+AGENT_PREFS_LOCK = threading.Lock()
+
+
+def _agent_prefs_load():
+    try:
+        with open(AGENT_PREFS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            data = {}
+    except Exception:
+        data = {}
+    data.setdefault("users", {})
+    return data
+
+
+def _agent_prefs_save(data):
+    try:
+        with open(AGENT_PREFS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log_error("保存智能体偏好失败: {}".format(e))
+
+
+def _agent_pref_entry(user_id, create=False):
+    user_id = str(user_id or "").strip()
+    if not user_id:
+        return {}
+    with AGENT_PREFS_LOCK:
+        data = _agent_prefs_load()
+        entry = data["users"].get(user_id)
+        if entry is None and create:
+            entry = {}
+            data["users"][user_id] = entry
+        if entry is None:
+            return {}
+        entry.setdefault("agent", "")
+        entry.setdefault("codex_thread", "")
+        entry.setdefault("codex_usage", {})
+        return entry
+
+
+def user_agent(user_id):
+    """返回用户手动选择的智能体 id；未设置返回空串（由全局默认决定）。"""
+    entry = _agent_pref_entry(user_id)
+    return str(entry.get("agent") or "").strip()
+
+
+def set_user_agent(user_id, agent):
+    """设置/清除（传空串）用户智能体偏好，返回设置后的生效智能体 id。"""
+    user_id = str(user_id or "").strip()
+    if not user_id:
+        return ""
+    agent = str(agent or "").strip()
+    with AGENT_PREFS_LOCK:
+        data = _agent_prefs_load()
+        if agent:
+            data["users"].setdefault(user_id, {})["agent"] = agent
+        else:
+            entry = data["users"].get(user_id)
+            if entry is not None:
+                entry.pop("agent", None)
+        _agent_prefs_save(data)
+    return agent
+
+
+def active_agent(user_id=""):
+    """用户生效的智能体：优先用户偏好，其次全局默认，最后 openclaw。"""
+    pref = user_agent(user_id)
+    if pref in AGENT_DISPLAY:
+        return pref
+    try:
+        default = str(load_config().get("default_agent") or AGENT_DEFAULT).strip()
+    except Exception:
+        default = AGENT_DEFAULT
+    return default if default in AGENT_DISPLAY else AGENT_OPENCLAW
+
+
+def codex_thread_for(user_id):
+    entry = _agent_pref_entry(user_id)
+    return str(entry.get("codex_thread") or "").strip()
+
+
+def set_codex_thread(user_id, thread_id):
+    user_id = str(user_id or "").strip()
+    thread_id = str(thread_id or "").strip()
+    if not user_id:
+        return
+    with AGENT_PREFS_LOCK:
+        data = _agent_prefs_load()
+        data["users"].setdefault(user_id, {})["codex_thread"] = thread_id
+        _agent_prefs_save(data)
+
+
+def codex_usage_for(user_id):
+    entry = _agent_pref_entry(user_id)
+    return dict(entry.get("codex_usage") or {})
+
+
+def add_codex_usage(user_id, usage):
+    """累加 Codex 单轮用量到该用户 thread 的会话总量（与后台事实同源）。"""
+    user_id = str(user_id or "").strip()
+    if not user_id or not isinstance(usage, dict):
+        return
+    with AGENT_PREFS_LOCK:
+        data = _agent_prefs_load()
+        entry = data["users"].setdefault(user_id, {})
+        total = dict(entry.get("codex_usage") or {})
+        try:
+            total["input"] = int(total.get("input") or 0) + int(usage.get("input_tokens") or 0)
+            total["cached"] = int(total.get("cached") or 0) + int(usage.get("cached_input_tokens") or 0)
+            total["output"] = int(total.get("output") or 0) + int(usage.get("output_tokens") or 0)
+        except (TypeError, ValueError):
+            return
+        entry["codex_usage"] = total
+        _agent_prefs_save(data)
+
+
+def codex_context_limit():
+    """Codex 上下文窗口（token）：优先后台配置，其次环境变量，最后默认值。"""
+    try:
+        value = str(load_config().get("codex_context_limit") or "").strip()
+        if value:
+            return max(1000, int(float(value)))
+    except (TypeError, ValueError):
+        pass
+    try:
+        return max(1000, int(os.environ.get("WXBOT_CODEX_CONTEXT_LIMIT") or CODEX_CONTEXT_LIMIT))
+    except (TypeError, ValueError):
+        return CODEX_CONTEXT_LIMIT
+
+
+def codex_context_status(user_id, usage=None):
+    """Codex 智能体的上下文统计，格式与 OpenClaw 后台一致（缓存命中/未命中）。
+
+    优先显示当前这一轮的实际上下文用量（usage 为该轮 codex exec 的
+    turn.completed usage），不再累加多轮总量；没有本轮用量时才回退到累计值。
+    """
+    used = cached = None
+    if isinstance(usage, dict):
+        try:
+            used = int(usage.get("input_tokens") or 0)
+            cached = int(usage.get("cached_input_tokens") or 0)
+        except (TypeError, ValueError):
+            used = cached = None
+    if not used:
+        saved = codex_usage_for(user_id)
+        try:
+            used = int(saved.get("input") or 0)
+            cached = int(saved.get("cached") or 0)
+        except (TypeError, ValueError):
+            return ""
+    if used <= 0:
+        return ""
+    miss = max(0, used - cached)
+    base = format_context_usage(used, codex_context_limit(), cached, miss)
+    if base and base.startswith("（"):
+        return "（Codex 智能体 · " + base[1:]
+    return "（Codex 智能体）"
 
 
 def _openclaw_registry_save(data):
@@ -1989,22 +2186,91 @@ def outbox_done(ids):
 
 # ---------------- AI 调用（OpenAI 兼容） ----------------
 def openclaw_config():
+    """微信侧 OpenClaw 配置：网关地址/模型固定默认，token 缺省时从 OpenClaw 配置同步。
+
+    网关是常驻的本机挂载（类似 Nginx），不需要后台配置；真正可配的是上游
+    模型提供商（URL/Token/模型），由后台写入 OpenClaw 配置并生效。
+    """
     cfg = load_config()
-    return cfg.get("openclaw") or {}
+    claw = dict(cfg.get("openclaw") or {})
+    claw.setdefault("base_url", OPENCLAW_GATEWAY_BASE_URL)
+    claw.setdefault("model", "openclaw:wxbot")
+    if not str(claw.get("api_key") or "").strip():
+        claw["api_key"] = openclaw_gateway_token()
+    return claw
+
+
+def openclaw_gateway_token(path=None):
+    """从 OpenClaw 配置读取网关共享 token（gateway.auth.token）。"""
+    path = path or OPENCLAW_CONFIG_FILE
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        token = ((cfg.get("gateway") or {}).get("auth") or {}).get("token") or ""
+        return str(token).strip()
+    except Exception:
+        return ""
+
+
+def openclaw_read_provider_config(path=None):
+    """只读当前 OpenClaw 模型提供商配置（URL/Token/模型列表），不写盘。"""
+    path = path or OPENCLAW_CONFIG_FILE
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except Exception:
+        return {}
+    if not isinstance(cfg, dict):
+        return {}
+    providers = ((cfg.get("models") or {}).get("providers") or {})
+    if not isinstance(providers, dict):
+        providers = {}
+    agent_model = ""
+    for agent in ((cfg.get("agents") or {}).get("list") or []):
+        if isinstance(agent, dict) and agent.get("id") == "wxbot":
+            agent_model = str(agent.get("model") or "").strip()
+            break
+    if not agent_model:
+        default_model = ((cfg.get("agents") or {}).get("defaults") or {}).get("model") or {}
+        if isinstance(default_model, dict):
+            agent_model = str(default_model.get("primary") or "").strip()
+    provider_id = agent_model.split("/", 1)[0] if "/" in agent_model else ""
+    pcfg = providers.get(provider_id) if provider_id else {}
+    if not isinstance(pcfg, dict):
+        pcfg = {}
+    models = []
+    for item in (pcfg.get("models") or []):
+        mid = (item.get("id") or item.get("name")) if isinstance(item, dict) else item
+        if mid and str(mid) not in models:
+            models.append(str(mid))
+    return {
+        "provider_id": provider_id or OPENCLAW_DEFAULT_PROVIDER,
+        "provider_url": str(pcfg.get("baseUrl") or pcfg.get("base_url") or ""),
+        "api_key": str(pcfg.get("apiKey") or pcfg.get("api_key") or ""),
+        "model": agent_model,
+        "model_id": agent_model.split("/", 1)[1] if "/" in agent_model else agent_model,
+        "models": models,
+    }
 
 
 def public_openclaw_config(claw):
-    result = {
-        "enabled": bool((claw or {}).get("enabled", False)),
-        "base_url": str((claw or {}).get("base_url") or ""),
-        "model": str((claw or {}).get("model") or "openclaw:wxbot"),
-        "session_index": str((claw or {}).get("session_index") or OPENCLAW_INDEX_FILE),
-        "transcript_dir": str((claw or {}).get("transcript_dir") or OPENCLAW_TRANSCRIPT_DIR),
+    """返回后台「模型提供商配置」页面所需信息，绝不泄露明文 token。"""
+    claw = claw or {}
+    provider = openclaw_read_provider_config()
+    gateway_ok = bool(str(claw.get("api_key") or "").strip() or openclaw_gateway_token())
+    return {
+        "enabled": bool(claw.get("enabled", False)),
+        "gateway_url": OPENCLAW_GATEWAY_BASE_URL,
+        "gateway_ok": gateway_ok,
+        "provider_id": provider.get("provider_id") or OPENCLAW_DEFAULT_PROVIDER,
+        "provider_url": provider.get("provider_url") or "",
+        "model_id": provider.get("model_id") or "",
+        "current_model": provider.get("model") or "",
+        "models": provider.get("models") or [],
+        "session_index": str(claw.get("session_index") or OPENCLAW_INDEX_FILE),
+        "transcript_dir": str(claw.get("transcript_dir") or OPENCLAW_TRANSCRIPT_DIR),
+        "api_key": "********" if provider.get("api_key") else "",
     }
-    key = str((claw or {}).get("api_key") or "")
-    result["api_key"] = "********" if key else ""
-    return result
-
 
 def clean_wechat_reply(text):
     """清掉模型偶尔输出的 Markdown 装饰和 emoji，保留适合微信的纯文本。"""
@@ -2218,22 +2484,390 @@ def _openclaw_chat_request(prompt, session_id="", cfg=None, timeout=60,
     return clean_wechat_reply(content) or "（没有返回内容）"
 
 
-def ai_answer(prompt, session_id=""):
-    """所有微信 AI 问答统一直连 OpenClaw，不设任何本地兜底。
+# ---------------- Codex 智能体后端 ----------------
+def _parse_codex_jsonl(text):
+    """解析 codex exec --json 的 JSONL 输出。
 
-    模型由 OpenClaw 后台配置决定（配置什么就走什么）；本应用只负责把用户消息
-    发给 OpenClaw Gateway，并原样返回其回答。
+    返回 (thread_id, 回答列表, 错误列表, 本轮用量)。
     """
+    thread_id = ""
+    messages = []
+    errors = []
+    usage = {}
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except Exception:
+            continue
+        typ = event.get("type")
+        if typ == "thread.started":
+            thread_id = str(event.get("thread_id") or "")
+        elif typ == "item.completed":
+            item = event.get("item") or {}
+            if item.get("type") == "agent_message":
+                msg = str(item.get("text") or "").strip()
+                if msg:
+                    messages.append(msg)
+            elif item.get("type") == "error":
+                err = str(item.get("message") or "").strip()
+                if err:
+                    errors.append(err)
+        elif typ == "turn.completed":
+            usage = dict(event.get("usage") or {})
+    return thread_id, messages, errors, usage
+
+
+def _codex_last_turn_usage(thread_id):
+    """读 Codex 线程文件最后一条 token_count 的 last_token_usage（本轮真实用量）。
+
+    codex 0.139 的 --json turn.completed.usage 报告的是会话累计值，
+    线程文件内的 last_token_usage 才是本轮请求的真实上下文占用。
+    """
+    path = _codex_thread_file(thread_id)
+    if not path:
+        return {}
+    usage = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line.startswith("{"):
+                    continue
+                try:
+                    event = json.loads(line)
+                except Exception:
+                    continue
+                if event.get("type") != "event_msg":
+                    continue
+                payload = event.get("payload") or {}
+                if payload.get("type") != "token_count":
+                    continue
+                info = payload.get("info") or {}
+                last = info.get("last_token_usage") or {}
+                if isinstance(last, dict) and last.get("input_tokens"):
+                    usage = dict(last)
+    except Exception:
+        pass
+    return usage
+
+
+def codex_answer(prompt, session_id=""):
+    """通过服务器上部署的 Codex CLI 问答；按微信用户维持 thread 会话。
+
+    Codex 使用与 OpenClaw 相同的模型提供商（后台「智能体」页配置 Codex 的
+    config.toml），只读沙箱运行，联网/工具能力由 Codex 自身提供。
+    """
+    if not shutil.which(CODEX_BINARY):
+        raise ValueError("Codex 智能体未部署：服务器上未安装 codex CLI")
+    user_id = str(session_id or "").strip()
+    thread_id = codex_thread_for(user_id) if user_id else ""
+    cmd = [CODEX_BINARY, "exec"]
+    if thread_id:
+        cmd += ["resume", thread_id]
+    cmd += ["--json", "--skip-git-repo-check"]
+    if not thread_id:
+        cmd += ["-s", CODEX_SANDBOX, "-C", CODEX_WORKDIR, "--color", "never"]
+    cmd.append(str(prompt))
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=int(CODEX_TIMEOUT),
+            stdin=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        raise ValueError("Codex 智能体未部署：找不到 codex 命令")
+    except subprocess.TimeoutExpired:
+        raise ValueError("Codex 智能体响应超时，请稍后重试")
+    if proc.returncode != 0:
+        err_lines = (proc.stderr or "").strip().splitlines()
+        detail = (err_lines[-1] if err_lines else proc.stdout or "").strip()[:200]
+        low = ((detail + " " + (proc.stdout or "")).lower())
+        # resume 时旧 thread 已不存在（被清理/迁移）→ 自动开新线程，不中断对话。
+        if thread_id and ("no rollout found" in low
+                          or "thread/resume failed" in low
+                          or ("resume" in low and "not found" in low)):
+            set_codex_thread(user_id, "")
+            return codex_answer(prompt, session_id)
+        raise ValueError("Codex 执行失败: {}".format(detail or "未知错误"))
+    new_thread, messages, errors, _usage = _parse_codex_jsonl(proc.stdout)
+    # 0.139 的 turn.completed 报累计值；线程文件里的 last_token_usage 才是本轮真实用量。
+    per_turn = _codex_last_turn_usage(new_thread or thread_id)
+    reply = messages[-1] if messages else ""
+    if not reply and errors:
+        raise ValueError("Codex 返回错误: {}".format(errors[-1][:200]))
+    if user_id:
+        if new_thread and new_thread != thread_id:
+            set_codex_thread(user_id, new_thread)
+        add_codex_usage(user_id, per_turn)
+    reply = clean_wechat_reply(reply) or "（没有返回内容）"
+    status = codex_context_status(user_id, per_turn) if user_id else ""
+    return (reply + "\n" + status).strip() if status else reply
+
+
+def _codex_sessions_dir():
+    """Codex 会话存储目录（与 config.toml 同级的 sessions/）。"""
+    return os.path.join(os.path.dirname(os.path.abspath(CODEX_CONFIG_FILE)), "sessions")
+
+
+def _codex_archive_dir():
+    return os.path.join(_codex_sessions_dir(), "wxbot-archived")
+
+
+def _codex_thread_file(thread_id):
+    """按 thread id 在 Codex 会话目录里定位 rollout 文件。"""
+    thread_id = str(thread_id or "").strip()
+    if not thread_id:
+        return ""
+    root = _codex_sessions_dir()
+    if not os.path.isdir(root):
+        return ""
+    suffix = thread_id + ".jsonl"
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for name in filenames:
+            if name.endswith(suffix):
+                return os.path.join(dirpath, name)
+    return ""
+
+
+def _codex_thread_records(thread_id):
+    """读取 Codex 线程文件里的用户输入与助手回答（按时间顺序）。"""
+    path = _codex_thread_file(thread_id)
+    if not path:
+        return []
+    records = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line.startswith("{"):
+                    continue
+                try:
+                    event = json.loads(line)
+                except Exception:
+                    continue
+                if event.get("type") != "event_msg":
+                    continue
+                payload = event.get("payload") or {}
+                typ = payload.get("type")
+                msg = str(payload.get("message") or "").strip()
+                if typ == "user_message" and msg:
+                    records.append(("user", msg))
+                elif typ == "agent_message" and payload.get("phase") == "final_answer" and msg:
+                    records.append(("assistant", msg))
+    except Exception:
+        pass
+    return records
+
+
+def _codex_exec_new(prompt, timeout=None):
+    """跑一次全新 codex exec（不写入任何用户偏好），返回 (thread_id, 回答, 错误, 用量)。
+
+    用于生成摘要、播种新线程等一次性调用。
+    """
+    if not shutil.which(CODEX_BINARY):
+        raise ValueError("Codex CLI 未安装")
+    cmd = [
+        CODEX_BINARY, "exec", "--json", "--skip-git-repo-check",
+        "-s", CODEX_SANDBOX, "-C", CODEX_WORKDIR, "--color", "never",
+        str(prompt),
+    ]
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True,
+            timeout=int(timeout or CODEX_TIMEOUT), stdin=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        raise ValueError("Codex 智能体未部署：找不到 codex 命令")
+    except subprocess.TimeoutExpired:
+        raise ValueError("Codex 响应超时")
+    if proc.returncode != 0:
+        err_lines = (proc.stderr or "").strip().splitlines()
+        detail = (err_lines[-1] if err_lines else proc.stdout or "").strip()[:200]
+        raise ValueError("Codex 执行失败: {}".format(detail or "未知错误"))
+    return _parse_codex_jsonl(proc.stdout)
+
+
+def _codex_delete_thread(thread_id):
+    """删除一次性 Codex 线程文件（只删指定 id 的 rollout，绝不批量删）。"""
+    path = _codex_thread_file(thread_id)
+    if not path:
+        return False
+    try:
+        os.remove(path)
+        return True
+    except Exception:
+        return False
+
+
+def _codex_archive_thread(thread_id):
+    """把旧 Codex 线程文件移到归档目录（不删除，可回溯）。"""
+    path = _codex_thread_file(thread_id)
+    if not path:
+        return False
+    try:
+        os.makedirs(_codex_archive_dir(), exist_ok=True)
+        shutil.move(path, os.path.join(_codex_archive_dir(), os.path.basename(path)))
+        return True
+    except Exception:
+        return False
+
+
+def reset_codex_usage(user_id):
+    """清空用户 Codex 用量累计（压缩/新会话后使用）。"""
+    user_id = str(user_id or "").strip()
+    if not user_id:
+        return
+    with AGENT_PREFS_LOCK:
+        data = _agent_prefs_load()
+        entry = data["users"].get(user_id)
+        if entry is not None:
+            entry["codex_usage"] = {}
+            _agent_prefs_save(data)
+
+
+def _codex_summarize(records, max_chars=12000):
+    """把 Codex 历史对话压缩成一份简短摘要（一次性 exec，用完即删）。"""
+    lines = []
+    for role, text in records[-40:]:
+        t = str(text or "").strip()[:400]
+        if not t:
+            continue
+        lines.append(("用户: " if role == "user" else "助手: ") + t)
+    history = "\n".join(lines)
+    prompt = (
+        "请把下面的微信对话压缩成一份不超过 300 字的简明摘要，"
+        "保留：用户身份与偏好、聊过的话题与结论、未完成事项。"
+        "不要输出 Markdown、标题或 emoji，直接输出摘要：\n\n" + history[:max_chars]
+    )
+    summary_thread, messages, _errors, _usage = _codex_exec_new(prompt)
+    if summary_thread:
+        _codex_delete_thread(summary_thread)
+    summary = (messages[-1] if messages else "").strip()
+    if not summary:
+        summary = "；".join(t for _role, t in lines[-6:])[:500]
+    return summary
+
+
+def codex_compact_session(user_id):
+    """真正压缩 Codex 线程：历史 → 摘要 → 归档旧线程 → 摘要播种新线程。
+
+    采用摘要模式而不是截断模式：压缩后新线程上下文只含简短摘要，
+    用量明显变小（与 OpenClaw 压缩口径一致）。
+    """
+    user_id = str(user_id or "").strip()
+    if not user_id:
+        raise ValueError("缺少用户")
+    thread_id = codex_thread_for(user_id)
+    if not thread_id:
+        return "当前没有 Codex 会话可压缩。"
+    records = _codex_thread_records(thread_id)
+    if len(records) < 2:
+        return "当前会话内容很少，暂时不需要压缩。"
+    summary = _codex_summarize(records)
+    _codex_archive_thread(thread_id)
+    reset_codex_usage(user_id)
+    set_codex_thread(user_id, "")
+    seed = (
+        "以下是之前对话的压缩摘要，请记住并基于它继续回答，"
+        "不要复述摘要，也不要提及压缩过程：\n\n" + summary
+    )
+    new_thread, _messages, _errors, usage = _codex_exec_new(seed)
+    if not new_thread:
+        raise ValueError("压缩后创建新会话失败")
+    set_codex_thread(user_id, new_thread)
+    add_codex_usage(user_id, usage)
+    status = codex_context_status(user_id, usage)
+    return "已压缩上下文：之前 {} 轮对话已整理成摘要并作为记忆保留，后续对话继续基于这份摘要交流（不是开新窗口）。\n\n记忆摘要：\n{}\n\n{}".format(
+        len(records), summary, status)
+
+
+def codex_start_new_session(user_id):
+    """开启全新 Codex 会话：归档旧线程并清空用量。"""
+    user_id = str(user_id or "").strip()
+    thread_id = codex_thread_for(user_id)
+    if thread_id:
+        _codex_archive_thread(thread_id)
+    reset_codex_usage(user_id)
+    set_codex_thread(user_id, "")
+    return "已开启新的 Codex 会话。后续对话将从新的上下文开始。"
+
+
+# ---------------- 智能体切换 ----------------
+def handle_agent_switch(arg, from_id):
+    """切换智能体：无参数显示当前/可选；参数设置并持久化到该用户。"""
+    arg = str(arg or "").strip().lower()
+    current = active_agent(from_id)
+    if not arg or arg in ("?", "列表", "查看", "当前", "状态", "help"):
+        names = "、".join("{}（{}）".format(k, v) for k, v in AGENT_DISPLAY.items())
+        return "当前智能体：{}。\n切换命令：/智能体 codex、/智能体 openclaw；恢复默认：/智能体 默认\n也可以直接说“切换到codex”。可选：{}".format(
+            AGENT_DISPLAY.get(current, current), names)
+    if arg in ("默认", "default", "reset"):
+        set_user_agent(from_id, "")
+        return "已恢复默认智能体：{}。".format(AGENT_DISPLAY.get(active_agent(from_id), active_agent(from_id)))
+    if arg in AGENT_DISPLAY:
+        set_user_agent(from_id, arg)
+        return "已切换到 {} 智能体，后续对话默认由 {} 回答。".format(AGENT_DISPLAY[arg], AGENT_DISPLAY[arg])
+    return "未知智能体：{}。可选：{}。".format(arg, "、".join(AGENT_DISPLAY.values()))
+
+
+def _parse_agent_switch_request(text):
+    """自然语言切换意图：返回要切换的 agent id / ""（查看）/ "默认"（恢复），否则 None。"""
+    t = (text or "").strip()
+    if not t:
+        return None
+    low = t.lower()
+    agent_word = ""
+    for agent in (AGENT_CODEX, AGENT_OPENCLAW):
+        if re.search(r"(^|[^a-z])" + re.escape(agent) + r"([^a-z]|$)", low):
+            agent_word = agent
+            break
+    is_switch = bool(re.search(r"切换|换成|切到|换到|换|用|使用|智能体|agent", low))
+    if agent_word and is_switch:
+        return agent_word
+    if re.search(r"切换智能体|智能体切换|换智能体", low):
+        return ""
+    if re.search(r"(?:恢复|切回|回到|改回|换回).{0,4}默认", low):
+        return "默认"
+    return None
+
+
+def ai_answer(prompt, session_id=""):
+    """微信 AI 问答入口：按用户当前智能体分发。
+
+    - openclaw：直连 OpenClaw Gateway，联网搜索由 OpenClaw agent 自己完成；
+    - codex：走服务器 Codex CLI（codex exec / resume，按用户 thread 续聊）。
+    模型由后台统一配置（配置什么就走什么）；本应用只负责把用户消息
+    交给所选智能体并原样返回最终回答。若模型只输出了工具调用标记
+    （清理后为空），用直答提示在同一会话内重试一次，避免微信侧收到空回复。
+    """
+    if active_agent(session_id) == AGENT_CODEX:
+        return codex_answer(prompt, session_id)
     claw = openclaw_config()
     enabled = claw.get("enabled", False)
     if enabled and claw.get("base_url") and claw.get("api_key"):
         key = openclaw_active_key(session_id) if session_id else ""
-        raw_reply = openclaw_chat(prompt, session_id=key, cfg=claw, sanitize=False)
+        raw_reply = openclaw_chat(prompt, session_id=key, cfg=claw, sanitize=False,
+                              timeout=90)
         reply = clean_wechat_reply(raw_reply)
+        leaked_toolcall = bool(re.search(
+            r"(?i)<(?:tool_calls|invoke|parameter|result)\b|\uff5c\uff5cDSML", raw_reply or ""))
+        if not reply or leaked_toolcall:
+            log_error("OpenClaw 返回内容为空（疑似工具调用文本），使用直答提示重试")
+            raw_reply = openclaw_chat(
+                "请重新回答上面的问题，只输出最终回答，不要输出工具调用标记或代码块：\n" + prompt,
+                session_id=key,
+                cfg=claw,
+                sanitize=False,
+                timeout=90,
+                system_prompt=OPENCLAW_DIRECT_SYSTEM_PROMPT,
+            )
+            reply = clean_wechat_reply(raw_reply)
         if not reply:
             raise ValueError("OpenClaw 返回内容为空")
         return _with_context_status(reply, key) if key else reply
-    raise ValueError("OpenClaw 未配置：请启用 Gateway 并填写地址和 token")
+    raise ValueError("OpenClaw 未配置：请启用 OpenClaw 对话并配置模型提供商")
 
 
 def _openclaw_session_by_key(session_key):
@@ -2521,37 +3155,289 @@ def _openclaw_native_model_ids(path=None):
     return ids
 
 
-def openclaw_fetch_models(timeout=15):
-    claw = openclaw_config()
-    base = (claw.get("base_url") or "").strip().rstrip("/")
-    key = (claw.get("api_key") or "").strip()
-    if not base or not key:
-        raise ValueError("请先填写 OpenClaw Gateway 地址和 token")
+def openclaw_fetch_provider_models(provider_url, api_key, timeout=15):
+    """从上游提供商 OpenAI 兼容 /models 接口拉取模型 ID 列表（CC Switch 风格预览）。"""
+    url = (provider_url or "").strip().rstrip("/")
+    key = (api_key or "").strip()
+    if not url or not key:
+        raise ValueError("请先填写提供商 URL 和 Token")
     req = urllib.request.Request(
-        base + "/models",
+        url + "/models",
         headers={"Authorization": "Bearer " + key},
         method="GET",
     )
-    gateway_error = None
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            data = json.loads(r.read().decode("utf-8", "ignore"))
-        items = data.get("data") or data.get("models") or []
-        ids = []
-        for item in items if isinstance(items, list) else []:
-            model_id = item if isinstance(item, str) else (item.get("id") or item.get("name"))
-            if model_id and model_id not in ids:
-                ids.append(model_id)
-        if ids:
-            return ids
-        gateway_error = "Gateway 未返回模型列表"
-    except Exception as e:
-        gateway_error = str(e)[:160]
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        data = json.loads(r.read().decode("utf-8", "ignore"))
+    items = data.get("data") or data.get("models") or []
+    ids = []
+    for item in items if isinstance(items, list) else []:
+        mid = (item.get("id") or item.get("name") or item.get("model")) if isinstance(item, dict) else item
+        if mid and str(mid) not in ids:
+            ids.append(str(mid))
+    if not ids:
+        raise ValueError("提供商未返回模型列表")
+    return ids
 
+
+def openclaw_fetch_models(timeout=15):
+    """获取当前已配置提供商的模型列表；提供商未配 URL/Token 时回退到本地配置解析。"""
+    provider = openclaw_read_provider_config()
+    url = (provider.get("provider_url") or "").strip()
+    key = (provider.get("api_key") or "").strip()
+    last_err = ""
+    if url and key:
+        try:
+            return openclaw_fetch_provider_models(url, key, timeout=timeout)
+        except Exception as e:
+            last_err = str(e)[:160]
+    else:
+        last_err = "提供商未配置 URL/Token"
     ids = _openclaw_native_model_ids()
     if ids:
         return ids
-    raise ValueError("获取模型失败：{}".format(gateway_error or "未找到 OpenClaw 模型配置"))
+    raise ValueError("获取模型失败：{}".format(last_err or "未找到 OpenClaw 模型配置"))
+
+
+def openclaw_apply_provider(provider_url, api_key, model_id, provider_id=None, timeout=180):
+    """把后台配置的提供商 URL/Token/模型写入 OpenClaw 配置，并重启网关生效。
+
+    写入 openclaw.json：models.providers[provider].baseUrl/apiKey/models、
+    agents.list[wxbot].model、agents.defaults.model.primary；改前备份，改后
+    docker restart openclaw 并等待 healthy。
+    """
+    provider_id = (provider_id or OPENCLAW_DEFAULT_PROVIDER or "deepseek").strip()
+    provider_url = (provider_url or "").strip()
+    api_key = (api_key or "").strip()
+    model_id = (model_id or "").strip()
+    if not provider_url or not model_id:
+        raise ValueError("提供商 URL 和模型不能为空")
+    try:
+        with open(OPENCLAW_CONFIG_FILE, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except Exception as e:
+        raise ValueError("读取 OpenClaw 配置失败: {}".format(e))
+    if not isinstance(cfg, dict):
+        raise ValueError("OpenClaw 配置格式异常")
+    providers = cfg.setdefault("models", {}).setdefault("providers", {})
+    pcfg = providers.get(provider_id)
+    if not isinstance(pcfg, dict):
+        pcfg = {}
+        providers[provider_id] = pcfg
+    pcfg["api"] = pcfg.get("api") or "openai-completions"
+    pcfg["baseUrl"] = provider_url
+    if api_key:
+        pcfg["apiKey"] = api_key
+    elif not pcfg.get("apiKey"):
+        raise ValueError("缺少提供商 API Token")
+    models = []
+    seen = set()
+    for item in (pcfg.get("models") or []):
+        mid = (item.get("id") or item.get("name")) if isinstance(item, dict) else item
+        mid = str(mid or "").strip()
+        if not mid or mid in seen:
+            continue
+        models.append(item)
+        seen.add(mid)
+    if model_id not in seen:
+        models.append({"id": model_id, "name": model_id})
+    pcfg["models"] = models
+    agents = cfg.setdefault("agents", {})
+    lst = agents.setdefault("list", [])
+    target = "{}/{}".format(provider_id, model_id)
+    found = False
+    for agent in lst:
+        if isinstance(agent, dict) and agent.get("id") == "wxbot":
+            agent["model"] = target
+            found = True
+            break
+    if not found:
+        lst.append({"id": "wxbot", "model": target})
+    agents.setdefault("defaults", {}).setdefault("model", {})["primary"] = target
+    try:
+        shutil.copy(OPENCLAW_CONFIG_FILE, "{}.bak-{}.json".format(
+            OPENCLAW_CONFIG_FILE, time.strftime("%Y%m%d%H%M%S")))
+    except Exception:
+        pass
+    try:
+        with open(OPENCLAW_CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        raise ValueError("写入 OpenClaw 配置失败: {}".format(e))
+    openclaw_restart_gateway(timeout)
+    return "已保存并应用（OpenClaw 已重启）"
+
+
+def openclaw_restart_gateway(timeout=180):
+    """重启 OpenClaw 容器并等待网关恢复 healthy；失败抛 ValueError。"""
+    container = str(OPENCLAW_GATEWAY_CONTAINER or "openclaw").strip()
+    try:
+        proc = subprocess.run(["docker", "restart", container],
+                              capture_output=True, text=True, timeout=90)
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+            raise ValueError("docker restart 失败: {}".format(
+                (detail[-1] if detail else "未知错误")[:200]))
+    except ValueError:
+        raise
+    except Exception as e:
+        raise ValueError("重启 OpenClaw 网关失败: {}".format(e))
+    deadline = time.time() + max(10, int(timeout))
+    last = ""
+    while time.time() < deadline:
+        try:
+            proc = subprocess.run(
+                ["docker", "inspect", "-f", "{{.State.Health.Status}}", container],
+                capture_output=True, text=True, timeout=15)
+            status = (proc.stdout or "").strip()
+            if status == "healthy":
+                return True
+            last = status or (proc.stderr or "").strip()[:120]
+        except Exception as e:
+            last = str(e)[:120]
+        time.sleep(3)
+    raise ValueError("OpenClaw 网关重启后未恢复健康（{}）".format(last or "未知状态"))
+
+# ---------------- Codex 配置管理（后台「智能体」页） ----------------
+def codex_read_provider_config(path=None):
+    """只读 Codex config.toml 的模型提供商配置，token 脱敏。"""
+    path = path or CODEX_CONFIG_FILE
+    result = {
+        "base_url": "", "model": "", "wire_api": "responses",
+        "api_key": "", "has_credentials": False, "configured": False,
+    }
+    try:
+        text = open(path, encoding="utf-8").read()
+    except Exception:
+        return result
+    result["configured"] = bool(text.strip())
+    m = re.search(r'^\s*model\s*=\s*"([^"]+)"', text, re.M)
+    if m:
+        result["model"] = m.group(1)
+    sec = re.search(r'\[model_providers\.([^\]]+)\][^\[]*', text)
+    if sec:
+        body = sec.group(0)
+        mu = re.search(r'base_url\s*=\s*"([^"]+)"', body)
+        if mu:
+            result["base_url"] = mu.group(1)
+        mw = re.search(r'wire_api\s*=\s*"([^"]+)"', body)
+        if mw:
+            result["wire_api"] = mw.group(1)
+    auth_path = os.path.join(os.path.dirname(os.path.abspath(path)), "auth.json")
+    try:
+        auth = json.load(open(auth_path, encoding="utf-8"))
+        token = str(auth.get("OPENAI_API_KEY") or "")
+        result["api_key"] = "********" if token else ""
+        result["has_credentials"] = bool(token)
+    except Exception:
+        pass
+    return result
+
+
+def _codex_login_with_key(api_key, timeout=90):
+    if not shutil.which(CODEX_BINARY):
+        raise ValueError("服务器未安装 codex CLI，无法保存登录凭据")
+    try:
+        proc = subprocess.run(
+            [CODEX_BINARY, "login", "--with-api-key"],
+            input=(str(api_key).strip() + "\n"),
+            capture_output=True, text=True, timeout=int(timeout),
+        )
+    except subprocess.TimeoutExpired:
+        raise ValueError("Codex 登录超时")
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip().splitlines()
+        raise ValueError("Codex 登录失败: {}".format((err[-1] if err else "未知错误")[:200]))
+
+
+def codex_apply_provider(base_url="", api_key="", model="", wire_api="responses"):
+    """把后台配置的模型提供商写入 Codex config.toml 并登录，返回提示。"""
+    base_url = (base_url or "").strip().rstrip("/") + "/"
+    model = (model or "").strip()
+    api_key = (api_key or "").strip()
+    wire_api = str(wire_api or "responses").strip().lower()
+    if wire_api not in ("responses", "chat"):
+        wire_api = "responses"
+    if not base_url or not model:
+        raise ValueError("Codex 接口地址和模型不能为空")
+    cfg_dir = os.path.dirname(CODEX_CONFIG_FILE) or "."
+    try:
+        os.makedirs(cfg_dir, exist_ok=True)
+        if os.path.exists(CODEX_CONFIG_FILE):
+            shutil.copy(CODEX_CONFIG_FILE, "{}.bak-{}".format(
+                CODEX_CONFIG_FILE, time.strftime("%Y%m%d%H%M%S")))
+    except Exception:
+        pass
+    text = (
+        'model_provider = "custom"\n'
+        'model = "{model}"\n'
+        'model_reasoning_effort = "medium"\n'
+        '\n'
+        '[model_providers.custom]\n'
+        'name = "custom"\n'
+        'wire_api = "{wire}"\n'
+        'requires_openai_auth = true\n'
+        'base_url = "{base}"\n'
+    ).format(model=model, wire=wire_api, base=base_url)
+    try:
+        with open(CODEX_CONFIG_FILE, "w", encoding="utf-8") as f:
+            f.write(text)
+    except Exception as e:
+        raise ValueError("写入 Codex 配置失败: {}".format(e))
+    if api_key:
+        _codex_login_with_key(api_key)
+    return "已保存并应用 Codex 配置（{} / {}）".format(base_url, model)
+
+
+def codex_test_connection(timeout=90):
+    """用一条极短消息实测 Codex 链路（config + 登录 + 模型可用）。"""
+    if not shutil.which(CODEX_BINARY):
+        raise ValueError("Codex CLI 未安装")
+    try:
+        os.makedirs(CODEX_WORKDIR, exist_ok=True)
+    except Exception:
+        pass
+    cmd = [
+        CODEX_BINARY, "exec", "--json", "--skip-git-repo-check", "--color", "never",
+        "-s", CODEX_SANDBOX, "-C", CODEX_WORKDIR, "只回复四个字：连接正常",
+    ]
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=int(timeout),
+            stdin=subprocess.DEVNULL,
+        )
+    except subprocess.TimeoutExpired:
+        raise ValueError("Codex 测试超时")
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip().splitlines()
+        raise ValueError("Codex 执行失败: {}".format((err[-1] if err else "未知错误")[:200]))
+    _, messages, errors, _usage = _parse_codex_jsonl(proc.stdout)
+    reply = messages[-1] if messages else ""
+    if not reply:
+        raise ValueError("Codex 未返回内容: {}".format((errors[-1] if errors else "未知")[:200]))
+    return "Codex 连接正常：{}".format(clean_wechat_reply(reply)[:80])
+
+
+def public_agents_config():
+    """后台「智能体」页数据：默认智能体 + 各智能体状态 + Codex 提供商（脱敏）。"""
+    try:
+        default = str(load_config().get("default_agent") or AGENT_DEFAULT).strip()
+    except Exception:
+        default = AGENT_DEFAULT
+    if default not in AGENT_DISPLAY:
+        default = AGENT_OPENCLAW
+    codex = codex_read_provider_config()
+    codex["context_limit"] = codex_context_limit()
+    return {
+        "default_agent": default,
+        "agents": [
+            {"id": AGENT_OPENCLAW, "name": AGENT_DISPLAY[AGENT_OPENCLAW],
+             "enabled": bool((openclaw_config() or {}).get("enabled", False))},
+            {"id": AGENT_CODEX, "name": AGENT_DISPLAY[AGENT_CODEX],
+             "enabled": bool(shutil.which(CODEX_BINARY)),
+             "available": bool(shutil.which(CODEX_BINARY))},
+        ],
+        "codex": codex,
+    }
 
 
 LEDGER_FORMAT_HINT = (
@@ -2668,10 +3554,19 @@ def _looks_like_compact_request(text):
     t = (text or "").strip()
     if not t or len(t) > 60:
         return False
-    if re.search(r"(?:什么是|啥是|什么叫|介绍一下|讲讲|科普|解释|原理|怎么|如何|为什么|区别|不同)", t):
+    if re.search(r"(?:什么是|啥是|什么叫|介绍一下|讲讲|科普|解释|原理)", t):
         return False
-    return bool(re.search(r"(?:压缩|精简)", t)
-                and re.search(r"(?:上下文|历史|记忆|对话|聊天)", t))
+    compact = bool(re.search(r"(?:压缩|精简)", t)
+                   and re.search(r"(?:上下文|历史|记忆|对话|聊天)", t))
+    if not compact:
+        return False
+    # 明确出现“压缩+对象”（压缩一下上下文/精简对话）时，即使顺带提问也算压缩指令
+    if re.search(r"(?:压缩|精简).{0,6}(?:上下文|历史|记忆|对话|聊天)", t):
+        return True
+    # 纯提问（为什么/为啥/怎么/如何）不算压缩指令
+    if re.search(r"(?:为什么|为啥|怎么|如何|区别|不同)", t):
+        return False
+    return True
 
 
 def _looks_like_new_session_request(text):
@@ -2693,7 +3588,20 @@ def smart_fallback(text, from_id, from_name, room_id, room_name, cfg):
         return None
     if not is_allowed(from_id):
         return AI_NO_PERMISSION_MSG
+    switch_req = _parse_agent_switch_request(text)
+    if switch_req is not None:
+        try:
+            return handle_agent_switch(switch_req, from_id)
+        except Exception as e:
+            log_error(f"智能体切换失败: {e}")
+            return AI_FAILURE_MSG
     if _looks_like_new_session_request(text):
+        if active_agent(from_id) == AGENT_CODEX:
+            try:
+                return codex_start_new_session(from_id)
+            except Exception as e:
+                log_error("Codex 新会话失败: {}".format(e))
+                return AI_FAILURE_MSG
         try:
             openclaw_start_new_session(from_id)
             return "已开启新的会话。后续对话将从新的上下文开始。"
@@ -2701,6 +3609,12 @@ def smart_fallback(text, from_id, from_name, room_id, room_name, cfg):
             log_error("OpenClaw 新会话失败: {}".format(e))
             return AI_FAILURE_MSG
     if _looks_like_compact_request(text):
+        if active_agent(from_id) == AGENT_CODEX:
+            try:
+                return codex_compact_session(from_id)
+            except Exception as e:
+                log_error("Codex 上下文压缩失败: {}".format(e))
+                return AI_FAILURE_MSG
         try:
             return openclaw_compact_session(from_id)
         except Exception as e:
@@ -2754,6 +3668,18 @@ def handle_command(text, from_id, from_name, room_id, room_name, cfg):
     """返回回复文本；无需回复返回 None。"""
     raw_text = (text or "").strip()
     if raw_text.lower() in SESSION_COMMANDS:
+        if active_agent(from_id) == AGENT_CODEX:
+            if raw_text.lower() in ("/compact", "/压缩上下文", "压缩上下文"):
+                try:
+                    return codex_compact_session(from_id)
+                except Exception as e:
+                    log_error("Codex 上下文压缩失败: {}".format(e))
+                    return AI_FAILURE_MSG
+            try:
+                return codex_start_new_session(from_id)
+            except Exception as e:
+                log_error("Codex 新会话失败: {}".format(e))
+                return AI_FAILURE_MSG
         if raw_text.lower() in ("/compact", "/压缩上下文", "压缩上下文"):
             try:
                 return openclaw_compact_session(from_id)
@@ -2768,6 +3694,9 @@ def handle_command(text, from_id, from_name, room_id, room_name, cfg):
             return AI_FAILURE_MSG
     cmd = text.split(None, 1)[0].lower()
     rest = text[len(cmd):].strip()
+
+    if cmd in AGENT_SWITCH_CMDS:
+        return handle_agent_switch(rest, from_id)
 
     if cmd in ("/ai",):
         if not rest:
@@ -3228,24 +4157,48 @@ a.link{color:#2f6fed;font-size:15px}
 
 <div id="tab-ai" class="tab">
   <div class="panel">
-    <h3>OpenClaw Gateway 配置</h3>
+    <h3>智能体切换</h3>
+    <form class="inline" onsubmit="event.preventDefault();saveAgentsConfig()">
+      <label>全局默认智能体</label>
+      <select id="agent-default">
+        <option value="openclaw">OpenClaw（网关 agent：联网搜索/会话/上下文统计）</option>
+        <option value="codex">Codex（服务器 Codex CLI：独立 thread 会话）</option>
+      </select>
+      <div class="row dim" id="agent-status" style="font-size:14px">加载中…</div>
+      <label>Codex 接口地址 URL</label>
+      <input type="text" id="codex-url" placeholder="https://api.deepseek.com/" autocomplete="off">
+      <label>Codex API Token</label>
+      <input type="password" id="codex-key" placeholder="输入 API Key；留掩码表示保留原 Key" autocomplete="new-password">
+      <label>Codex 模型</label>
+      <input type="text" id="codex-model" placeholder="deepseek-v4-flash" autocomplete="off">
+      <label>Codex 上下文上限（token，到达后自动压缩）</label>
+      <input type="number" id="codex-limit" placeholder="272000" min="1000" step="1000" autocomplete="off">
+      <div class="row">
+        <button type="submit">保存并应用</button>
+        <button class="btn2" type="button" onclick="testCodex()">测试 Codex</button>
+        <span id="codex-result" style="font-size:15px;color:#666;word-break:break-all"></span>
+      </div>
+    </form>
+  </div>
+  <div class="panel">
+    <h3>模型提供商配置（OpenClaw 路由）</h3>
     <form class="inline" onsubmit="event.preventDefault();saveOpenClawConfig()">
-      <label class="switch"><input type="checkbox" id="claw-enabled"> 启用 OpenClaw 对话</label>
-      <label>Gateway Base URL</label>
-      <input type="text" id="claw-base" placeholder="http://127.0.0.1:18788/v1" autocomplete="off">
-      <label>Gateway Token</label>
-      <input type="password" id="claw-key" placeholder="输入新 token；留着掩码表示不修改" autocomplete="new-password">
+      <label class="switch"><input type="checkbox" id="claw-enabled"> 启用 AI 对话</label>
+      <label>网关地址（自动）</label>
+      <input type="text" id="claw-gateway" readonly value="http://127.0.0.1:18788/v1" class="dim">
+      <label>提供商 ID</label>
+      <input type="text" id="claw-provider" placeholder="deepseek" autocomplete="off">
+      <label>接口地址 URL</label>
+      <input type="text" id="claw-provider-url" placeholder="https://api.deepseek.com/v1" autocomplete="off">
+      <label>API Token</label>
+      <input type="password" id="claw-provider-key" placeholder="输入提供商 API Key；留掩码表示保留原 Key" autocomplete="new-password">
       <label>模型 <span id="claw-model-status" class="dim"></span></label>
       <div class="row">
-        <input type="text" id="claw-model" placeholder="openclaw:wxbot" style="flex:1">
+        <input type="text" id="claw-model" placeholder="deepseek-v4-flash" style="flex:1">
         <button class="btn2" type="button" onclick="fetchOpenClawModels()">获取模型</button>
       </div>
-      <label>Session 索引文件</label>
-      <input type="text" id="claw-index" placeholder="/root/openclaw/openclaw_space/agents/wxbot/sessions/sessions.json">
-      <label>Transcript 目录</label>
-      <input type="text" id="claw-transcripts" placeholder="/root/openclaw/openclaw_space/agents/wxbot/sessions">
       <div class="row">
-        <button type="submit">保存配置</button>
+        <button type="submit">保存并应用</button>
         <button class="btn2" type="button" onclick="testOpenClaw()">测试连接</button>
         <span id="claw-result" style="font-size:15px;color:#666;word-break:break-all"></span>
       </div>
@@ -3332,21 +4285,78 @@ async function sendMsg(){
     $('send-result').textContent=JSON.stringify(r);
   }catch(e){$('send-result').textContent='请求失败'}
 }
+async function loadAgentsConfig(){
+  try{
+    var d=await api('/api/agents');
+    if(d.default_agent) $('agent-default').value=d.default_agent;
+    var c=d.codex||{};
+    $('codex-url').value=c.base_url||'';
+    $('codex-key').value=c.api_key||'';
+    $('codex-model').value=c.model||'';
+    $('codex-limit').value=c.context_limit||'';
+    var parts=[];
+    (d.agents||[]).forEach(function(a){parts.push(a.name+(a.enabled?' ✓':' ✗'))});
+    $('agent-status').textContent='智能体：'+parts.join('、')+'；Codex '+(c.has_credentials?'已登录':'未登录');
+  }catch(e){$('agent-status').textContent='加载失败'}
+}
+function agentsForm(){
+  return {
+    default_agent:$('agent-default').value,
+    codex_url:$('codex-url').value.trim(),
+    codex_key:$('codex-key').value.trim(),
+    codex_model:$('codex-model').value.trim(),
+    codex_context_limit:$('codex-limit').value.trim()
+  };
+}
+async function saveAgentsConfig(){
+  $('codex-result').textContent='保存并应用中，请稍候…';
+  try{
+    var d=await api('/api/agents',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(agentsForm())});
+    $('codex-result').textContent=d.success?(d.message||'已保存'):(d.message||'保存失败');
+    loadAgentsConfig();
+  }catch(e){$('codex-result').textContent='保存失败'}
+}
+async function testCodex(){
+  $('codex-result').textContent='测试中…';
+  try{
+    var d=await api('/api/agents',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'test'})});
+    $('codex-result').textContent=d.success?(d.message||'连接正常'):(d.message||'测试失败');
+  }catch(e){$('codex-result').textContent='测试失败'}
+}
 async function loadOpenClawConfig(){
   try{
     var d=await api('/api/openclaw/config');var a=d.openclaw||{};
-    $('claw-enabled').checked=!!a.enabled;$('claw-base').value=a.base_url||'';$('claw-key').value=a.api_key||'';
-    $('claw-model').value=a.model||'openclaw:wxbot';$('claw-index').value=a.session_index||'';$('claw-transcripts').value=a.transcript_dir||'';
-    $('claw-model-status').textContent=a.base_url?(a.model?'已配置 '+esc(a.model):'已填地址，未配模型'):'未配置';
+    $('claw-enabled').checked=!!a.enabled;
+    $('claw-gateway').value=a.gateway_url||'http://127.0.0.1:18788/v1';
+    $('claw-provider').value=a.provider_id||'deepseek';
+    $('claw-provider-url').value=a.provider_url||'';
+    $('claw-provider-key').value=a.api_key?'********':'';
+    $('claw-model').value=a.model_id||'';
+    if(a.models&&a.models.length){
+      var opts=a.models.map(function(m){return '<option value="'+esc(m)+'">'+esc(m)+'</option>'}).join('');
+      var cur=$('claw-model').value.trim();
+      $('claw-model').outerHTML='<input type="text" id="claw-model" list="claw-model-list" placeholder="deepseek-v4-flash" style="flex:1"><datalist id="claw-model-list">'+opts+'</datalist>';
+      $('claw-model').value=cur;
+    }
+    $('claw-model-status').textContent=a.current_model?('当前 '+esc(a.current_model)):'未配置模型';
   }catch(e){}
 }
 function openClawForm(){
-  return {enabled:$('claw-enabled').checked,base_url:$('claw-base').value.trim(),api_key:$('claw-key').value.trim(),model:$('claw-model').value.trim(),session_index:$('claw-index').value.trim(),transcript_dir:$('claw-transcripts').value.trim()};
+  return {
+    enabled:$('claw-enabled').checked,
+    provider_id:$('claw-provider').value.trim(),
+    provider_url:$('claw-provider-url').value.trim(),
+    api_key:$('claw-provider-key').value.trim(),
+    model_id:$('claw-model').value.trim()
+  };
 }
 async function saveOpenClawConfig(){
+  $('claw-result').textContent='保存并应用中（会重启 OpenClaw），请稍候…';
   try{
-    await api('/api/openclaw/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(openClawForm())});
-    $('claw-result').textContent='已保存';loadOpenClawConfig();
+    var d=await api('/api/openclaw/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(openClawForm())});
+    $('claw-result').textContent=d.success?(d.message||'已保存并应用'):(d.message||'保存失败');
+    loadOpenClawConfig();
+    loadAgentsConfig();
   }catch(e){$('claw-result').textContent='保存失败'}
 }
 async function testOpenClaw(){
@@ -3359,13 +4369,13 @@ async function testOpenClaw(){
 async function fetchOpenClawModels(){
   $('claw-model-status').textContent='获取中';
   try{
-    var d=await api('/api/openclaw/models');
+    var d=await api('/api/openclaw/models',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({provider_url:$('claw-provider-url').value.trim(),api_key:$('claw-provider-key').value.trim()})});
     if(!d.success){$('claw-model-status').textContent=esc(d.message);return}
     if(d.models&&d.models.length){
       var opts=d.models.map(function(m){return '<option value="'+esc(m)+'">'+esc(m)+'</option>'}).join('');
       var cur=$('claw-model').value.trim();
-      $('claw-model').outerHTML='<input type="text" id="claw-model" list="claw-model-list" placeholder="openclaw:wxbot" style="flex:1"><datalist id="claw-model-list">'+opts+'</datalist>';
-      $('claw-model').value=cur;
+      $('claw-model').outerHTML='<input type="text" id="claw-model" list="claw-model-list" placeholder="deepseek-v4-flash" style="flex:1"><datalist id="claw-model-list">'+opts+'</datalist>';
+      $('claw-model').value=cur||d.models[0];
     }
     $('claw-model-status').textContent='共 '+(d.models?d.models.length:0)+' 个模型';
   }catch(e){$('claw-model-status').textContent='获取失败'}
@@ -3527,6 +4537,7 @@ refreshStatus();
 loadMessages(0);
 loadLogs();
 loadOpenClawConfig();
+loadAgentsConfig();
 loadUsers();
 loadReminders();
 loadSubs();
@@ -3823,6 +4834,8 @@ class Handler(BaseHTTPRequestHandler):
             })
         elif path == "/api/config":
             self._json(public_config(load_config()))
+        elif path == "/api/agents":
+            self._json({"success": True, **public_agents_config()})
         elif path == "/api/openclaw/config":
             self._json({"success": True, "openclaw": public_openclaw_config(openclaw_config())})
         elif path == "/api/openclaw/models":
@@ -4068,22 +5081,100 @@ class Handler(BaseHTTPRequestHandler):
                     self._json({"success": True, "active_session_ref": item.get("session_ref")})
                 else:
                     self._json({"success": False, "message": "unknown action"})
+            elif path == "/api/agents":
+                try:
+                    action = str(data.get("action") or "")
+                    if action == "test":
+                        reply = codex_test_connection()
+                        self._json({"success": True, "message": reply})
+                        return
+                    default_agent = str(data.get("default_agent") or "").strip()
+                    if default_agent and default_agent not in AGENT_DISPLAY:
+                        self._json({"success": False, "message": "未知智能体"})
+                        return
+                    codex_url = str(data.get("codex_url") or "").strip()
+                    codex_key = str(data.get("codex_key") or "").strip()
+                    codex_model = str(data.get("codex_model") or "").strip()
+                    codex_wire = str(data.get("codex_wire") or "responses").strip()
+                    if codex_key and "*" in codex_key:
+                        codex_key = ""
+                    codex_limit_raw = str(data.get("codex_context_limit") or "").strip()
+                    if codex_limit_raw:
+                        try:
+                            codex_limit = max(1000, int(float(codex_limit_raw)))
+                        except (TypeError, ValueError):
+                            self._json({"success": False, "message": "Codex 上下文窗口必须是数字"})
+                            return
+                    else:
+                        codex_limit = None
+                    message = "已保存"
+                    if codex_url or codex_key or codex_model:
+                        message = codex_apply_provider(
+                            base_url=codex_url, api_key=codex_key,
+                            model=codex_model, wire_api=codex_wire)
+                    cfg = load_config()
+                    if codex_limit:
+                        cfg["codex_context_limit"] = codex_limit
+                        message += "；上下文窗口：{}".format(codex_limit)
+                    if default_agent:
+                        cfg["default_agent"] = default_agent
+                        message += "；默认智能体：{}".format(AGENT_DISPLAY[default_agent])
+                    save_config(cfg)
+                    self._json({
+                        "success": True, "message": message,
+                        **public_agents_config(),
+                    })
+                except Exception as e:
+                    log_error("保存智能体配置失败: {}".format(e))
+                    self._json({"success": False, "message": str(e)[:200]})
             elif path == "/api/openclaw/config":
-                cfg = load_config()
-                claw = cfg.setdefault("openclaw", {})
-                if "enabled" in data:
-                    claw["enabled"] = bool(data.get("enabled"))
-                for field in ("base_url", "model", "session_index", "transcript_dir"):
-                    if field in data:
-                        claw[field] = str(data.get(field) or "").strip()
-                new_key = str(data.get("api_key") or "").strip()
-                if new_key and "*" not in new_key:
-                    claw["api_key"] = new_key
-                elif "api_key" in data and not new_key:
-                    claw["api_key"] = ""
-                cfg.pop("ai", None)
-                save_config(cfg)
-                self._json({"success": True, "config": public_config(cfg)})
+                try:
+                    provider_url = str(data.get("provider_url") or "").strip()
+                    provider_key = str(data.get("api_key") or "").strip()
+                    model_id = str(data.get("model_id") or "").strip()
+                    if provider_key and "*" in provider_key:
+                        provider_key = ""
+                    if provider_url or provider_key or model_id:
+                        message = openclaw_apply_provider(
+                            provider_url=provider_url,
+                            api_key=provider_key,
+                            model_id=model_id,
+                            provider_id=str(data.get("provider_id") or "").strip(),
+                        )
+                    else:
+                        message = "已保存"
+                    cfg = load_config()
+                    claw = cfg.setdefault("openclaw", {})
+                    if "enabled" in data:
+                        claw["enabled"] = bool(data.get("enabled"))
+                    # 网关是常驻本机挂载：地址固定默认，token 与模型路由自动同步。
+                    claw["base_url"] = OPENCLAW_GATEWAY_BASE_URL
+                    claw["model"] = "openclaw:wxbot"
+                    claw["api_key"] = openclaw_gateway_token() or str(claw.get("api_key") or "")
+                    cfg.pop("ai", None)
+                    save_config(cfg)
+                    self._json({
+                        "success": True,
+                        "message": message,
+                        "config": public_config(cfg),
+                        "openclaw": public_openclaw_config(openclaw_config()),
+                    })
+                except Exception as e:
+                    log_error("OpenClaw 配置应用失败: {}".format(e))
+                    self._json({"success": False, "message": str(e)[:300]}, 400)
+            elif path == "/api/openclaw/models":
+                try:
+                    url = str(data.get("provider_url") or "").strip()
+                    key = str(data.get("api_key") or "").strip()
+                    if key and "*" in key:
+                        key = ""
+                    if url and key:
+                        ids = openclaw_fetch_provider_models(url, key, timeout=15)
+                    else:
+                        ids = openclaw_fetch_models(timeout=15)
+                    self._json({"success": True, "models": ids})
+                except Exception as e:
+                    self._json({"success": False, "message": str(e)[:200]})
             elif path == "/api/openclaw/test":
                 try:
                     tmp = dict(openclaw_config())

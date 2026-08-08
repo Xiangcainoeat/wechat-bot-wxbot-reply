@@ -8,6 +8,7 @@ import contextlib
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from unittest import mock
 import urllib.error
+import urllib.parse
 import urllib.request
 
 import app
@@ -68,6 +69,22 @@ class _HtmlModelsHandler(BaseHTTPRequestHandler):
         body = b"<!doctype html><title>OpenClaw Control</title>"
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, _format, *_args):
+        pass
+
+
+class _ModelsJsonHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = json.dumps({"object": "list", "data": [
+            {"id": "deepseek-v4-flash", "object": "model"},
+            {"id": "deepseek-v4-pro", "object": "model"},
+        ]}).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -418,7 +435,6 @@ class OpenClawTests(unittest.TestCase):
 
     def test_legacy_web_search_and_ai_router_are_removed(self):
         for name in (
-            "web_search",
             "web_search_ai",
             "AI_TOOLS",
             "ai_tool_call",
@@ -557,8 +573,9 @@ class OpenClawTests(unittest.TestCase):
 
     def test_admin_ai_tab_is_openclaw_configuration_only(self):
         page = app.ADMIN_PAGE
-        self.assertIn("OpenClaw Gateway 配置", page)
-        self.assertIn("id=\"claw-base\"", page)
+        self.assertIn("模型提供商配置", page)
+        self.assertIn("id=\"claw-gateway\"", page)
+        self.assertIn("id=\"claw-provider-url\"", page)
         self.assertIn("/api/openclaw/config", page)
         self.assertNotIn("id=\"ai-base\"", page)
         self.assertNotIn("loadAI()", page)
@@ -578,23 +595,34 @@ class OpenClawTests(unittest.TestCase):
                 "openclaw": {"enabled": True, "base_url": "http://old-gateway/v1", "api_key": "old-token", "model": "openclaw:wxbot"},
             })
             with mock.patch.object(app, "CONFIG_FILE", config_path), \
+                 mock.patch.object(app, "openclaw_apply_provider",
+                                   return_value="已保存并应用（OpenClaw 已重启）") as apply_provider, \
+                 mock.patch.object(app, "openclaw_gateway_token",
+                                   return_value="gw-token", create=True), \
                  mock.patch.object(app, "valid_session", return_value=True):
                 get_status, current = self._public_api_request("GET", "/api/openclaw/config")
-                post_status, _ = self._public_api_request("POST", "/api/openclaw/config", {
+                post_status, payload = self._public_api_request("POST", "/api/openclaw/config", {
                     "enabled": True,
-                    "base_url": "http://new-gateway/v1",
-                    "api_key": "new-token",
-                    "model": "openclaw:wxbot",
-                    "session_index": "/sessions/index.json",
-                    "transcript_dir": "/sessions",
+                    "provider_id": "deepseek",
+                    "provider_url": "https://api.deepseek.com/v1",
+                    "api_key": "sk-provider-key",
+                    "model_id": "deepseek-v4-flash",
                 })
                 saved = app.load_config()
 
         self.assertEqual(get_status, 200)
         self.assertNotIn("old-token", json.dumps(current))
         self.assertEqual(post_status, 200)
-        self.assertEqual(saved["openclaw"]["base_url"], "http://new-gateway/v1")
-        self.assertEqual(saved["openclaw"]["api_key"], "new-token")
+        self.assertTrue(payload.get("success"))
+        apply_provider.assert_called_once_with(
+            provider_url="https://api.deepseek.com/v1",
+            api_key="sk-provider-key",
+            model_id="deepseek-v4-flash",
+            provider_id="deepseek",
+        )
+        self.assertEqual(saved["openclaw"]["base_url"], app.OPENCLAW_GATEWAY_BASE_URL)
+        self.assertEqual(saved["openclaw"]["model"], "openclaw:wxbot")
+        self.assertEqual(saved["openclaw"]["api_key"], "gw-token")
         self.assertNotIn("ai", saved)
 
     def test_openclaw_chat_sends_stable_user_and_returns_content(self):
@@ -905,6 +933,123 @@ class OpenClawTests(unittest.TestCase):
 
         self.assertEqual(models, ["wxbot/gpt-5.5", "bailian/qwen3.5-plus"])
 
+    def test_openclaw_fetch_provider_models_returns_ids(self):
+        fetch = self._require_callable("openclaw_fetch_provider_models")
+        server = HTTPServer(("127.0.0.1", 0), _ModelsJsonHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            ids = fetch("http://127.0.0.1:{}/v1".format(server.server_port),
+                        "sk-test", timeout=2)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+        self.assertEqual(ids, ["deepseek-v4-flash", "deepseek-v4-pro"])
+
+    def test_openclaw_apply_provider_writes_config_and_restarts(self):
+        apply_provider = self._require_callable("openclaw_apply_provider")
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = os.path.join(tmp, "openclaw.json")
+            self._write_json(config_path, {
+                "models": {"providers": {"deepseek": {
+                    "api": "openai-completions",
+                    "baseUrl": "https://api.deepseek.com/v1",
+                    "apiKey": "old-key",
+                    "models": [{"id": "deepseek-v4-flash"}],
+                }}},
+                "agents": {
+                    "defaults": {"model": {"primary": "deepseek/deepseek-v4-flash"}},
+                    "list": [{"id": "wxbot", "model": "deepseek/deepseek-v4-flash"}],
+                },
+            })
+            with mock.patch.object(app, "OPENCLAW_CONFIG_FILE", config_path, create=True), \
+                 mock.patch.object(app, "openclaw_restart_gateway",
+                                   return_value=True) as restart:
+                msg = apply_provider(
+                    provider_url="https://api.deepseek.com/v1",
+                    api_key="new-key",
+                    model_id="deepseek-v4-pro",
+                    provider_id="deepseek",
+                )
+                with open(config_path, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+
+        self.assertIn("已保存并应用", msg)
+        restart.assert_called_once()
+        deepseek = cfg["models"]["providers"]["deepseek"]
+        self.assertEqual(deepseek["baseUrl"], "https://api.deepseek.com/v1")
+        self.assertEqual(deepseek["apiKey"], "new-key")
+        ids = [m["id"] for m in deepseek["models"]]
+        self.assertIn("deepseek-v4-flash", ids)
+        self.assertIn("deepseek-v4-pro", ids)
+        self.assertEqual(cfg["agents"]["list"][0]["model"], "deepseek/deepseek-v4-pro")
+        self.assertEqual(cfg["agents"]["defaults"]["model"]["primary"],
+                         "deepseek/deepseek-v4-pro")
+
+    def test_openclaw_apply_provider_keeps_existing_selected_model(self):
+        apply_provider = self._require_callable("openclaw_apply_provider")
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = os.path.join(tmp, "openclaw.json")
+            self._write_json(config_path, {
+                "models": {"providers": {"deepseek": {
+                    "baseUrl": "https://api.deepseek.com/v1",
+                    "apiKey": "key",
+                    "models": [{"id": "deepseek-v4-flash"}],
+                }}},
+                "agents": {"list": [{"id": "wxbot", "model": "deepseek/deepseek-v4-flash"}]},
+            })
+            with mock.patch.object(app, "OPENCLAW_CONFIG_FILE", config_path, create=True), \
+                 mock.patch.object(app, "openclaw_restart_gateway", return_value=True):
+                apply_provider(
+                    provider_url="https://api.deepseek.com/v1",
+                    api_key="key",
+                    model_id="deepseek-v4-flash",
+                    provider_id="deepseek",
+                )
+                with open(config_path, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+
+        ids = [m["id"] for m in cfg["models"]["providers"]["deepseek"]["models"]]
+        self.assertEqual(ids, ["deepseek-v4-flash"])
+
+    def test_public_openclaw_config_returns_provider_info_without_secrets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = os.path.join(tmp, "openclaw.json")
+            self._write_json(config_path, {
+                "gateway": {"auth": {"token": "gw-token"}},
+                "models": {"providers": {"deepseek": {
+                    "apiKey": "sk-secret",
+                    "baseUrl": "https://api.deepseek.com/v1",
+                    "models": [{"id": "deepseek-v4-flash"}, {"id": "deepseek-v4-pro"}],
+                }}},
+                "agents": {"list": [{"id": "wxbot", "model": "deepseek/deepseek-v4-flash"}]},
+            })
+            with mock.patch.object(app, "OPENCLAW_CONFIG_FILE", config_path, create=True):
+                info = app.public_openclaw_config({"enabled": True})
+
+        self.assertEqual(info["gateway_url"], app.OPENCLAW_GATEWAY_BASE_URL)
+        self.assertTrue(info["gateway_ok"])
+        self.assertEqual(info["provider_url"], "https://api.deepseek.com/v1")
+        self.assertEqual(info["model_id"], "deepseek-v4-flash")
+        self.assertEqual(info["current_model"], "deepseek/deepseek-v4-flash")
+        self.assertEqual(info["models"], ["deepseek-v4-flash", "deepseek-v4-pro"])
+        self.assertNotIn("sk-secret", json.dumps(info))
+
+    def test_openclaw_config_defaults_to_local_gateway(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = os.path.join(tmp, "config.json")
+            self._write_json(config_path, {"openclaw": {"enabled": True}})
+            with mock.patch.object(app, "CONFIG_FILE", config_path), \
+                 mock.patch.object(app, "openclaw_gateway_token",
+                                   return_value="gw-token", create=True):
+                cfg = app.openclaw_config()
+
+        self.assertEqual(cfg["base_url"], "http://127.0.0.1:18788/v1")
+        self.assertEqual(cfg["model"], "openclaw:wxbot")
+        self.assertEqual(cfg["api_key"], "gw-token")
+
     def test_wechat_system_prompt_does_not_claim_a_model(self):
         prompt = app.WECHAT_SYSTEM_PROMPT
         self.assertIn("我是 OpenClaw 智能体", prompt)
@@ -938,11 +1083,12 @@ class OpenClawTests(unittest.TestCase):
              ) as chat:
             result = ai_answer("王者明天抽奖活动")
 
-        # 即使回复偏敷衍也原样返回，不触发本地搜索兜底
+        # 原样返回网关回答，不做本地搜索、不做任何改写
         self.assertIn("官方公告", result)
         self.assertNotIn("本地搜索", result)
         self.assertNotIn("搜索结果", result)
         chat.assert_called_once()
+        self.assertEqual(chat.call_args.args[0], "王者明天抽奖活动")
 
     def test_ai_answer_propagates_gateway_failure_without_fallback(self):
         ai_answer = self._require_callable("ai_answer")
@@ -958,6 +1104,314 @@ class OpenClawTests(unittest.TestCase):
                 ai_answer("王者明天抽奖活动")
 
         chat.assert_called_once()
+
+    def test_ai_answer_retries_once_when_reply_is_toolcall_text(self):
+        ai_answer = self._require_callable("ai_answer")
+        toolcall_text = (
+            '<tool_calls>\n<invoke name="exec">\n'
+            '<parameter name="command" string="true">python3 -c "print(1)"</parameter>\n'
+            '</invoke>\n</tool_calls>'
+        )
+        with mock.patch.object(
+            app, "openclaw_config",
+            return_value={"enabled": True, "base_url": "http://127.0.0.1:18788/v1",
+                          "api_key": "k", "model": "openclaw:wxbot"},
+        ), mock.patch.object(app, "openclaw_active_key", return_value="wx-user"), \
+             mock.patch.object(
+                 app, "openclaw_chat",
+                 side_effect=[toolcall_text, "直接回答内容"],
+             ) as chat:
+            result = ai_answer("问题", session_id="wx-user")
+
+        self.assertEqual(result, "直接回答内容")
+        self.assertEqual(chat.call_count, 2)
+        self.assertEqual(chat.call_args_list[0].kwargs["session_id"], "wx-user")
+        self.assertEqual(chat.call_args_list[1].kwargs["session_id"], "wx-user")
+        self.assertIn("不要输出工具调用标记", chat.call_args_list[1].kwargs["system_prompt"])
+        self.assertIn("请重新回答", chat.call_args_list[1].args[0])
+
+    def test_ai_answer_passes_prompt_directly_without_search_injection(self):
+        ai_answer = self._require_callable("ai_answer")
+        with mock.patch.object(
+            app, "openclaw_config",
+            return_value={"enabled": True, "base_url": "http://127.0.0.1:18788/v1",
+                          "api_key": "k", "model": "openclaw:wxbot"},
+        ), mock.patch.object(app, "openclaw_active_key", return_value="wx-user"), \
+             mock.patch.object(app, "openclaw_chat", return_value="明天是夏日农友节") as chat:
+            result = ai_answer("王者明天抽奖活动", session_id="wx-user")
+
+        self.assertEqual(result, "明天是夏日农友节")
+        chat.assert_called_once()
+        # 原样透传用户问题，由 OpenClaw agent 自己决定是否联网搜索，微信侧不做搜索注入
+        self.assertEqual(chat.call_args.args[0], "王者明天抽奖活动")
+        self.assertNotIn("[网页搜索结果]", chat.call_args.args[0])
+
+    # ---------------- 智能体切换 / Codex 后端 ----------------
+    def test_parse_codex_jsonl_extracts_thread_reply_usage(self):
+        parse = self._require_callable("_parse_codex_jsonl")
+        text = (
+            '{"type":"thread.started","thread_id":"019f-abc"}\n'
+            '{"type":"turn.started"}\n'
+            '{"type":"item.completed","item":{"id":"i1","type":"agent_message","text":"你好"}}\n'
+            '{"type":"item.completed","item":{"id":"i2","type":"agent_message","text":"我是Codex"}}\n'
+            '{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":60,"output_tokens":20}}\n'
+        )
+        thread_id, messages, errors, usage = parse(text)
+        self.assertEqual(thread_id, "019f-abc")
+        self.assertEqual(messages, ["你好", "我是Codex"])
+        self.assertEqual(errors, [])
+        self.assertEqual(usage["input_tokens"], 100)
+        self.assertEqual(usage["cached_input_tokens"], 60)
+
+    def test_codex_answer_first_turn_creates_thread_then_resumes(self):
+        codex_answer = self._require_callable("codex_answer")
+        calls = []
+        outputs = [
+            '{"type":"thread.started","thread_id":"019f-new"}\n'
+            '{"type":"item.completed","item":{"id":"i1","type":"agent_message","text":"第一轮回答"}}\n'
+            '{"type":"turn.completed","usage":{"input_tokens":100,"output_tokens":10}}\n',
+            '{"type":"thread.started","thread_id":"019f-new"}\n'
+            '{"type":"item.completed","item":{"id":"i1","type":"agent_message","text":"第二轮回答"}}\n'
+            '{"type":"turn.completed","usage":{"input_tokens":200,"cached_input_tokens":80,"output_tokens":20}}\n',
+        ]
+
+        class _Proc:
+            returncode = 0
+
+            def __init__(self, out):
+                self.stdout = out
+                self.stderr = ""
+
+        def fake_run(cmd, **kwargs):
+            calls.append((list(cmd), kwargs))
+            return _Proc(outputs[len(calls) - 1])
+
+        with mock.patch.object(app, "shutil") as sh, \
+             mock.patch.object(app, "subprocess") as sp, \
+             mock.patch.object(app, "_codex_last_turn_usage",
+                               side_effect=[{"input_tokens": 100, "output_tokens": 10},
+                                            {"input_tokens": 200, "cached_input_tokens": 80, "output_tokens": 20}]) as last_usage:
+            sh.which.return_value = "/usr/bin/codex"
+            sp.run.side_effect = fake_run
+            prefs_tmp = app.AGENT_PREFS_FILE
+            app.AGENT_PREFS_FILE = os.path.join(tempfile.mkdtemp(), "prefs.json")
+            try:
+                r1 = codex_answer("你好", session_id="wx-user")
+                self.assertIn("第一轮回答", r1)
+                self.assertIn("Codex 智能体", r1)
+                first_cmd = calls[0][0]
+                self.assertIn("exec", first_cmd)
+                self.assertNotIn("resume", first_cmd)
+                self.assertIn("019f-new", app.codex_thread_for("wx-user"))
+
+                r2 = codex_answer("再聊", session_id="wx-user")
+                self.assertIn("第二轮回答", r2)
+                self.assertIn("200", r2)
+                self.assertNotIn("300", r2)
+                second_cmd = calls[1][0]
+                self.assertIn("resume", second_cmd)
+                self.assertEqual(second_cmd[second_cmd.index("resume") + 1], "019f-new")
+                usage = app.codex_usage_for("wx-user")
+                self.assertEqual(usage["input"], 300)
+                self.assertEqual(usage["cached"], 80)
+            finally:
+                app.AGENT_PREFS_FILE = prefs_tmp
+
+    def test_codex_last_turn_usage_reads_thread_file_token_count(self):
+        fn = self._require_callable("_codex_last_turn_usage")
+        with tempfile.TemporaryDirectory() as tmp:
+            sessions_root = os.path.join(tmp, "sessions")
+            day_dir = os.path.join(sessions_root, "2026", "08", "08")
+            os.makedirs(day_dir)
+            thread_file = os.path.join(day_dir, "rollout-2026-08-08T00-00-00-019f-test.jsonl")
+            self._write_jsonl(thread_file, [
+                {"type": "event_msg", "payload": {"type": "token_count", "info": {"last_token_usage": {"input_tokens": 10254}}}},
+                {"type": "event_msg", "payload": {"type": "token_count", "info": {"last_token_usage": {"input_tokens": 11161, "cached_input_tokens": 11008}}}},
+            ])
+            old_cfg = app.CODEX_CONFIG_FILE
+            app.CODEX_CONFIG_FILE = os.path.join(tmp, "config.toml")
+            try:
+                result = fn("019f-test")
+                self.assertEqual(result.get("input_tokens"), 11161)
+                self.assertEqual(result.get("cached_input_tokens"), 11008)
+            finally:
+                app.CODEX_CONFIG_FILE = old_cfg
+
+    def test_codex_answer_fails_when_cli_missing(self):
+        codex_answer = self._require_callable("codex_answer")
+        with mock.patch.object(app, "shutil") as sh:
+            sh.which.return_value = None
+            with self.assertRaises(ValueError) as ctx:
+                codex_answer("你好", session_id="wx-user")
+        self.assertIn("未部署", str(ctx.exception))
+    def test_codex_answer_restarts_thread_when_resume_thread_missing(self):
+        # 旧 thread 已被清理时：resume 失败自动开新线程，不中断对话。
+        codex_answer = self._require_callable("codex_answer")
+        calls = []
+
+        class _Proc:
+            def __init__(self, returncode, stdout="", stderr=""):
+                self.returncode = returncode
+                self.stdout = stdout
+                self.stderr = stderr
+
+        outputs = [
+            _Proc(returncode=1, stderr="Error: thread/resume: thread/resume failed: "
+                  "no rollout found for thread id 019f-dead (code -32600)", stdout=""),
+            '{"type":"thread.started","thread_id":"019f-fresh"}\n'
+            '{"type":"item.completed","item":{"id":"i1","type":"agent_message","text":"新会话回答"}}\n'
+            '{"type":"turn.completed","usage":{"input_tokens":100,"output_tokens":10}}\n',
+        ]
+
+        def fake_run(cmd, **kwargs):
+            calls.append(list(cmd))
+            out = outputs[len(calls) - 1]
+            if isinstance(out, _Proc):
+                return out
+            return _Proc(0, stdout=out)
+
+        with mock.patch.object(app, "shutil") as sh, \
+             mock.patch.object(app, "subprocess") as sp:
+            sh.which.return_value = "/usr/bin/codex"
+            sp.run.side_effect = fake_run
+            prefs_tmp = app.AGENT_PREFS_FILE
+            app.AGENT_PREFS_FILE = os.path.join(tempfile.mkdtemp(), "prefs.json")
+            try:
+                app.set_codex_thread("wx-user", "019f-dead")
+                result = codex_answer("你好", session_id="wx-user")
+                self.assertIn("新会话回答", result)
+                self.assertIn("resume", calls[0])
+                self.assertNotIn("resume", calls[1])
+                self.assertEqual(app.codex_thread_for("wx-user"), "019f-fresh")
+            finally:
+                app.AGENT_PREFS_FILE = prefs_tmp
+
+
+    def test_agent_switch_commands_and_natural_language(self):
+        handle = self._require_callable("handle_agent_switch")
+        parse = self._require_callable("_parse_agent_switch_request")
+        prefs_tmp = app.AGENT_PREFS_FILE
+        app.AGENT_PREFS_FILE = os.path.join(tempfile.mkdtemp(), "prefs.json")
+        try:
+            app.set_user_agent("wx-user", "")
+            self.assertEqual(parse("切换到codex"), "codex")
+            self.assertEqual(parse("用 openclaw"), "openclaw")
+            self.assertEqual(parse("切换智能体"), "")
+            self.assertEqual(parse("恢复默认智能体"), "默认")
+            self.assertIsNone(parse("你好"))
+            self.assertIsNone(parse("今天天气怎么样"))
+
+            reply = handle("codex", "wx-user")
+            self.assertIn("Codex", reply)
+            self.assertEqual(app.active_agent("wx-user"), "codex")
+            self.assertEqual(app.user_agent("wx-user"), "codex")
+
+            reply = handle("", "wx-user")
+            self.assertIn("当前智能体", reply)
+
+            reply = handle("默认", "wx-user")
+            self.assertIn("默认", reply)
+            self.assertEqual(app.user_agent("wx-user"), "")
+        finally:
+            app.AGENT_PREFS_FILE = prefs_tmp
+
+    def test_ai_answer_routes_to_codex_when_selected(self):
+        ai_answer = self._require_callable("ai_answer")
+        with mock.patch.object(app, "active_agent", return_value="codex") as active, \
+             mock.patch.object(app, "codex_answer", return_value="Codex 回答") as codex:
+            reply = ai_answer("问题", session_id="wx-user")
+        self.assertEqual(reply, "Codex 回答")
+        codex.assert_called_once_with("问题", "wx-user")
+        active.assert_called_once_with("wx-user")
+
+    def test_codex_apply_provider_writes_config_and_logs_in(self):
+        apply = self._require_callable("codex_apply_provider")
+        cfg_tmp = os.path.join(tempfile.mkdtemp(), "config.toml")
+        old = app.CODEX_CONFIG_FILE
+        app.CODEX_CONFIG_FILE = cfg_tmp
+        try:
+            with mock.patch.object(app, "shutil") as sh, \
+                 mock.patch.object(app, "subprocess") as sp:
+                sh.which.return_value = "/usr/bin/codex"
+                sp.run.return_value = mock.Mock(returncode=0, stdout="", stderr="")
+                message = apply("https://api.deepseek.com/", "sk-test", "deepseek-v4-flash")
+            self.assertIn("已保存并应用", message)
+            with open(cfg_tmp, encoding="utf-8") as f:
+                text = f.read()
+            self.assertIn('model = "deepseek-v4-flash"', text)
+            self.assertIn('base_url = "https://api.deepseek.com/"', text)
+            self.assertIn('wire_api = "responses"', text)
+            login_cmd = sp.run.call_args.args[0]
+            self.assertIn("login", login_cmd)
+            self.assertIn("--with-api-key", login_cmd)
+        finally:
+            app.CODEX_CONFIG_FILE = old
+
+    def test_admin_saves_codex_context_limit_and_default_agent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = os.path.join(tmp, "config.json")
+            self._write_json(config_path, {})
+            with mock.patch.object(app, "CONFIG_FILE", config_path), \
+                 mock.patch.object(app, "valid_session", return_value=True), \
+                 mock.patch.object(app, "CODEX_CONFIG_FILE", os.path.join(tmp, "codex-config.toml")), \
+                 mock.patch.object(app.shutil, "which", return_value="/usr/local/bin/codex"):
+                status, payload = self._public_api_request("POST", "/api/agents", {
+                    "default_agent": "codex",
+                    "codex_context_limit": "1000000",
+                })
+                saved = app.load_config()
+                get_status, current = self._public_api_request("GET", "/api/agents")
+
+        self.assertEqual(status, 200)
+        self.assertTrue(payload.get("success"))
+        self.assertEqual(saved["default_agent"], "codex")
+        self.assertEqual(saved["codex_context_limit"], 1000000)
+        self.assertEqual(get_status, 200)
+        self.assertEqual(current["codex"]["context_limit"], 1000000)
+
+    def test_codex_context_status_uses_current_turn_usage(self):
+        # 当前轮次用量优先：不累加多轮，格式与 OpenClaw 回复末尾一致。
+        status = self._require_callable("codex_context_status")
+        prefs_tmp = app.AGENT_PREFS_FILE
+        app.AGENT_PREFS_FILE = os.path.join(tempfile.mkdtemp(), "prefs.json")
+        try:
+            app.add_codex_usage("wx-user", {"input_tokens": 12000, "cached_input_tokens": 8000, "output_tokens": 100})
+            result = status("wx-user", {"input_tokens": 6000, "cached_input_tokens": 4000, "output_tokens": 80})
+            self.assertIn("Codex 智能体", result)
+            self.assertIn("缓存命中 4000", result)
+            self.assertIn("未命中 2000", result)
+            self.assertIn("6k / 272k", result)
+            self.assertNotIn("12k", result)
+        finally:
+            app.AGENT_PREFS_FILE = prefs_tmp
+
+    def test_codex_context_status_falls_back_to_cumulative(self):
+        # 没有本轮用量时回退到累计值（兼容旧数据）。
+        status = self._require_callable("codex_context_status")
+        prefs_tmp = app.AGENT_PREFS_FILE
+        app.AGENT_PREFS_FILE = os.path.join(tempfile.mkdtemp(), "prefs.json")
+        try:
+            app.add_codex_usage("wx-user", {"input_tokens": 12000, "cached_input_tokens": 8000, "output_tokens": 100})
+            result = status("wx-user")
+            self.assertIn("Codex 智能体", result)
+            self.assertIn("缓存命中 8000", result)
+            self.assertIn("12k", result)
+        finally:
+            app.AGENT_PREFS_FILE = prefs_tmp
+
+    def test_codex_context_status_respects_configured_limit(self):
+        # 后台配置的上下文窗口（如 deepseek 的 1M）决定显示分母。
+        status = self._require_callable("codex_context_status")
+        prefs_tmp = app.AGENT_PREFS_FILE
+        app.AGENT_PREFS_FILE = os.path.join(tempfile.mkdtemp(), "prefs.json")
+        try:
+            app.add_codex_usage("wx-user", {"input_tokens": 300000, "cached_input_tokens": 280000, "output_tokens": 100})
+            with mock.patch.object(app, "load_config", return_value={"codex_context_limit": 1000000}):
+                result = status("wx-user", {"input_tokens": 300000, "cached_input_tokens": 280000, "output_tokens": 100})
+            self.assertIn("300k / 1000k", result)
+            self.assertIn("30.0%", result)
+        finally:
+            app.AGENT_PREFS_FILE = prefs_tmp
 
     def test_compact_uses_gateway_native_compaction_in_place(self):
         compact = self._require_callable("openclaw_compact_session")
@@ -1043,6 +1497,7 @@ class OpenClawTests(unittest.TestCase):
         self.assertTrue(detect("把上下文压缩一下"))
         self.assertTrue(detect("帮我精简一下历史对话"))
         self.assertTrue(detect("压缩对话"))
+        self.assertTrue(detect("压缩一下上下文，小猫，把它们吃掉，小猫为啥我就说了不到十个字，上下文怎么多了12k"))
         self.assertFalse(detect("什么是上下文压缩"))
         self.assertFalse(detect("介绍一下上下文压缩的原理"))
         self.assertFalse(detect("上下文压缩和开新会话有什么区别"))
@@ -1075,6 +1530,79 @@ class OpenClawTests(unittest.TestCase):
             reply = app.smart_fallback("帮我开启一个新对话", "wx-user", "用户", "", "", {"smart": True})
         self.assertEqual(reply, "已开启新的会话。后续对话将从新的上下文开始。")
         start_new.assert_called_once_with("wx-user")
+
+    def test_codex_compact_session_rebuilds_thread_with_summary(self):
+        compact = self._require_callable("codex_compact_session")
+        with tempfile.TemporaryDirectory() as tmp:
+            sessions_root = os.path.join(tmp, "sessions")
+            day_dir = os.path.join(sessions_root, "2026", "08", "08")
+            os.makedirs(day_dir)
+            thread_file = os.path.join(day_dir, "rollout-2026-08-08T00-00-00-019f-test.jsonl")
+            self._write_jsonl(thread_file, [
+                {"type": "event_msg", "payload": {"type": "user_message", "message": "记住我喜欢蓝色"}},
+                {"type": "event_msg", "payload": {"type": "agent_message", "phase": "final_answer", "message": "好的记住了"}},
+                {"type": "event_msg", "payload": {"type": "user_message", "message": "我喜欢的颜色是什么"}},
+                {"type": "event_msg", "payload": {"type": "agent_message", "phase": "final_answer", "message": "蓝色"}},
+            ])
+            prefs_tmp = app.AGENT_PREFS_FILE
+            app.AGENT_PREFS_FILE = os.path.join(tmp, "prefs.json")
+            old_cfg = app.CODEX_CONFIG_FILE
+            app.CODEX_CONFIG_FILE = os.path.join(tmp, "config.toml")
+            try:
+                app.set_codex_thread("wx-user", "019f-test")
+                app.add_codex_usage("wx-user", {"input_tokens": 50000, "cached_input_tokens": 49000, "output_tokens": 100})
+                with mock.patch.object(
+                    app, "_codex_exec_new",
+                    side_effect=[
+                        ("019f-tmp", ["用户喜欢蓝色"], [], {}),
+                        ("019f-new", ["好的"], [], {"input_tokens": 3000, "cached_input_tokens": 2000, "output_tokens": 50}),
+                    ],
+                ) as exec_new:
+                    reply = compact("wx-user")
+                self.assertIn("已压缩上下文", reply)
+                self.assertIn("Codex 智能体", reply)
+                self.assertIn("3k / 272k", reply)
+                self.assertEqual(app.codex_thread_for("wx-user"), "019f-new")
+                usage = app.codex_usage_for("wx-user")
+                self.assertEqual(usage.get("input"), 3000)
+                self.assertEqual(usage.get("cached"), 2000)
+                self.assertFalse(os.path.exists(thread_file))
+                self.assertEqual(exec_new.call_count, 2)
+                self.assertIn("蓝色", exec_new.call_args_list[0].args[0])
+                self.assertIn("摘要", exec_new.call_args_list[1].args[0])
+            finally:
+                app.AGENT_PREFS_FILE = prefs_tmp
+                app.CODEX_CONFIG_FILE = old_cfg
+
+    def test_smart_fallback_routes_compact_and_new_session_to_codex_when_active(self):
+        with mock.patch.object(app, "active_agent", return_value="codex") as active, \
+             mock.patch.object(app, "is_allowed", return_value=True), \
+             mock.patch.object(app, "codex_compact_session",
+                               return_value="已压缩 Codex 上下文", create=True) as c_compact, \
+             mock.patch.object(app, "openclaw_compact_session",
+                               return_value="已压缩 OpenClaw 上下文", create=True) as o_compact, \
+             mock.patch.object(app, "codex_start_new_session",
+                               return_value="新 Codex 会话", create=True) as c_new, \
+             mock.patch.object(app, "openclaw_start_new_session",
+                               return_value="新 OpenClaw 会话", create=True) as o_new:
+            compact_reply = app.smart_fallback("压缩一下上下文", "wx-user", "用户", "", "", app.load_config())
+            new_reply = app.smart_fallback("开启新会话", "wx-user", "用户", "", "", app.load_config())
+            cmd_compact = app.handle_command("/compact", "wx-user", "用户", "", "", app.load_config())
+            cmd_new = app.handle_command("开启新的会话", "wx-user", "用户", "", "", app.load_config())
+
+        self.assertEqual(compact_reply, "已压缩 Codex 上下文")
+        self.assertEqual(new_reply, "新 Codex 会话")
+        self.assertEqual(cmd_compact, "已压缩 Codex 上下文")
+        self.assertEqual(cmd_new, "新 Codex 会话")
+        self.assertEqual(c_compact.call_count, 2)
+        for call in c_compact.call_args_list:
+            self.assertEqual(call.args, ("wx-user",))
+        self.assertEqual(c_new.call_count, 2)
+        for call in c_new.call_args_list:
+            self.assertEqual(call.args, ("wx-user",))
+        o_compact.assert_not_called()
+        o_new.assert_not_called()
+        self.assertEqual(active.call_count, 4)
 
     def test_compact_and_new_session_commands_are_handled(self):
         with mock.patch.object(
@@ -1239,4 +1767,3 @@ class OpenClawTests(unittest.TestCase):
                     app._OPENCLAW_LAST_USAGE.pop("wx-user", None)
         self.assertIn("上下文 265 / 128k", result)
         self.assertIn("缓存命中 256 / 未命中 9", result)
-
