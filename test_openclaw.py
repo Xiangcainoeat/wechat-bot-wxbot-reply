@@ -871,7 +871,7 @@ class OpenClawTests(unittest.TestCase):
         ):
             self.assertEqual(
                 context_status("wx-user"),
-                "（上下文 4.9k / 128k，3.8%；缓存命中 1792 / 未命中 3088）",
+                "（上下文 6.8k / 128k，5.3%；输入 4.9k / 输出 2k；缓存命中 1792 / 未命中 3088）",
             )
 
     def test_sessions_index_context_uses_input_plus_cache_read_from_transcript(self):
@@ -1163,6 +1163,15 @@ class OpenClawTests(unittest.TestCase):
         self.assertEqual(usage["input_tokens"], 100)
         self.assertEqual(usage["cached_input_tokens"], 60)
 
+    def test_strip_bot_mentions_removes_mention_anywhere(self):
+        strip = self._require_callable("strip_bot_mentions")
+        self.assertEqual(strip("用个websearch 这对么 还都命中了@kindle", "kindle"),
+                         "用个websearch 这对么 还都命中了")
+        self.assertEqual(strip("@kindle 你好", "kindle"), "你好")
+        self.assertEqual(strip("你好@kindle 啊", "kindle"), "你好 啊")
+        self.assertEqual(strip("没有任何提及", "kindle"), "没有任何提及")
+        self.assertEqual(strip("结尾提一下@THk", "kindle"), "结尾提一下")
+
     def test_codex_answer_first_turn_creates_thread_then_resumes(self):
         codex_answer = self._require_callable("codex_answer")
         calls = []
@@ -1186,11 +1195,19 @@ class OpenClawTests(unittest.TestCase):
             calls.append((list(cmd), kwargs))
             return _Proc(outputs[len(calls) - 1])
 
+        stats_seq = [
+            {"persistent": 100, "call_input": 100, "cached": 0, "output": 10, "seen_line": 5, "thread": "019f-new"},
+            {"persistent": 200, "call_input": 200, "cached": 80, "output": 20, "seen_line": 9, "thread": "019f-new"},
+        ]
+
+        def fake_record(user_id, thread_id):
+            stats = stats_seq.pop(0)
+            app._store_codex_usage(user_id, stats)
+            return stats
+
         with mock.patch.object(app, "shutil") as sh, \
              mock.patch.object(app, "subprocess") as sp, \
-             mock.patch.object(app, "_codex_last_turn_usage",
-                               side_effect=[{"input_tokens": 100, "output_tokens": 10},
-                                            {"input_tokens": 200, "cached_input_tokens": 80, "output_tokens": 20}]) as last_usage:
+             mock.patch.object(app, "codex_record_turn", side_effect=fake_record) as record:
             sh.which.return_value = "/usr/bin/codex"
             sp.run.side_effect = fake_run
             prefs_tmp = app.AGENT_PREFS_FILE
@@ -1212,29 +1229,98 @@ class OpenClawTests(unittest.TestCase):
                 self.assertIn("resume", second_cmd)
                 self.assertEqual(second_cmd[second_cmd.index("resume") + 1], "019f-new")
                 usage = app.codex_usage_for("wx-user")
-                self.assertEqual(usage["input"], 300)
+                self.assertEqual(usage["input"], 200)
                 self.assertEqual(usage["cached"], 80)
+                self.assertEqual(usage["call_input"], 200)
+                self.assertEqual(record.call_count, 2)
             finally:
                 app.AGENT_PREFS_FILE = prefs_tmp
 
-    def test_codex_last_turn_usage_reads_thread_file_token_count(self):
-        fn = self._require_callable("_codex_last_turn_usage")
+    def test_codex_record_turn_tracks_persistent_context(self):
+        record = self._require_callable("codex_record_turn")
         with tempfile.TemporaryDirectory() as tmp:
             sessions_root = os.path.join(tmp, "sessions")
             day_dir = os.path.join(sessions_root, "2026", "08", "08")
             os.makedirs(day_dir)
             thread_file = os.path.join(day_dir, "rollout-2026-08-08T00-00-00-019f-test.jsonl")
-            self._write_jsonl(thread_file, [
-                {"type": "event_msg", "payload": {"type": "token_count", "info": {"last_token_usage": {"input_tokens": 10254}}}},
-                {"type": "event_msg", "payload": {"type": "token_count", "info": {"last_token_usage": {"input_tokens": 11161, "cached_input_tokens": 11008}}}},
-            ])
+            prefs_tmp = app.AGENT_PREFS_FILE
+            app.AGENT_PREFS_FILE = os.path.join(tmp, "prefs.json")
             old_cfg = app.CODEX_CONFIG_FILE
             app.CODEX_CONFIG_FILE = os.path.join(tmp, "config.toml")
             try:
-                result = fn("019f-test")
-                self.assertEqual(result.get("input_tokens"), 11161)
-                self.assertEqual(result.get("cached_input_tokens"), 11008)
+                def append_jsonl(path, records):
+                    with open(path, "a", encoding="utf-8") as handle:
+                        for record in records:
+                            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+                app.set_codex_thread("wx-user", "019f-test")
+                # 第 1 轮：无工具，input 即对话上下文
+                self._write_jsonl(thread_file, [
+                    {"type": "event_msg", "payload": {"type": "user_message", "message": "你好"}},
+                    {"type": "event_msg", "payload": {"type": "token_count", "info": {"last_token_usage": {"input_tokens": 10254, "cached_input_tokens": 10000, "output_tokens": 80}}}},
+                ])
+                stats = record("wx-user", "019f-test")
+                self.assertEqual(stats["persistent"], 10254)
+                self.assertEqual(stats["call_input"], 10254)
+                # 第 2 轮：web 搜索，单条 token_count 含瞬时搜索结果 -> 估算增量，单调不减
+                append_jsonl(thread_file, [
+                    {"type": "event_msg", "payload": {"type": "user_message", "message": "搜索一下"}},
+                    {"type": "event_msg", "payload": {"type": "web_search_call", "action": {"type": "search", "queries": ["x"]}}},
+                    {"type": "event_msg", "payload": {"type": "web_search_end", "action": {"type": "search", "queries": ["x"]}}},
+                    {"type": "event_msg", "payload": {"type": "token_count", "info": {"last_token_usage": {"input_tokens": 36000, "cached_input_tokens": 34000, "output_tokens": 600}}}},
+                ])
+                stats2 = record("wx-user", "019f-test")
+                self.assertEqual(stats2["call_input"], 36000)
+                self.assertTrue(stats2["estimated"])
+                self.assertGreaterEqual(stats2["persistent"], stats["persistent"])
+                self.assertLess(stats2["persistent"], 36000)
+                # 第 3 轮：多次模型调用（工具），首条 input 即工具前的干净上下文
+                append_jsonl(thread_file, [
+                    {"type": "event_msg", "payload": {"type": "function_call", "id": "f1"}},
+                    {"type": "event_msg", "payload": {"type": "function_call_output", "output": "ok"}},
+                    {"type": "event_msg", "payload": {"type": "token_count", "info": {"last_token_usage": {"input_tokens": 15000, "cached_input_tokens": 14800, "output_tokens": 100}}}},
+                    {"type": "event_msg", "payload": {"type": "token_count", "info": {"last_token_usage": {"input_tokens": 15600, "cached_input_tokens": 15400, "output_tokens": 300}}}},
+                ])
+                stats3 = record("wx-user", "019f-test")
+                self.assertEqual(stats3["persistent"], 15000)
+                self.assertEqual(stats3["call_input"], 15600)
+                self.assertEqual(stats3["output"], 300)
+                self.assertFalse(stats3["estimated"])
+                saved = app.codex_usage_for("wx-user")
+                self.assertEqual(saved["thread"], "019f-test")
+                self.assertEqual(saved["seen_line"], 9)
             finally:
+                app.AGENT_PREFS_FILE = prefs_tmp
+                app.CODEX_CONFIG_FILE = old_cfg
+
+    def test_codex_record_turn_resets_when_thread_changes(self):
+        record = self._require_callable("codex_record_turn")
+        with tempfile.TemporaryDirectory() as tmp:
+            sessions_root = os.path.join(tmp, "sessions")
+            day_dir = os.path.join(sessions_root, "2026", "08", "08")
+            os.makedirs(day_dir)
+            prefs_tmp = app.AGENT_PREFS_FILE
+            app.AGENT_PREFS_FILE = os.path.join(tmp, "prefs.json")
+            old_cfg = app.CODEX_CONFIG_FILE
+            app.CODEX_CONFIG_FILE = os.path.join(tmp, "config.toml")
+            try:
+                old_file = os.path.join(day_dir, "rollout-2026-08-08T00-00-00-019f-old.jsonl")
+                self._write_jsonl(old_file, [
+                    {"type": "event_msg", "payload": {"type": "token_count", "info": {"last_token_usage": {"input_tokens": 50000, "output_tokens": 100}}}},
+                ])
+                app.set_codex_thread("wx-user", "019f-old")
+                stats = record("wx-user", "019f-old")
+                self.assertEqual(stats["persistent"], 50000)
+                # 新线程（如压缩后）：上下文重置，不再沿用旧线程
+                new_file = os.path.join(day_dir, "rollout-2026-08-08T00-00-00-019f-new.jsonl")
+                self._write_jsonl(new_file, [
+                    {"type": "event_msg", "payload": {"type": "token_count", "info": {"last_token_usage": {"input_tokens": 3000, "output_tokens": 50}}}},
+                ])
+                app.set_codex_thread("wx-user", "019f-new")
+                stats2 = record("wx-user", "019f-new")
+                self.assertEqual(stats2["persistent"], 3000)
+            finally:
+                app.AGENT_PREFS_FILE = prefs_tmp
                 app.CODEX_CONFIG_FILE = old_cfg
 
     def test_codex_answer_fails_when_cli_missing(self):
@@ -1376,17 +1462,20 @@ class OpenClawTests(unittest.TestCase):
         app.AGENT_PREFS_FILE = os.path.join(tempfile.mkdtemp(), "prefs.json")
         try:
             app.add_codex_usage("wx-user", {"input_tokens": 12000, "cached_input_tokens": 8000, "output_tokens": 100})
-            result = status("wx-user", {"input_tokens": 6000, "cached_input_tokens": 4000, "output_tokens": 80})
+            result = status("wx-user", {"persistent": 6000, "call_input": 6000, "cached": 4000, "output": 80})
             self.assertIn("Codex 智能体", result)
             self.assertIn("缓存命中 4000", result)
             self.assertIn("未命中 2000", result)
-            self.assertIn("6k / 272k", result)
+            self.assertIn("对话上下文 6.1k / 272k", result)
+            self.assertIn("输入 6k / 输出 80", result)
             self.assertNotIn("12k", result)
+            self.assertNotIn("本次调用输入", result)
+            self.assertNotIn("约", result)
         finally:
             app.AGENT_PREFS_FILE = prefs_tmp
 
-    def test_codex_context_status_falls_back_to_cumulative(self):
-        # 没有本轮用量时回退到累计值（兼容旧数据）。
+    def test_codex_context_status_falls_back_to_latest_turn_usage(self):
+        # 没有本轮用量时回退到最近一次记录（覆盖语义，不再累加）。
         status = self._require_callable("codex_context_status")
         prefs_tmp = app.AGENT_PREFS_FILE
         app.AGENT_PREFS_FILE = os.path.join(tempfile.mkdtemp(), "prefs.json")
@@ -1395,7 +1484,7 @@ class OpenClawTests(unittest.TestCase):
             result = status("wx-user")
             self.assertIn("Codex 智能体", result)
             self.assertIn("缓存命中 8000", result)
-            self.assertIn("12k", result)
+            self.assertIn("输入 12k / 输出 100", result)
         finally:
             app.AGENT_PREFS_FILE = prefs_tmp
 
@@ -1407,9 +1496,24 @@ class OpenClawTests(unittest.TestCase):
         try:
             app.add_codex_usage("wx-user", {"input_tokens": 300000, "cached_input_tokens": 280000, "output_tokens": 100})
             with mock.patch.object(app, "load_config", return_value={"codex_context_limit": 1000000}):
-                result = status("wx-user", {"input_tokens": 300000, "cached_input_tokens": 280000, "output_tokens": 100})
-            self.assertIn("300k / 1000k", result)
+                result = status("wx-user", {"persistent": 300000, "call_input": 300000, "cached": 280000, "output": 100})
+            self.assertIn("300.1k / 1000k", result)
             self.assertIn("30.0%", result)
+        finally:
+            app.AGENT_PREFS_FILE = prefs_tmp
+
+    def test_codex_context_status_appends_call_input_when_transient(self):
+        # 搜索/工具轮：对话上下文不含瞬时内容，本次调用输入单独标注，避免误读为上下文缩小
+        status = self._require_callable("codex_context_status")
+        prefs_tmp = app.AGENT_PREFS_FILE
+        app.AGENT_PREFS_FILE = os.path.join(tempfile.mkdtemp(), "prefs.json")
+        try:
+            result = status("wx-user", {"persistent": 12000, "call_input": 36000,
+                                        "cached": 33000, "output": 800, "estimated": True})
+            self.assertIn("对话上下文 约12.8k / 272k", result)
+            self.assertIn("搜索轮估算", result)
+            self.assertIn("本次调用输入 36k", result)
+            self.assertIn("缓存命中 33000 / 未命中 3000", result)
         finally:
             app.AGENT_PREFS_FILE = prefs_tmp
 
@@ -1562,6 +1666,7 @@ class OpenClawTests(unittest.TestCase):
                 self.assertIn("已压缩上下文", reply)
                 self.assertIn("Codex 智能体", reply)
                 self.assertIn("3k / 272k", reply)
+                self.assertIn("输入 3k / 输出 50", reply)
                 self.assertEqual(app.codex_thread_for("wx-user"), "019f-new")
                 usage = app.codex_usage_for("wx-user")
                 self.assertEqual(usage.get("input"), 3000)

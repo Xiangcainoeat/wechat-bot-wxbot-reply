@@ -610,23 +610,49 @@ def codex_usage_for(user_id):
     return dict(entry.get("codex_usage") or {})
 
 
-def add_codex_usage(user_id, usage):
-    """累加 Codex 单轮用量到该用户 thread 的会话总量（与后台事实同源）。"""
-    user_id = str(user_id or "").strip()
-    if not user_id or not isinstance(usage, dict):
-        return
+def _store_codex_usage(user_id, stats):
+    """持久化 Codex 用量记录（覆盖）：input=对话上下文（单调），call_input=本次调用输入。"""
     with AGENT_PREFS_LOCK:
         data = _agent_prefs_load()
         entry = data["users"].setdefault(user_id, {})
-        total = dict(entry.get("codex_usage") or {})
-        try:
-            total["input"] = int(total.get("input") or 0) + int(usage.get("input_tokens") or 0)
-            total["cached"] = int(total.get("cached") or 0) + int(usage.get("cached_input_tokens") or 0)
-            total["output"] = int(total.get("output") or 0) + int(usage.get("output_tokens") or 0)
-        except (TypeError, ValueError):
-            return
-        entry["codex_usage"] = total
+        entry["codex_usage"] = {
+            "input": int(stats.get("persistent") or stats.get("input") or 0),
+            "cached": int(stats.get("cached") or 0),
+            "output": int(stats.get("output") or 0),
+            "call_input": int(stats.get("call_input") or stats.get("input") or 0),
+            "seen_line": int(stats.get("seen_line") or -1),
+            "thread": str(stats.get("thread") or ""),
+            "estimated": bool(stats.get("estimated")),
+        }
         _agent_prefs_save(data)
+
+
+def add_codex_usage(user_id, usage):
+    """记录最近一次 Codex 调用用量（覆盖，不累加）。
+
+    usage 可以是 codex_record_turn 返回的统计 dict，也可以是原始 token 统计
+    （input_tokens / cached_input_tokens / output_tokens，如压缩播种）。
+    """
+    user_id = str(user_id or "").strip()
+    if not user_id or not isinstance(usage, dict):
+        return
+    if "persistent" in usage or "call_input" in usage:
+        _store_codex_usage(user_id, usage)
+        return
+    try:
+        call_input = int(usage.get("input_tokens") or 0)
+        stats = {
+            "persistent": call_input,
+            "call_input": call_input,
+            "cached": int(usage.get("cached_input_tokens") or 0),
+            "output": int(usage.get("output_tokens") or 0),
+            "seen_line": -1,
+            "thread": "",
+        }
+    except (TypeError, ValueError):
+        return
+    if call_input > 0 or stats["output"] > 0:
+        _store_codex_usage(user_id, stats)
 
 
 def codex_context_limit():
@@ -649,27 +675,33 @@ def codex_context_status(user_id, usage=None):
     优先显示当前这一轮的实际上下文用量（usage 为该轮 codex exec 的
     turn.completed usage），不再累加多轮总量；没有本轮用量时才回退到累计值。
     """
-    used = cached = None
-    if isinstance(usage, dict):
-        try:
-            used = int(usage.get("input_tokens") or 0)
-            cached = int(usage.get("cached_input_tokens") or 0)
-        except (TypeError, ValueError):
-            used = cached = None
-    if not used:
-        saved = codex_usage_for(user_id)
-        try:
-            used = int(saved.get("input") or 0)
-            cached = int(saved.get("cached") or 0)
-        except (TypeError, ValueError):
-            return ""
-    if used <= 0:
+    stats = usage if (isinstance(usage, dict) and usage.get("persistent")) else codex_usage_for(user_id)
+    if not isinstance(stats, dict):
         return ""
-    miss = max(0, used - cached)
-    base = format_context_usage(used, codex_context_limit(), cached, miss)
-    if base and base.startswith("（"):
-        return "（Codex 智能体 · " + base[1:]
-    return "（Codex 智能体）"
+    try:
+        persistent = int(stats.get("persistent") or stats.get("input") or 0)
+        call_input = int(stats.get("call_input") or persistent)
+        cached = int(stats.get("cached") or 0)
+        output = int(stats.get("output") or 0)
+    except (TypeError, ValueError):
+        return ""
+    if persistent <= 0:
+        return ""
+    miss = max(0, call_input - cached)
+    estimated = bool(stats.get("estimated"))
+    base = format_context_usage(persistent, codex_context_limit(), cached, miss, output,
+                                label="对话上下文")
+    if not base:
+        return "（Codex 智能体）"
+    if estimated:
+        # 搜索轮的 token_count 是「对话+搜索结果」的混合值，文件里没有拆分，
+        # 对话上下文只能估算（下一轮无搜索时才会显示精确值），加「约」避免误读
+        base = base.replace("（对话上下文 ", "（对话上下文 约", 1)
+        base = base[:-1] + "；搜索轮估算，下一轮显示精确值）"
+    # 本次调用含瞬时内容（搜索/工具结果）时，输入会大于对话上下文，追加说明避免误读
+    if call_input > persistent:
+        base = base[:-1] + "；本次调用输入 {}）".format(_fmt_tokens(call_input))
+    return "（Codex 智能体 · " + base[1:]
 
 
 def _openclaw_registry_save(data):
@@ -900,7 +932,18 @@ def read_openclaw_transcript(session_id, transcript_dir=None):
     return openclaw_parse_transcript(path)
 
 
-def format_context_usage(used, limit, cached=None, miss=None):
+def _fmt_tokens(value):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if value >= 1000:
+        text = "{:.1f}".format(value / 1000).rstrip("0").rstrip(".")
+        return text + "k"
+    return str(int(value))
+
+
+def format_context_usage(used, limit, cached=None, miss=None, output=None, label="上下文"):
     if used is None or limit is None:
         return ""
     try:
@@ -908,12 +951,11 @@ def format_context_usage(used, limit, cached=None, miss=None):
         limit = float(limit)
         if limit <= 0:
             return ""
-        def fmt(value):
-            if value >= 1000:
-                text = "{:.1f}".format(value / 1000).rstrip("0").rstrip(".")
-                return text + "k"
-            return str(int(value))
-        result = "（上下文 {} / {}，{:.1f}%）".format(fmt(used), fmt(limit), used / limit * 100)
+        # 上下文总量 = 输入 + 输出（用户口径），并保留输入/输出拆分
+        total = used + (float(output) if output is not None else 0)
+        result = "（{} {} / {}，{:.1f}%）".format(label, _fmt_tokens(total), _fmt_tokens(limit), total / limit * 100)
+        if output is not None:
+            result = result[:-1] + "；输入 {} / 输出 {}）".format(_fmt_tokens(used), _fmt_tokens(output))
         if cached is not None and miss is not None:
             result = result[:-1] + "；缓存命中 {} / 未命中 {}）".format(int(cached), int(miss))
         return result
@@ -972,6 +1014,11 @@ def _usage_breakdown(usage):
     return None
 
 
+def _usage_output(usage):
+    """跨格式解析 usage 的输出 token 数。"""
+    return _usage_int(usage, "output", "outputTokens", "completion_tokens", "output_tokens")
+
+
 def _context_used_from_usage(usage):
     parts = _usage_breakdown(usage)
     return parts[0] if parts else None
@@ -984,7 +1031,8 @@ def _openclaw_context_status(session_key):
         parts = _usage_breakdown(usage)
         limit = _positive_usage_value(usage, "contextTokens", "contextWindow") or 128000
         if parts:
-            result = format_context_usage(parts[0], limit, parts[1], parts[2])
+            result = format_context_usage(parts[0], limit, parts[1], parts[2],
+                                          _usage_output(usage))
             if result:
                 return result
     # 与后台同源：优先 transcript 最新一条 usage，其次原生索引
@@ -1004,7 +1052,8 @@ def _openclaw_context_status(session_key):
                 limit = (_positive_usage_value(
                     entry, "contextWindow", "contextTokens", "contextWindowTokens"
                 ) or 128000)
-                return format_context_usage(parts[0], limit, parts[1], parts[2])
+                return format_context_usage(parts[0], limit, parts[1], parts[2],
+                                            _usage_output(latest))
         used = _positive_usage_value(entry, "totalTokens", "inputTokens", "input_tokens")
         limit = _positive_usage_value(entry, "contextWindow", "contextTokens") or 128000
         return format_context_usage(used, limit) if used is not None else ""
@@ -2520,38 +2569,108 @@ def _parse_codex_jsonl(text):
     return thread_id, messages, errors, usage
 
 
-def _codex_last_turn_usage(thread_id):
-    """读 Codex 线程文件最后一条 token_count 的 last_token_usage（本轮真实用量）。
+# token_count 之外的工具类事件：出现说明本轮调用可能含瞬时内容（搜索/工具结果）
+_CODEX_TOOL_EVENTS = (
+    "web_search_call", "web_search_end",
+    "function_call", "function_call_output",
+    "exec_call", "exec_output", "shell_call", "shell_output",
+)
 
-    codex 0.139 的 --json turn.completed.usage 报告的是会话累计值，
-    线程文件内的 last_token_usage 才是本轮请求的真实上下文占用。
+
+def _codex_read_turn(thread_id, seen_line):
+    """读 Codex 线程文件，返回 (本轮新 token_count 用量列表, 工具事件文本量, 用户消息文本量, 最后 token_count 行号)。
+
+    seen_line 为已消费的最后一条 token_count 行号；只统计它之后的新事件。
     """
     path = _codex_thread_file(thread_id)
-    if not path:
+    counts = []
+    tool_chars = 0
+    user_chars = 0
+    last_line = seen_line
+    if path:
+        try:
+            with open(path, encoding="utf-8") as f:
+                for idx, line in enumerate(f):
+                    line = line.strip()
+                    if not line.startswith("{"):
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except Exception:
+                        continue
+                    if event.get("type") != "event_msg":
+                        continue
+                    payload = event.get("payload") or {}
+                    typ = payload.get("type")
+                    if typ == "token_count":
+                        info = payload.get("info") or {}
+                        last = info.get("last_token_usage") or {}
+                        if isinstance(last, dict) and last.get("input_tokens"):
+                            counts.append((idx, dict(last)))
+                    elif typ in _CODEX_TOOL_EVENTS and idx > seen_line:
+                        tool_chars += len(json.dumps(payload, ensure_ascii=False))
+                    elif typ == "user_message" and idx > seen_line:
+                        msg = payload.get("message") or ""
+                        if isinstance(msg, dict):
+                            msg = msg.get("content") or ""
+                        user_chars += len(str(msg))
+        except Exception:
+            pass
+    if counts:
+        last_line = counts[-1][0]
+    new_counts = [u for i, u in counts if i > seen_line]
+    return new_counts, tool_chars, user_chars, last_line
+
+
+def codex_record_turn(user_id, thread_id):
+    """读取本轮 Codex 调用统计并持久化，返回展示用 dict。
+
+    对话上下文（persistent，单调不减，不含搜索/工具瞬时内容）：
+    - 多 token_count 的轮次：取首条 input（工具前的干净上下文）；
+    - 单条且无工具：input 即本轮上下文；
+    - 单条且含 web 搜索：input 含瞬时搜索结果，按 输出+消息文本 估算增量。
+    本次调用输入/输出/缓存命中/未命中：取本轮最后一条 token_count（真实调用值）。
+    """
+    user_id = str(user_id or "").strip()
+    if not user_id or not thread_id:
         return {}
-    usage = {}
+    prev = codex_usage_for(user_id)
+    thread_changed = str(prev.get("thread") or "") != str(thread_id)
     try:
-        with open(path, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line.startswith("{"):
-                    continue
-                try:
-                    event = json.loads(line)
-                except Exception:
-                    continue
-                if event.get("type") != "event_msg":
-                    continue
-                payload = event.get("payload") or {}
-                if payload.get("type") != "token_count":
-                    continue
-                info = payload.get("info") or {}
-                last = info.get("last_token_usage") or {}
-                if isinstance(last, dict) and last.get("input_tokens"):
-                    usage = dict(last)
-    except Exception:
-        pass
-    return usage
+        seen_line = -1 if thread_changed else max(-1, int(prev.get("seen_line") or -1))
+    except (TypeError, ValueError):
+        seen_line = -1
+    counts, tool_chars, user_chars, last_line = _codex_read_turn(thread_id, seen_line)
+    if not counts:
+        return {}
+    last = counts[-1]
+    call_input = int(last.get("input_tokens") or 0)
+    call_cached = int(last.get("cached_input_tokens") or 0)
+    call_output = int(last.get("output_tokens") or 0)
+    prev_persistent = 0 if thread_changed else int(prev.get("input") or 0)
+    if len(counts) > 1:
+        persistent = int(counts[0].get("input_tokens") or 0)
+        estimated = False
+    elif tool_chars == 0:
+        persistent = call_input
+        estimated = False
+    else:
+        # 搜索轮：估算增量 = 输出 + 用户消息/工具事件文本的粗略 token 数（中文约 1 字/字符）
+        delta = call_output + max(1, int((tool_chars + user_chars) / 4))
+        persistent = prev_persistent + delta
+        estimated = True
+    persistent = max(prev_persistent, min(call_input, persistent))
+    stats = {
+        "persistent": persistent,
+        "call_input": call_input,
+        "cached": call_cached,
+        "output": call_output,
+        "seen_line": last_line,
+        "thread": str(thread_id),
+        "estimated": estimated,
+    }
+    _store_codex_usage(user_id, stats)
+    return stats
 
 
 def codex_answer(prompt, session_id=""):
@@ -2592,17 +2711,16 @@ def codex_answer(prompt, session_id=""):
             return codex_answer(prompt, session_id)
         raise ValueError("Codex 执行失败: {}".format(detail or "未知错误"))
     new_thread, messages, errors, _usage = _parse_codex_jsonl(proc.stdout)
-    # 0.139 的 turn.completed 报累计值；线程文件里的 last_token_usage 才是本轮真实用量。
-    per_turn = _codex_last_turn_usage(new_thread or thread_id)
     reply = messages[-1] if messages else ""
     if not reply and errors:
         raise ValueError("Codex 返回错误: {}".format(errors[-1][:200]))
+    stats = {}
     if user_id:
         if new_thread and new_thread != thread_id:
             set_codex_thread(user_id, new_thread)
-        add_codex_usage(user_id, per_turn)
+        stats = codex_record_turn(user_id, new_thread or thread_id)
     reply = clean_wechat_reply(reply) or "（没有返回内容）"
-    status = codex_context_status(user_id, per_turn) if user_id else ""
+    status = codex_context_status(user_id, stats) if user_id else ""
     return (reply + "\n" + status).strip() if status else reply
 
 
@@ -2795,6 +2913,21 @@ def codex_start_new_session(user_id):
 
 
 # ---------------- 智能体切换 ----------------
+def strip_bot_mentions(text, bot_name):
+    """去掉消息里对机器人本体的 @提及（可能出现在开头/中间/结尾），只保留正文。
+
+    @提及是微信群的触发前缀，原样发给 AI 会污染提问（如把 @kindle 当查询内容）。
+    """
+    text = str(text or "")
+    if not text.strip():
+        return text
+    if bot_name:
+        text = re.sub(r"@\s*" + re.escape(str(bot_name)) + r"\s*", " ", text)
+    # 结尾的 @xxx 通常也是群里的 @提及（如 "...命中了@kindle"），一并去掉
+    text = re.sub(r"@\s*[\u4e00-\u9fa5\w\-]+\s*$", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def handle_agent_switch(arg, from_id):
     """切换智能体：无参数显示当前/可选；参数设置并持久化到该用户。"""
     arg = str(arg or "").strip().lower()
@@ -5339,8 +5472,9 @@ class Handler(BaseHTTPRequestHandler):
             elif wizard_reply is not None:
                 reply = wizard_reply
             elif (not in_room) or mentioned:
-                # 群聊里可能带 @机器人 前缀（如 "@kindle /余额"），先剥掉再判断命令
-                cmd_text = re.sub(r"^@\s*[\u4e00-\u9fa5\w\-]+", "", text_in).strip()
+                # 去掉对机器人本体的 @提及（开头/中间/结尾都可能出现），避免原样发给 AI
+                text_clean = strip_bot_mentions(text_in, bot_name)
+                cmd_text = re.sub(r"^@\s*[\u4e00-\u9fa5\w\-]+", "", text_clean).strip()
                 cmd_word = cmd_text.split(None, 1)[0].lower() if cmd_text else ""
                 # 权限规则：AI 类命令需要授权；普通功能（计算/记账/提醒等）人人可用
                 if ((cmd_text.startswith("/") and cmd_word in AI_CMDS)
