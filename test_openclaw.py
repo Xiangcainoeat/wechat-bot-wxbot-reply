@@ -815,6 +815,72 @@ class OpenClawTests(unittest.TestCase):
         self.assertIn("明天下午三点开会", reply_no_from)
         self.assertIsNone(reply_empty)
 
+    def test_handle_recall_notice_parses_revokemsg_xml(self):
+        handle = self._require_callable("handle_recall_notice")
+        xml = (
+            '<sysmsg type="revokemsg"><revokemsg><session>7537871174@chatroom'
+            "</session><oldmsgid>667143938</oldmsgid><msgid>891050704353080508"
+            '</msgid><replacemsg><![CDATA["欣欣木子" 撤回了一条消息]]></replacemsg>'
+            "</revokemsg></sysmsg>"
+        )
+        app._recent.append({
+            "roomId": "@@room", "fromId": "member-x", "from": "欣欣木子",
+            "content": "晚八点可约故宫？", "reply": None,
+        })
+        try:
+            # from 字段归因错误时，以 replacemsg 里的姓名为准
+            reply = handle(xml, "someone-else", "其他用户", "@@room")
+            reply_wrong_room = handle(xml, "member-x", "欣欣木子", "@@other-room")
+        finally:
+            app._recent.clear()
+        self.assertIn("欣欣木子", reply)
+        self.assertIn("晚八点可约故宫？", reply)
+        self.assertIn("撤回没用", reply)
+        self.assertIsNone(handle("你好", "member-x", "欣欣木子", "@@room"))
+        self.assertIn("没来得及缓存原内容", reply_wrong_room)
+
+    def test_on_receive_recall_event_reveals_content(self):
+        xml = (
+            '<sysmsg type="revokemsg"><revokemsg><session>7537871174@chatroom'
+            "</session><oldmsgid>667143938</oldmsgid><msgid>891050704353080508"
+            '</msgid><replacemsg><![CDATA["欣欣木子" 撤回了一条消息]]></replacemsg>'
+            "</revokemsg></sysmsg>"
+        )
+        source = {
+            "room": {"id": "@@room", "payload": {"topic": "测试群"}},
+            "from": {"payload": {"id": "@user", "name": "其他用户"}},
+            "to": {"payload": {"name": "kindle"}},
+        }
+        fields = {
+            "type": (None, b"unknown"),
+            "content": (None, xml.encode("utf-8")),
+            "source": (None, json.dumps(source, ensure_ascii=False).encode("utf-8")),
+            "isMentioned": (None, b"0"),
+            "isMsgFromSelf": (None, b"0"),
+            "isSystemEvent": (None, b"0"),
+        }
+
+        class _Receiver:
+            def _json(self, value):
+                self.result = value
+
+        receiver = _Receiver()
+        app._recent.append({
+            "roomId": "@@room", "fromId": "member-x", "from": "欣欣木子",
+            "content": "晚八点可约故宫？", "reply": None,
+        })
+        try:
+            with mock.patch.object(app, "identity_user_id", return_value="stable-user", create=True), \
+                 mock.patch.object(app, "record_user"), \
+                 mock.patch.object(app, "load_config", return_value={"auto_reply": True}), \
+                 mock.patch.object(app, "save_record"):
+                app.Handler._on_receive(receiver, fields)
+        finally:
+            app._recent.clear()
+        data = receiver.result.get("data") or {}
+        self.assertIn("晚八点可约故宫？", data.get("content", ""))
+        self.assertIn("撤回没用", data.get("content", ""))
+
     def test_collect_add_and_summary(self):
         with tempfile.TemporaryDirectory() as tmp:
             collects = os.path.join(tmp, "collects.json")

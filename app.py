@@ -4201,32 +4201,62 @@ def do_mention(target, content, from_id, from_name, room_id, room_name):
 
 
 def handle_recall_notice(content, from_id, sender_name, room_id):
-    """防撤回：识别“XX撤回了一条消息”提示，把缓存的原内容公之于众（撤回没用）。
+    """防撤回：识别撤回提示，把缓存的原内容公之于众（撤回没用）。
 
+    兼容两种格式：
+    1. 纯文本提示：“XX撤回了一条消息”
+    2. 网页版 sysmsg XML：<sysmsg type="revokemsg">…<replacemsg>“XX” 撤回了一条消息</replacemsg>
+       （type=unknown，from 字段可能归因错误，以 replacemsg 里的姓名为准）
     网页版协议不一定上报撤回事件，这里做尽力而为：收到撤回提示时，
     从消息记录里找出同一发送者/同一群最近一条非撤回消息并展示。
     """
     content = str(content or "")
-    if "撤回了一条消息" not in content:
+    if "撤回了一条消息" not in content and "revokemsg" not in content:
         return None
     room_id = str(room_id or "").strip()
     from_id = str(from_id or "").strip()
+    xml_sender = ""
+    m = re.search(r'<replacemsg><!\[CDATA\["?([^"<\]]+)"?\s*撤回了一条消息', content)
+    if m:
+        xml_sender = m.group(1).strip()
+        sender_name = xml_sender
+    m = re.search(r"<session>([^<]+)</session>", content)
+    if m and not room_id:
+        room_id = m.group(1).strip()
     sender_name = str(sender_name or "").strip() or "有人"
+    # 能否确定真实撤回者：有稳定 fromId 或 XML 里带姓名时按人匹配；
+    # 都拿不到时（如纯文本提示且无 fromId）尽力而为展示该群最近一条消息
+    identified = bool(from_id) or bool(xml_sender)
 
-    def _find(records, match_from):
+    def _find(records):
         for rec in reversed(records):
             if room_id and str(rec.get("roomId") or "") != room_id:
                 continue
-            if match_from and from_id and str(rec.get("fromId") or "") != from_id:
+            rec_name = str(rec.get("from") or "")
+            rec_fid = str(rec.get("fromId") or "")
+            if not ((from_id and rec_fid == from_id) or rec_name == sender_name):
                 continue
             original = str(rec.get("content") or "")
-            if original and "撤回" not in original:
+            if original and "撤回" not in original and "sysmsg" not in original:
                 return original
         return ""
 
-    original = _find(_recent, True) or _find(_recent, False)
+    def _find_room_only(records):
+        for rec in reversed(records):
+            if room_id and str(rec.get("roomId") or "") != room_id:
+                continue
+            original = str(rec.get("content") or "")
+            if original and "撤回" not in original and "sysmsg" not in original:
+                return original
+        return ""
+
+    original = _find(_recent)
+    if not original and not identified:
+        original = _find_room_only(_recent)
     if not original:
-        original = _find(read_messages(5000), True) or _find(read_messages(5000), False)
+        original = _find(read_messages(5000))
+    if not original and not identified:
+        original = _find_room_only(read_messages(5000))
     if not original:
         return "⚠️ {} 撤回了一条消息，撤回没用，但我没来得及缓存原内容。".format(sender_name)
     return "⚠️ {} 撤回了一条消息，撤回没用：「{}」".format(sender_name, original[:200])
@@ -6055,13 +6085,14 @@ class Handler(BaseHTTPRequestHandler):
         reply = None
         cfg = load_config()
         session_id = ai_session_key(from_id, room_id)
-        if mtype == "text" and cfg.get("auto_reply", True):
-            text_in = content.strip()
-            # 防撤回：识别撤回提示并把缓存的原内容公之于众
+        if cfg.get("auto_reply", True):
+            # 防撤回：撤回事件是 type=unknown 的 revokemsg XML（或纯文本提示），
+            # 识别后把缓存的原内容公之于众，不进入 AI 问答
             recall_reply = handle_recall_notice(content, from_id, sender_name, room_id)
             if recall_reply is not None:
                 reply = recall_reply
-            else:
+            elif mtype == "text":
+                text_in = content.strip()
                 # 每日推送城市确认流程：有待确认时优先处理（群里可不用 @机器人）
                 pending_reply = handle_pending_reply(from_id, text_in) if text_in else None
                 wizard_reply = handle_wizard(from_id, text_in) if (pending_reply is None and text_in) else None
