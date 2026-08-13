@@ -94,6 +94,20 @@ class _ModelsJsonHandler(BaseHTTPRequestHandler):
 
 
 class OpenClawTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # 测试会故意触发错误路径（如 AI 调用失败），把 error.log 隔离到
+        # 临时目录，避免污染生产 error.log 并在后台误报“AI 不可用”。
+        cls._cls_tmpdir = tempfile.TemporaryDirectory()
+        cls._error_log_path = os.path.join(cls._cls_tmpdir.name, "error.log")
+        cls._error_log_patch = mock.patch.object(app, "ERROR_LOG", cls._error_log_path)
+        cls._error_log_patch.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._error_log_patch.stop()
+        cls._cls_tmpdir.cleanup()
+
     def _patch_openclaw_paths(self, stack, *, registry=None, index=None, transcript_dir=None):
         """Keep session fixtures isolated regardless of the production constant spelling."""
         aliases = {
