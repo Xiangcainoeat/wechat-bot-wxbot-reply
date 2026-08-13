@@ -677,16 +677,134 @@ class OpenClawTests(unittest.TestCase):
             reply = app.do_mention("张三", "你好", "wx-user", "用户", "room-1", "测试群")
             private_reply = app.do_mention("张三", "你好", "wx-user", "用户", "", "")
             empty_reply = app.do_mention("张三", "", "wx-user", "用户", "room-1", "测试群")
-        self.assertIn("已替你在群里艾特 张三", reply)
+        # 确认回复不重复用户原话
+        self.assertEqual(reply, "✅ 已替你在群里艾特 张三")
         self.assertIn("只能在群里使用", private_reply)
-        self.assertIn("请带上要发送的内容", empty_reply)
-        send.assert_called_once_with("测试群", "@张三 你好", is_room=True)
+        # 无内容时只发一个裸 @，也允许
+        self.assertEqual(empty_reply, "✅ 已替你在群里艾特 张三")
+        send.assert_any_call("测试群", "@张三 你好", is_room=True)
+        send.assert_any_call("测试群", "@张三", is_room=True)
 
     def test_do_mention_requires_permission(self):
         with mock.patch.object(app, "is_allowed", return_value=False), \
              mock.patch.object(app, "bot_send", side_effect=AssertionError("不应发送")):
             reply = app.do_mention("张三", "你好", "wx-user", "用户", "room-1", "测试群")
         self.assertEqual(reply, app.AI_NO_PERMISSION_MSG)
+
+    def test_strip_bot_mentions_normalizes_invisible_spaces(self):
+        # 微信 @提及 用 U+2005 等不可见分隔符，必须归一后剥离，避免把 kindle 当目标
+        self.assertEqual(
+            app.strip_bot_mentions("@kindle\u2005THk 群里这个人叫田浩亢", "kindle"),
+            "THk 群里这个人叫田浩亢")
+        self.assertEqual(
+            app.strip_bot_mentions("@kindle\u200b帮我看看", "kindle"),
+            "帮我看看")
+        self.assertEqual(
+            app.strip_bot_mentions("@KINDLE\u2005你好", "kindle"),
+            "你好")
+
+    def test_parse_mention_request_rejects_self_and_dynamic_intent(self):
+        parse = self._require_callable("_parse_mention_request")
+        # @机器人本体是触发前缀，不是艾特指令
+        self.assertIsNone(parse("@kindle THk 群里这个人叫田浩亢", "room-1", "kindle"))
+        self.assertIsNone(parse("@kindle\u2005我没让你艾特他啊", "room-1", "kindle"))
+        self.assertIsNone(parse("艾特我", "room-1", "kindle"))
+        self.assertIsNone(parse("艾特kindle", "room-1", "kindle"))
+        # “提醒谁”也是艾特意图；目标是“我/他”则交还提醒/AI 处理
+        self.assertEqual(parse("提醒田浩亢 记得带电脑", "room-1"), ("田浩亢", "记得带电脑"))
+        self.assertEqual(parse("提醒一下田浩亢：记得带电脑", "room-1"), ("田浩亢", "记得带电脑"))
+        self.assertIsNone(parse("提醒我 明天8点开会", "room-1"))
+        self.assertIsNone(parse("提醒他 明天开会", "room-1"))
+        # 内容里指代目标本人的“提醒他/告诉他”前缀简化成直接内容
+        self.assertEqual(parse("艾特田浩亢提醒他带电脑", "room-1"), ("田浩亢", "带电脑"))
+        self.assertEqual(parse("@田浩亢 提醒他带电脑", "room-1"), ("田浩亢", "带电脑"))
+        # 艾特群里 + 名字
+        self.assertEqual(parse("把我艾特群里田浩亢提醒他", "room-1"), ("田浩亢", ""))
+        # 正常艾特指令不受影响
+        self.assertEqual(parse("艾特张三说你好", "room-1"), ("张三", "你好"))
+        self.assertEqual(parse("@张三 明天开会", "room-1"), ("张三", "明天开会"))
+
+    def test_group_memory_learns_name_alias_from_sentence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            memory = os.path.join(tmp, "group_memory.json")
+            with mock.patch.object(app, "GROUP_MEMORY_FILE", memory):
+                reply = app.learn_group_alias("room-1", "THk 群里这个人叫田浩亢")
+                self.assertIn("记住了", reply)
+                # 别名能解析出真实姓名
+                self.assertEqual(app.resolve_member_name("room-1", "THk"), ("", "田浩亢"))
+                # 已学过的重复消息不再重复确认
+                self.assertIsNone(app.learn_group_alias("room-1", "THk 群里这个人叫田浩亢"))
+                # 常见说法
+                self.assertIsNotNone(app.learn_group_alias("room-1", "小明就是王小明"))
+                self.assertEqual(app.resolve_member_name("room-1", "小明"), ("", "王小明"))
+                self.assertIsNotNone(app.learn_group_alias("room-1", "记住小明的真名是王小明"))
+                # 普通聊天不误学
+                self.assertIsNone(app.learn_group_alias("room-1", "这个群是干嘛的"))
+                self.assertIsNone(app.learn_group_alias("room-1", "雷军是小米的爸爸"))
+
+    def test_do_mention_confirmation_does_not_echo_content(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            memory = os.path.join(tmp, "group_memory.json")
+            with mock.patch.object(app, "GROUP_MEMORY_FILE", memory), \
+                 mock.patch.object(app, "is_allowed", return_value=True), \
+                 mock.patch.object(app, "bot_send",
+                                   return_value=(True, '{"success":true}')) as send:
+                app.remember_sender_in_room("room-1", "测试群", "member-a", "王小明")
+                reply = app.do_mention("王小明", "明天记得带电脑", "wx-user", "用户", "room-1", "测试群")
+        self.assertEqual(reply, "✅ 已替你在群里艾特 王小明")
+        send.assert_called_once_with("测试群", "@王小明 明天记得带电脑", is_room=True)
+
+    def test_receive_pipeline_learns_name_alias_instead_of_mention(self):
+        source = {
+            "room": {"id": "@@room", "payload": {"topic": "测试群"}},
+            "from": {"payload": {"id": "@user", "name": "Z"}},
+            "to": {"payload": {"name": "kindle"}},
+        }
+        fields = {
+            "type": (None, b"text"),
+            "content": (None, "@kindle\u2005THk 群里这个人叫田浩亢".encode("utf-8")),
+            "source": (None, json.dumps(source, ensure_ascii=False).encode("utf-8")),
+            "isMentioned": (None, b"1"),
+            "isMsgFromSelf": (None, b"0"),
+            "isSystemEvent": (None, b"0"),
+        }
+
+        class _Receiver:
+            def _json(self, value):
+                self.result = value
+
+        receiver = _Receiver()
+        with tempfile.TemporaryDirectory() as tmp:
+            memory = os.path.join(tmp, "group_memory.json")
+            with mock.patch.object(app, "GROUP_MEMORY_FILE", memory), \
+                 mock.patch.object(app, "identity_user_id", return_value="stable-user", create=True), \
+                 mock.patch.object(app, "record_user"), \
+                 mock.patch.object(app, "load_config", return_value={"auto_reply": True, "smart": True}), \
+                 mock.patch.object(app, "handle_pending_reply", return_value=None), \
+                 mock.patch.object(app, "handle_wizard", return_value=None), \
+                 mock.patch.object(app, "is_allowed", return_value=True), \
+                 mock.patch.object(app, "bot_send",
+                                   side_effect=AssertionError("不应发送艾特")) as send, \
+                 mock.patch.object(app, "save_record") as save:
+                app.Handler._on_receive(receiver, fields)
+                data = receiver.result.get("data") or {}
+                self.assertIn("记住了", data.get("content", ""))
+                send.assert_not_called()
+                # 称呼已写入群长期记忆，可直接解析
+                self.assertEqual(app.resolve_member_name("@@room", "THk"), ("", "田浩亢"))
+
+    def test_save_alias_markers_from_ai_reply(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            memory = os.path.join(tmp, "group_memory.json")
+            with mock.patch.object(app, "GROUP_MEMORY_FILE", memory):
+                reply = app._save_alias_markers(
+                    "他是田浩亢没错。\n【记住称呼】THk=田浩亢", "group:@@room")
+                self.assertNotIn("【记住称呼】", reply)
+                self.assertIn("已记住群里称呼：THk=田浩亢", reply)
+                self.assertEqual(app.resolve_member_name("@@room", "THk"), ("", "田浩亢"))
+                # 非群聊会话不解析标记
+                raw = "【记住称呼】X=Y"
+                self.assertEqual(app._save_alias_markers(raw, "wx-user"), raw)
 
     def test_stats_toggle_natural_language_and_persistence(self):
         parse = self._require_callable("_parse_stats_toggle_request")
@@ -775,7 +893,7 @@ class OpenClawTests(unittest.TestCase):
                 self.assertIn("已替你在群里艾特 张三", data.get("content", ""))
                 rec = save.call_args.args[0]
                 self.assertEqual(rec["roomId"], "@@room")
-                self.assertEqual(rec["reply"], "✅ 已替你在群里艾特 张三：你好")
+                self.assertEqual(rec["reply"], "✅ 已替你在群里艾特 张三")
                 # 群成员称呼被记入长期记忆
                 self.assertEqual(app.resolve_member_name("@@room", "Z"), ("stable-user", "Z"))
 

@@ -222,6 +222,10 @@ WECHAT_SYSTEM_PROMPT = (
     "替用户在群里艾特/发消息、收款登记、催收、防撤回等均由本地功能自动处理，"
     "你无法直接操作微信，遇到这类需求直接告诉用户对应用法"
     "（如“艾特张三说你好”“/收款 100 张三 买奶茶”），不要说做不到。"
+    "如果用户告诉你群里某成员的昵称/外号/英文名对应哪个真实姓名"
+    "（比如“THk 群里这个人叫田浩亢”“小明就是王小明”“记住小明的真名是王小明”），"
+    "在回复末尾单独附加一行【记住称呼】别名=真实姓名（一行一个对应关系），"
+    "除此之外不要输出这个标记，也不要把它写进正常回复内容。"
 )
 OPENCLAW_DIRECT_SYSTEM_PROMPT = (
     "你是通过微信回答用户问题的助手。请直接用简洁的纯文本回答用户的问题，"
@@ -1662,6 +1666,14 @@ def record_user(from_id, name):
 
 
 # ---------------- 群聊长期记忆（成员称呼 / 艾特纠错） ----------------
+# 微信提及用 U+2005 等不可见分隔符隔开（@名字 + 透明空格 + 正文），
+# \s 匹配不到部分零宽字符，先统一归一成普通空格再处理。
+_INVISIBLE_SPACE_RE = re.compile(
+    "[\u2000-\u200f\u2028\u2029\u202f\u205f\u2060\u2061\u2062\u2063"
+    "\u3000\u00a0\u1680\u180e\ufeff\u200b]"
+)
+
+
 def _group_memory_load():
     try:
         with open(GROUP_MEMORY_FILE, "r", encoding="utf-8") as f:
@@ -1706,6 +1718,13 @@ def remember_sender_in_room(room_id, room_name, from_id, sender_name):
         if sender_name not in member["names"]:
             member["names"].append(sender_name)
             changed = True
+        # 群里学过“sender_name 就是某人真名/别名”时，把对应称呼也挂到该成员上
+        for alias_key, canonical in (room.get("name_aliases") or {}).items():
+            if _normalize_name(alias_key) == _normalize_name(sender_name):
+                for extra in (alias_key, canonical):
+                    if extra and extra not in member["names"]:
+                        member["names"].append(extra)
+                        changed = True
         if changed:
             room["updated_at"] = now_str()
             _group_memory_save(data)
@@ -1731,7 +1750,48 @@ def remember_alias_for_member(room_id, member_id, alias):
 
 
 def _normalize_name(value):
-    return re.sub(r"\s+", "", str(value or "")).lower()
+    return re.sub(r"\s+", "", _INVISIBLE_SPACE_RE.sub("", str(value or ""))).lower()
+
+
+def room_name_aliases(room_id):
+    """返回该群的称呼映射表：{别名: 真实姓名}（如 THk -> 田浩亢）。"""
+    room_id = str(room_id or "").strip()
+    with GROUP_MEMORY_LOCK:
+        data = _group_memory_load()
+        room = data["rooms"].get(room_id) or {}
+        return dict(room.get("name_aliases") or {})
+
+
+def remember_name_alias(room_id, alias, canonical):
+    """记录群里“某个称呼 = 某人的真实姓名/规范称呼”（如 THk = 田浩亢）。
+
+    若该真实姓名已对应到已知群成员，直接把别名挂到该成员名下。
+    """
+    alias = str(alias or "").strip().lstrip("@").strip()
+    canonical = str(canonical or "").strip()
+    if not room_id or not alias or not canonical:
+        return False
+    if _normalize_name(alias) == _normalize_name(canonical):
+        return False
+    with GROUP_MEMORY_LOCK:
+        data = _group_memory_load()
+        room = data["rooms"].setdefault(
+            room_id, {"room_name": "", "members": {}, "updated_at": ""}
+        )
+        aliases = room.setdefault("name_aliases", {})
+        if aliases.get(_normalize_name(alias)) == canonical:
+            return False
+        aliases[_normalize_name(alias)] = canonical
+        changed = True
+        # 真实姓名已对应的成员，直接把别名挂到成员上
+        for mid, member in room.get("members", {}).items():
+            names = member.get("names") or []
+            if any(_normalize_name(n) == _normalize_name(canonical) for n in names):
+                if alias not in names:
+                    member.setdefault("names", []).append(alias)
+        room["updated_at"] = now_str()
+        _group_memory_save(data)
+    return True
 
 
 def room_member_aliases(room_id):
@@ -1749,21 +1809,31 @@ def room_member_aliases(room_id):
 
 
 def resolve_member_name(room_id, target):
-    """在群成员长期记忆里解析目标称呼：精确匹配 → 模糊纠错（昵称/错别字）。
+    """在群成员长期记忆里解析目标称呼：成员精确匹配 → 群里称呼映射 → 模糊纠错。
 
-    返回 (member_id, 群内规范称呼) 或 None。
+    返回 (member_id, 群内规范称呼) 或 None；member_id 为空表示只知道称呼
+    映射但尚未对应到具体成员（如只学过“THk=田浩亢”还没见到本人）。
     """
     target = str(target or "").strip().lstrip("@").strip()
     norm = _normalize_name(target)
     if not norm:
         return None
     aliases = room_member_aliases(room_id)
-    # 精确匹配（忽略空格/大小写）
+    # 1) 成员名精确匹配（忽略空格/大小写）
     for mid, names in aliases:
         for name in names:
             if _normalize_name(name) == norm:
                 return mid, name
-    # 模糊匹配：包含关系 / 编辑距离
+    # 2) 群里称呼映射：别名 -> 真实姓名，能反查到成员则返回成员
+    name_aliases = room_name_aliases(room_id)
+    canonical = name_aliases.get(norm)
+    if canonical:
+        for mid, names in aliases:
+            for name in names:
+                if _normalize_name(name) == _normalize_name(canonical):
+                    return mid, name
+        return "", canonical
+    # 3) 成员名模糊匹配：包含关系 / 编辑距离
     best = None
     best_score = 0.0
     for mid, names in aliases:
@@ -1780,6 +1850,88 @@ def resolve_member_name(room_id, target):
                 best = (mid, name)
     if best and best_score >= 0.6:
         return best
+    return None
+
+
+# ---------------- 群里称呼学习（别名 -> 真实姓名） ----------------
+_ALIAS_LEARN_SKIP = {
+    "他", "她", "它", "我", "你", "咱", "咱们", "大家", "本人", "老子", "俺",
+    "这个", "那个", "这人", "此人", "这位", "那位", "群里", "群", "机器人",
+    "bot", "openclaw", "kz", "z",
+}
+_ALIAS_LEARN_PATTERNS = (
+    # X 群里这个人叫 Y / X 在群里叫 Y / X 群里叫 Y
+    re.compile(
+        r"^(.{1,40}?)\s*[，,、]?\s*(?:群里|在群里|在我们这个群里|在这个群里)"
+        r"\s*(?:这个|那个|这|那)?\s*人?\s*(?:叫|是|就是)\s*(.{1,40}?)[。.！!？?]*$"
+    ),
+    # （记住/以后）X 就叫 Y / X 真名叫 Y / X 外号叫 Y / X 昵称叫 Y / X 名字是 Y / X 叫 Y
+    re.compile(
+        r"^(?:记住|以后|大家记住|麻烦记住|帮我记住|说下|说一下|记一下|对了)?\s*"
+        r"(.{1,40}?)\s*[，,、]?\s*(?:就叫|真名叫|外号叫|昵称叫|名字是|昵称是|叫)"
+        r"\s*(.{1,40}?)[。.！!？?]*$"
+    ),
+    # X 就是 Y（“小明就是王小明”）
+    re.compile(
+        r"^(?:记住|以后|大家记住|麻烦记住|帮我记住|其实)?\s*"
+        r"(.{1,30}?)\s*[，,、]?\s*就是\s*(.{1,20}?)[。.！!？?]*$"
+    ),
+    # 记住/其实 X 是 Y（普通“X 是 Y”不学，避免“雷军是小米的爸爸”误学）
+    re.compile(
+        r"^(?:记住|以后|大家记住|麻烦记住|帮我记住|其实)\s*"
+        r"(.{1,30}?)\s*[，,、]?\s*是\s*(.{1,20}?)[。.！!？?]*$"
+    ),
+    # X = Y（直接映射）
+    re.compile(r"^(.{1,30}?)\s*=\s*(.{1,20}?)[。.！!？?]*$"),
+)
+
+
+def _alias_valid_token(value):
+    value = str(value or "").strip().lstrip("@").strip()
+    if not value or len(value) > 30:
+        return None
+    norm = _normalize_name(value)
+    if not norm or norm in {_normalize_name(v) for v in _ALIAS_LEARN_SKIP}:
+        return None
+    if re.search(r"[吗呢啊吧什么怎么干嘛多少哪个]|[群游戏功能]", value):
+        return None
+    return value
+
+
+def _alias_valid_name(value):
+    value = str(value or "").strip()
+    if not value or len(value) > 20:
+        return None
+    if re.search(r"[，。！？、\s]", value):
+        return None
+    norm = _normalize_name(value)
+    if not norm or norm in {_normalize_name(v) for v in _ALIAS_LEARN_SKIP}:
+        return None
+    if re.search(r"[的得都把它让在是]", value):
+        return None
+    return value
+
+
+def learn_group_alias(room_id, text):
+    """从群里消息识别“某个称呼 = 某人真名”并写入群长期记忆。
+
+    例：“THk 群里这个人叫田浩亢” -> 别名 THk = 田浩亢。
+    返回确认文案（学到新称呼时）或 None（不是称呼消息 / 已学过）。
+    """
+    t = str(text or "").strip()
+    if not t or not str(room_id or "").strip():
+        return None
+    for pat in _ALIAS_LEARN_PATTERNS:
+        m = pat.match(t)
+        if not m:
+            continue
+        alias = _alias_valid_token(m.group(1))
+        canonical = _alias_valid_name(m.group(2))
+        if not alias or not canonical:
+            continue
+        if remember_name_alias(room_id, alias, canonical):
+            return "✅ 记住了，群里说“{}”就是 {}。".format(alias, canonical)
+        return None
     return None
 
 
@@ -3269,13 +3421,16 @@ def codex_start_new_session(user_id):
 def strip_bot_mentions(text, bot_name):
     """去掉消息里对机器人本体的 @提及（可能出现在开头/中间/结尾），只保留正文。
 
-    @提及是微信群的触发前缀，原样发给 AI 会污染提问（如把 @kindle 当查询内容）。
+    微信 @提及 用 U+2005 等不可见分隔符隔开（如 "@kindle\u2005THk..."），
+    先把这些不可见分隔符归一成普通空格再剥 @机器人本体，避免把 kindle
+    误当成艾特目标。
     """
     text = str(text or "")
     if not text.strip():
         return text
+    text = _INVISIBLE_SPACE_RE.sub(" ", text)
     if bot_name:
-        text = re.sub(r"@\s*" + re.escape(str(bot_name)) + r"\s*", " ", text)
+        text = re.sub(r"@\s*" + re.escape(str(bot_name)) + r"\s*", " ", text, flags=re.I)
     # 结尾的 @xxx 通常也是群里的 @提及（如 "...命中了@kindle"），一并去掉
     text = re.sub(r"@\s*[\u4e00-\u9fa5\w\-]+\s*$", " ", text)
     return re.sub(r"\s+", " ", text).strip()
@@ -3323,6 +3478,40 @@ def _parse_agent_switch_request(text):
     return None
 
 
+_ALIAS_MARKER_RE = re.compile(r"^【记住称呼】\s*([^=\s【】]+?)\s*=\s*(.+?)\s*$")
+
+
+def _save_alias_markers(reply, session_id):
+    """解析 AI 回复里的【记住称呼】别名=真名 标记，写入群长期记忆并移除标记。
+
+    仅对群聊会话生效：模型从上下文推断出“哪个用户是哪个称呼”时，
+    通过这个标记让本地把称呼固化到群长期记忆。
+    """
+    reply = str(reply or "")
+    if not is_group_session_key(session_id):
+        return reply
+    room_id = str(session_id or "")[len(GROUP_SESSION_PREFIX):]
+    if not room_id:
+        return reply
+    learned = []
+    kept = []
+    for line in reply.splitlines():
+        m = _ALIAS_MARKER_RE.match(line.strip())
+        if m:
+            alias = m.group(1).strip()
+            canonical = m.group(2).strip()
+            if alias and canonical and remember_name_alias(room_id, alias, canonical):
+                if alias not in [x[0] for x in learned]:
+                    learned.append((alias, canonical))
+            continue
+        kept.append(line)
+    text = "\n".join(kept).strip()
+    if learned:
+        note = "；".join("{}={}".format(a, c) for a, c in learned)
+        text = (text + "\n" if text else "") + "✅ 已记住群里称呼：{}".format(note)
+    return text
+
+
 def ai_answer(prompt, session_id=""):
     """微信 AI 问答入口：按用户当前智能体分发。
 
@@ -3333,7 +3522,7 @@ def ai_answer(prompt, session_id=""):
     （清理后为空），用直答提示在同一会话内重试一次，避免微信侧收到空回复。
     """
     if active_agent(session_id) == AGENT_CODEX:
-        return codex_answer(prompt, session_id)
+        return _save_alias_markers(codex_answer(prompt, session_id), session_id)
     claw = openclaw_config()
     enabled = claw.get("enabled", False)
     if enabled and claw.get("base_url") and claw.get("api_key"):
@@ -3356,6 +3545,7 @@ def ai_answer(prompt, session_id=""):
             reply = clean_wechat_reply(raw_reply)
         if not reply:
             raise ValueError("OpenClaw 返回内容为空")
+        reply = _save_alias_markers(reply, session_id)
         if not key:
             return reply
         if not stats_visible(session_id):
@@ -4109,7 +4299,7 @@ def _parse_stats_toggle_request(text):
     return None
 
 
-_MENTION_VERBS = r"(?:说|告诉|通知|转告|发消息|发个消息)"
+_MENTION_VERBS = r"(?:说|告诉|通知|转告|发消息|发个消息|提醒一下|提醒下|提醒|喊|叫)"
 _MENTION_META_QUESTION = re.compile(r"(?:怎么用|如何使用|是什么|啥是|介绍一下|功能|原理)")
 
 
@@ -4119,50 +4309,98 @@ def _mention_pair(match):
     return target, content
 
 
-def _parse_mention_request(text, room_id):
+def _mention_result(m, bot_name):
+    """校验一条艾特规则匹配：目标是自己/机器人/纯代词时不算艾特指令。
+
+    内容里指代目标本人的“提醒他/告诉他”前缀会简化成直接内容。
+    """
+    target = (m.group(1) or "").lstrip("@").strip()
+    content = (m.group(2) or "").strip()
+    # “提醒他带电脑” -> “带电脑”（“他”指目标本人，不是要复述的话）；
+    # 单独的“他是我朋友”这类陈述保留原样
+    content = re.sub(
+        r"^(?:提醒一下|提醒下|提醒|告诉|跟|通知)(?:他|她|他们|她们)"
+        r"(?:一下|下)?[，,、:：]?\s*",
+        "", content)
+    tgt = _normalize_name(target)
+    if not tgt:
+        return None
+    if tgt.startswith(("我", "你", "他", "她", "它", "咱", "俺", "老子")):
+        return None
+    if tgt in ("大家", "各位", "所有人"):
+        return None
+    if bot_name and tgt == _normalize_name(bot_name):
+        return None
+    return target, content
+
+
+def _parse_mention_request(text, room_id, bot_name=""):
     """识别群内艾特指令（仅限群聊），返回 (目标称呼, 消息内容)（内容可为空）。
 
     群里指挥机器人艾特某人，不再追问是哪个群，一律在当前群发送。支持：
-    1. 艾特/at/@ + 名字 + 说/告诉/发消息 + 内容
-    2. 以 @名字 开头 + 内容（群里指挥转达）
-    3. 帮我在群里艾特 名字 [内容]
-    4. 裸指令：艾特/at 名字 [内容]（问“艾特功能怎么用”这类元问题不算）
+    1. 艾特/at/@ + 名字 + 说/告诉/提醒/发消息 + 内容
+    2. 提醒/提醒一下 + 名字 + 内容（“提醒谁”视为艾特意图）
+    3. 以 @名字 开头 + 内容（群里指挥转达）
+    4. 帮我在群里艾特 名字 [内容]
+    5. 裸指令：艾特/at 名字 [内容]（问“艾特功能怎么用”这类元问题不算）
+
+    @机器人本体的前缀不算艾特指令：目标是机器人自己（如 kindle）时返回
+    None，避免把“@kindle THk 群里这个人叫田浩亢”误当成“艾特 kindle”。
     """
+    bot_name = str(bot_name or "").strip()
     t = str(text or "").strip()
     if not t or not str(room_id or "").strip():
         return None
-    if not re.search(r"艾特|@|(?<![a-zA-Z])at(?![a-zA-Z])", t, re.I):
+    if not re.search(r"艾特|@|(?<![a-zA-Z])at(?![a-zA-Z])|提醒", t, re.I):
         return None
+    # 0) 防御：开头若有 @机器人本体（可能没被 strip 干净），先剥掉
+    if bot_name:
+        m = re.match(
+            r"^@\s*" + re.escape(bot_name) + r"(?=[\s:：]|$)", t, re.I)
+        if m:
+            t = t[m.end():].lstrip(" :：\t").strip()
+            if not t:
+                return None
     # 1) 明确指令：艾特/at/@ + 名字 + 动词 + 内容（动词必须出现，不会误伤聊天）
     m = re.match(
-        r"^(?:帮我在群里|在群里帮我|帮我|请帮我|在群里)?(?:艾特|@|at)\s*"
-        r"(@?[\u4e00-\u9fa5\w\-]{1,30}?)\s*"
-        + _MENTION_VERBS + r"\s*[:：]?\s*(.*)$",
+        r"^(?:帮我在群里|在群里帮我|帮我|请帮我|在群里|帮我一下|请|麻烦|把我)?"
+        r"(?:艾特|@|at)\s*(?:一下|下)?\s*(?:群里|群里的)?\s*"
+        r"@?([\u4e00-\u9fa5\w\-]{1,30}?)\s*"
+        + _MENTION_VERBS + r"\s*(?:他|她|他们|她们)?\s*[:：]?\s*(.*)$",
         t, re.I | re.S)
     if m:
-        return _mention_pair(m)
-    # 2) 以 @名字 开头（群里指挥转达），内容可选
+        return _mention_result(m, bot_name)
+    # 2) 提醒/提醒一下 + 名字 + 内容（目标为“我/你/他”则交还提醒/AI 处理）
     m = re.match(
-        r"^@\s*(@?[\u4e00-\u9fa5\w\-]{1,30}?)(?:(?:\s*[:：]\s*|\s+)(.*))?$",
+        r"^(?:帮我|请帮我|麻烦|帮我一下)?(?:提醒一下|提醒下|提醒)\s*"
+        r"@?([\u4e00-\u9fa5\w\-]{1,30}?)(?:(?:\s*[:：]\s*|\s+)(.*)|)$",
         t, re.I | re.S)
     if m:
-        return _mention_pair(m)
+        return _mention_result(m, bot_name)
+    # 3) 以 @名字 开头（群里指挥转达），内容可选
+    m = re.match(
+        r"^@\s*@?([\u4e00-\u9fa5\w\-]{1,30}?)(?:(?:\s*[:：]\s*|\s+)(.*))?$",
+        t, re.I | re.S)
+    if m:
+        return _mention_result(m, bot_name)
     # 问“艾特功能怎么用”这类元问题不算指令
     if _MENTION_META_QUESTION.search(t):
         return None
-    # 3) 帮我在群里艾特 名字 [内容]
+    # 4) 帮我在群里艾特 名字 [内容]
     m = re.match(
-        r"^(?:帮我在群里|在群里帮我|帮我|请帮我|在群里)(?:艾特|@|at)\s*"
-        r"(@?[\u4e00-\u9fa5\w\-]{1,30}?)(?:(?:\s*[:：]\s*|\s+)(.*))?$",
+        r"^(?:帮我在群里|在群里帮我|帮我|请帮我|在群里|帮我一下|请|麻烦|把我)"
+        r"(?:艾特|@|at)\s*(?:一下|下)?\s*(?:群里|群里的)?\s*"
+        r"@?([\u4e00-\u9fa5\w\-]{1,30}?)(?:(?:\s*[:：]\s*|\s+)(.*))?$",
         t, re.I | re.S)
     if m:
-        return _mention_pair(m)
-    # 4) 裸指令：艾特/at 名字 [内容]
+        return _mention_result(m, bot_name)
+    # 5) 裸指令：艾特/at 名字 [内容]
     m = re.match(
-        r"^(?:艾特|at)\s*(@?[\u4e00-\u9fa5\w\-]{1,30}?)(?:(?:\s*[:：]\s*|\s+)(.*))?$",
+        r"^(?:艾特|at)\s*(?:一下|下)?\s*(?:群里|群里的)?\s*"
+        r"@?([\u4e00-\u9fa5\w\-]{1,30}?)(?:(?:\s*[:：]\s*|\s+)(.*))?$",
         t, re.I | re.S)
     if m:
-        return _mention_pair(m)
+        return _mention_result(m, bot_name)
     return None
 
 
@@ -4183,8 +4421,6 @@ def do_mention(target, content, from_id, from_name, room_id, room_name):
         return AI_NO_PERMISSION_MSG
     if target == from_name or target == from_id:
         return "⚠️ 不能艾特自己，换一个群成员试试。"
-    if not content:
-        return "⚠️ 请带上要发送的内容，例如：艾特张三说你好"
     # 智能纠错：优先用群长期记忆里的规范称呼（昵称/外号/错别字自动纠正）
     resolved = resolve_member_name(room_id, target)
     if resolved:
@@ -4192,12 +4428,13 @@ def do_mention(target, content, from_id, from_name, room_id, room_name):
         if canonical != target:
             remember_alias_for_member(room_id, member_id, target)
         target = canonical
-    text = "@{} {}".format(target, content)
+    text = "@{} {}".format(target, content) if content else "@{}".format(target)
     ok, resp = bot_send(room_name or room_id, text, is_room=True)
     if not ok:
         log_error("艾特发送失败: {}".format(str(resp)[:200]))
         return "❌ 发送失败：{}".format(str(resp)[:100]) if resp else "❌ 发送失败，请稍后重试"
-    return "✅ 已替你在群里艾特 {}：{}".format(target, content)
+    # 确认回复不重复用户原话（内容是从语境推断的，原样回显反而啰嗦）
+    return "✅ 已替你在群里艾特 {}".format(target)
 
 
 def handle_recall_notice(content, from_id, sender_name, room_id):
@@ -6104,40 +6341,45 @@ class Handler(BaseHTTPRequestHandler):
                         in_room and text_in.startswith("/") and len(text_in.strip()) > 1):
                     # 去掉对机器人本体的 @提及（开头/中间/结尾都可能出现），避免原样发给 AI
                     text_clean = strip_bot_mentions(text_in, bot_name)
-                    mention_req = _parse_mention_request(text_clean, room_id) if in_room else None
-                    if mention_req is not None:
-                        target, content = mention_req
-                        if not is_allowed(from_id):
-                            reply = AI_NO_PERMISSION_MSG
-                        else:
-                            reply = do_mention(target, content, from_id, sender_name, room_id, room_name)
+                    # 群里称呼学习优先：“THk 群里这个人叫田浩亢”是告知称呼，不是艾特指令
+                    alias_reply = learn_group_alias(room_id, text_clean) if in_room else None
+                    if alias_reply is not None:
+                        reply = alias_reply
                     else:
-                        cmd_text = re.sub(r"^@\s*[\u4e00-\u9fa5\w\-]+", "", text_clean).strip()
-                        cmd_word = cmd_text.split(None, 1)[0].lower() if cmd_text else ""
-                        # 权限规则：AI 类命令需要授权；普通功能（计算/记账/提醒等）人人可用
-                        if ((cmd_text.startswith("/") and cmd_word in AI_CMDS)
-                                or cmd_text.strip().lower() in SESSION_COMMANDS) and not is_allowed(from_id):
-                            reply = AI_NO_PERMISSION_MSG
-                        elif cmd_text.startswith("/") or cmd_text.strip().lower() in SESSION_COMMANDS:
-                            reply = handle_command(cmd_text, from_id, sender_name, room_id, room_name, cfg,
-                                                   session_id)
-                            if reply is None:
-                                reply = FALLBACK_HELP
+                        mention_req = _parse_mention_request(text_clean, room_id, bot_name) if in_room else None
+                        if mention_req is not None:
+                            target, content = mention_req
+                            if not is_allowed(from_id):
+                                reply = AI_NO_PERMISSION_MSG
+                            else:
+                                reply = do_mention(target, content, from_id, sender_name, room_id, room_name)
                         else:
-                            expr = normalize_expr(text_in)
-                            if is_math_expr(expr):
-                                try:
-                                    result = evaluate_math(expr)
-                                    reply = f"{expr} = {fmt_number(result)}"
-                                except ZeroDivisionError:
-                                    reply = "除数不能为 0"
-                                except ValueError:
-                                    reply = None
-                            if reply is None:
-                                reply = smart_fallback(cmd_text, from_id, sender_name, room_id, room_name, cfg,
+                            cmd_text = re.sub(r"^@\s*[\u4e00-\u9fa5\w\-]+", "", text_clean).strip()
+                            cmd_word = cmd_text.split(None, 1)[0].lower() if cmd_text else ""
+                            # 权限规则：AI 类命令需要授权；普通功能（计算/记账/提醒等）人人可用
+                            if ((cmd_text.startswith("/") and cmd_word in AI_CMDS)
+                                    or cmd_text.strip().lower() in SESSION_COMMANDS) and not is_allowed(from_id):
+                                reply = AI_NO_PERMISSION_MSG
+                            elif cmd_text.startswith("/") or cmd_text.strip().lower() in SESSION_COMMANDS:
+                                reply = handle_command(cmd_text, from_id, sender_name, room_id, room_name, cfg,
                                                        session_id)
-                            if reply is None:
-                                reply = FALLBACK_HELP
+                                if reply is None:
+                                    reply = FALLBACK_HELP
+                            else:
+                                expr = normalize_expr(text_in)
+                                if is_math_expr(expr):
+                                    try:
+                                        result = evaluate_math(expr)
+                                        reply = f"{expr} = {fmt_number(result)}"
+                                    except ZeroDivisionError:
+                                        reply = "除数不能为 0"
+                                    except ValueError:
+                                        reply = None
+                                if reply is None:
+                                    reply = smart_fallback(cmd_text, from_id, sender_name, room_id, room_name, cfg,
+                                                           session_id)
+                                if reply is None:
+                                    reply = FALLBACK_HELP
 
         rec = {
             "type": mtype,
