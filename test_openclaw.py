@@ -504,7 +504,152 @@ class OpenClawTests(unittest.TestCase):
             "room-1",
             "群",
             rounds=1,
+            session_id="group:room-1",
         )
+
+    def test_ai_session_key_isolates_private_and_group_scenarios(self):
+        key = self._require_callable("ai_session_key")
+        self.assertEqual(key("wx-user", ""), "wx-user")
+        self.assertEqual(key("wx-user", "room-1"), "group:room-1")
+        # 同一群里所有成员共享同一个会话键；不同群、私聊互不相同
+        self.assertEqual(key("wx-user", "room-1"), key("wx-user2", "room-1"))
+        self.assertNotEqual(key("wx-user", "room-1"), key("wx-user", "room-2"))
+        self.assertNotEqual(key("wx-user", "room-1"), key("wx-user", ""))
+
+    def test_smart_fallback_uses_shared_group_session_in_room(self):
+        with mock.patch.object(app, "is_allowed", return_value=True), \
+             mock.patch.object(app, "openclaw_route", side_effect=AssertionError("不应路由")), \
+             mock.patch.object(app, "ai_answer", return_value="群回答") as answer:
+            reply = app.smart_fallback("明天活动", "wx-user", "用户", "room-1", "群", {"smart": True})
+        self.assertEqual(reply, "群回答")
+        answer.assert_called_once_with("明天活动", session_id="group:room-1")
+
+    def test_handle_command_compact_uses_shared_group_session(self):
+        with mock.patch.object(app, "openclaw_compact_session",
+                               return_value="已压缩。", create=True) as compact:
+            reply = app.handle_command("/compact", "wx-user", "用户", "room-1", "群",
+                                       app.load_config())
+        self.assertEqual(reply, "已压缩。")
+        compact.assert_called_once_with("group:room-1")
+
+    def test_dispatch_route_chat_answer_uses_group_session_key(self):
+        with mock.patch.object(app, "is_allowed", return_value=True), \
+             mock.patch.object(app, "ai_answer", return_value="回答") as answer:
+            reply = app.dispatch_route(
+                "chat_answer", {"question": "问题"}, "问题", "wx-user", "用户", "room-1", "群"
+            )
+        self.assertEqual(reply, "回答")
+        answer.assert_called_once_with("问题", session_id="group:room-1")
+
+    def test_agent_switch_preference_is_isolated_per_scenario(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prefs = os.path.join(tmp, "agent_prefs.json")
+            with mock.patch.object(app, "AGENT_PREFS_FILE", prefs), \
+                 mock.patch.object(app, "load_config", return_value={"default_agent": "openclaw"}):
+                app.handle_agent_switch("codex", "wx-user")
+                app.handle_agent_switch("codex", "group:room-1")
+                app.handle_agent_switch("默认", "group:room-1")
+                self.assertEqual(app.active_agent("wx-user"), "codex")
+                self.assertEqual(app.active_agent("group:room-1"), "openclaw")
+
+    def test_openclaw_session_api_lists_group_sessions(self):
+        with tempfile.TemporaryDirectory() as tmp, contextlib.ExitStack() as stack, \
+             mock.patch.object(app, "valid_session", return_value=True):
+            fixture = self._session_fixture(tmp)
+            room_id = "@@room_" + ("C" * 40)
+            group_key = "agent:wxbot:openai-user:group:" + room_id + ":session:grp"
+            group_sid = "transcript-group"
+            with open(fixture["index"], "r", encoding="utf-8") as f:
+                index_data = json.load(f)
+            index_data[group_key] = {"sessionId": group_sid, "updatedAt": 1723036803000}
+            with open(fixture["index"], "w", encoding="utf-8") as f:
+                json.dump(index_data, f, ensure_ascii=False)
+            transcript = os.path.join(fixture["transcript_dir"], group_sid + ".jsonl")
+            self._write_jsonl(transcript, [
+                {"type": "message", "timestamp": "2026-08-07T10:00:00Z",
+                 "message": {"role": "user", "content": [{"type": "text", "text": "群问题"}]}},
+            ])
+            app._recent.append({"roomId": room_id, "room": "测试群",
+                                "from": "用户", "fromId": "wx-user"})
+            try:
+                self._patch_openclaw_paths(
+                    stack,
+                    registry=os.path.join(tmp, "openclaw_sessions.json"),
+                    index=fixture["index"],
+                    transcript_dir=fixture["transcript_dir"],
+                )
+                status, payload = self._public_api_request("GET", "/api/openclaw/sessions")
+            finally:
+                app._recent.clear()
+
+        self.assertEqual(status, 200)
+        group_items = [s for s in payload["sessions"] if s.get("is_group")]
+        self.assertEqual(len(group_items), 1)
+        self.assertEqual(group_items[0]["user_name"], "测试群")
+        self.assertNotIn(room_id, json.dumps(payload, ensure_ascii=False))
+
+    def test_parse_mention_request_detects_group_mention_intent(self):
+        parse = self._require_callable("_parse_mention_request")
+        self.assertEqual(parse("艾特张三说你好", "room-1"), ("张三", "你好"))
+        self.assertEqual(parse("帮我在群里艾特张三说你好", "room-1"), ("张三", "你好"))
+        self.assertEqual(parse("@张三 说 明天开会", "room-1"), ("张三", "明天开会"))
+        self.assertEqual(parse("at王五发消息：晚上聚餐", "room-1"), ("王五", "晚上聚餐"))
+        self.assertIsNone(parse("你好", "room-1"))
+        self.assertIsNone(parse("艾特张三说你好", ""))  # 私聊不识别
+        self.assertIsNone(parse("今天@张三 一起吃饭吗", "room-1"))  # 只是提及，不是指令
+
+    def test_do_mention_sends_group_message_and_rejects_private(self):
+        with mock.patch.object(app, "is_allowed", return_value=True), \
+             mock.patch.object(app, "bot_send",
+                               return_value=(True, '{"success":true}')) as send:
+            reply = app.do_mention("张三", "你好", "wx-user", "用户", "room-1", "测试群")
+            private_reply = app.do_mention("张三", "你好", "wx-user", "用户", "", "")
+        self.assertIn("已替你在群里艾特 张三", reply)
+        self.assertIn("只能在群里使用", private_reply)
+        send.assert_called_once_with("测试群", "@张三 你好", is_room=True)
+
+    def test_do_mention_requires_permission(self):
+        with mock.patch.object(app, "is_allowed", return_value=False), \
+             mock.patch.object(app, "bot_send", side_effect=AssertionError("不应发送")):
+            reply = app.do_mention("张三", "你好", "wx-user", "用户", "room-1", "测试群")
+        self.assertEqual(reply, app.AI_NO_PERMISSION_MSG)
+
+    def test_receive_pipeline_sends_group_mention(self):
+        source = {
+            "room": {"id": "@@room", "payload": {"topic": "测试群"}},
+            "from": {"payload": {"id": "@user", "name": "Z"}},
+            "to": {"payload": {"name": "kindle"}},
+        }
+        fields = {
+            "type": (None, b"text"),
+            "content": (None, "艾特张三说你好".encode("utf-8")),
+            "source": (None, json.dumps(source, ensure_ascii=False).encode("utf-8")),
+            "isMentioned": (None, b"1"),
+            "isMsgFromSelf": (None, b"0"),
+            "isSystemEvent": (None, b"0"),
+        }
+
+        class _Receiver:
+            def _json(self, value):
+                self.result = value
+
+        receiver = _Receiver()
+        with mock.patch.object(app, "identity_user_id", return_value="stable-user", create=True), \
+             mock.patch.object(app, "record_user"), \
+             mock.patch.object(app, "load_config", return_value={"auto_reply": True, "smart": True}), \
+             mock.patch.object(app, "handle_pending_reply", return_value=None), \
+             mock.patch.object(app, "handle_wizard", return_value=None), \
+             mock.patch.object(app, "is_allowed", return_value=True), \
+             mock.patch.object(app, "bot_send", return_value=(True, '{"success":true}')) as send, \
+             mock.patch.object(app, "save_record") as save:
+            app.Handler._on_receive(receiver, fields)
+
+        send.assert_called_once_with("测试群", "@张三 你好", is_room=True)
+        data = receiver.result.get("data") or {}
+        self.assertIn("已替你在群里艾特 张三", data.get("content", ""))
+        rec = save.call_args.args[0]
+        self.assertEqual(rec["roomId"], "@@room")
+        self.assertEqual(rec["reply"], "✅ 已替你在群里艾特 张三：你好")
 
     def test_same_session_requests_are_serialized(self):
         _ConcurrentOpenClawHandler.active = 0

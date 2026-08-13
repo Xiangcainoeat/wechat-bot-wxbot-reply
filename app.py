@@ -219,7 +219,8 @@ OPENCLAW_COMPACT_SYSTEM_PROMPT = (
     "按要点列出，控制在 600 字以内，不要编造对话里没有的信息，"
     "不要输出 Markdown、加粗符号、井号标题或 emoji，不要提及压缩过程。"
 )
-AI_CMDS = ("/ai", "/搜索", "/search", "/上网", "/智能体", "/agent", "/切换智能体")  # 需要授权的 AI 类命令
+AI_CMDS = ("/ai", "/搜索", "/search", "/上网", "/智能体", "/agent", "/切换智能体",
+           "/艾特", "/at", "/mention")  # 需要授权的 AI 类命令
 SESSION_COMMANDS = {
     "/compact", "/压缩上下文", "压缩上下文",
     "/new", "/新会话", "新会话", "开启新的会话", "开启新会话",
@@ -256,6 +257,7 @@ FALLBACK_HELP = (
     "5. AI 路由：OpenClaw 识别提醒和推送并执行\n"
     "   例：“明天早上8点提醒我开会”“每天八点推送北京市朝阳区天气”\n"
     "6. AI 问答：直接问我任何问题（可 /智能体 codex 切换回答后端）\n"
+    "7. 群内艾特：/艾特 群昵称 消息（只在群里发送，不能私聊外发）\n"
     "\n"
     "详细用法：/说明"
 )
@@ -283,6 +285,8 @@ DETAIL_HELP = (
     "7. AI 问答：直接问我任何问题（闲聊、问答、查资料都可以）\n"
     "8. 智能体切换：/智能体 codex 或 /智能体 openclaw 切换回答后端；/智能体 查看当前；\n"
     "   /智能体 默认 恢复全局默认；也可直接说“切换到codex”\n"
+    "9. 群内艾特：/艾特 群昵称 消息内容，或说“艾特张三说你好”\n"
+    "   只会在当前群里以 @昵称 形式发送，绝不私聊外发；私聊里使用会被拒绝\n"
     "\n"
     "记账例外：账本必须用 /记账 + / - 精确格式，AI 不会代记"
 )
@@ -416,10 +420,42 @@ def read_messages(limit=10000):
     return list(dq)
 
 
+def room_display_name(room_id):
+    """按房间 ID 从最近消息记录中找回群名（后台群聊会话展示用）。"""
+    room_id = str(room_id or "").strip()
+    if not room_id:
+        return ""
+    for rec in reversed(_recent):
+        if str(rec.get("roomId") or "") == room_id and rec.get("room"):
+            return str(rec.get("room"))
+    for rec in reversed(read_messages(5000)):
+        if str(rec.get("roomId") or "") == room_id and rec.get("room"):
+            return str(rec.get("room"))
+    return ""
+
+
 # ---------------- OpenClaw 会话与上下文 ----------------
 _OPENCLAW_INDEX_PREFIX = "agent:wxbot:openai-user:"
 _OPENCLAW_MAX_TRANSCRIPT_BYTES = 4 * 1024 * 1024
 _OPENCLAW_MAX_TRANSCRIPT_RECORDS = 5000
+# 群聊共享会话键前缀：同一群里所有成员共享同一 AI 上下文。
+GROUP_SESSION_PREFIX = "group:"
+
+
+def ai_session_key(from_id, room_id):
+    """会话场景键：私聊=用户ID（保持原有连续会话），群聊=群共享会话 group:房间ID。
+
+    同一个微信用户在群聊和私聊使用不同会话；群聊内所有成员共享同一上下文。
+    """
+    room_id = str(room_id or "").strip()
+    if room_id:
+        return GROUP_SESSION_PREFIX + room_id
+    return str(from_id or "").strip()
+
+
+def is_group_session_key(session_key):
+    """判断会话场景键是否属于群聊共享会话。"""
+    return str(session_key or "").startswith(GROUP_SESSION_PREFIX)
 
 
 def _short_ref(value, prefix="ref"):
@@ -766,6 +802,9 @@ def _openclaw_user_from_key(key):
     if user_key.startswith("route:") or user_key.startswith("compose:"):
         return None
     user_id = user_key.split(":session:", 1)[0]
+    if user_id.startswith(GROUP_SESSION_PREFIX):
+        # 群聊共享会话：返回 group:<房间ID> 作为场景键，后台按群展示。
+        return user_id
     return identity_existing_user_id(user_id) or user_id
 
 
@@ -884,6 +923,8 @@ def openclaw_parse_sessions_index(index_path=None, transcript_dir=None):
         user_id = _openclaw_user_from_key(key)
         if not user_id or not isinstance(entry, dict):
             continue
+        is_group = user_id.startswith(GROUP_SESSION_PREFIX)
+        room_id = user_id[len(GROUP_SESSION_PREFIX):] if is_group else ""
         session_id = str(entry.get("sessionId") or "").strip()
         if not session_id:
             continue
@@ -902,7 +943,7 @@ def openclaw_parse_sessions_index(index_path=None, transcript_dir=None):
             entry, "contextWindow", "contextTokens", "contextWindowTokens"
         ) or 128000)
         sessions.append({
-            "user_ref": _short_ref(user_id, "u"),
+            "user_ref": _short_ref(room_id, "r") if is_group else _short_ref(user_id, "u"),
             "session_ref": _short_ref(key, "s"),
             "session_id": session_id,
             "updated_at": _openclaw_time(entry.get("updatedAt")),
@@ -913,6 +954,9 @@ def openclaw_parse_sessions_index(index_path=None, transcript_dir=None):
             "message_count": len(messages),
             "compaction_count": len(compactions),
             "_user_id": user_id,
+            "_is_group": is_group,
+            "room_id": room_id,
+            "room_name": room_display_name(room_id) if is_group else "",
             "_session_key": key,
             "_transcript": transcript,
         })
@@ -2928,19 +2972,23 @@ def strip_bot_mentions(text, bot_name):
     return re.sub(r"\s+", " ", text).strip()
 
 
-def handle_agent_switch(arg, from_id):
-    """切换智能体：无参数显示当前/可选；参数设置并持久化到该用户。"""
+def handle_agent_switch(arg, session_id):
+    """切换智能体：无参数显示当前/可选；参数设置并持久化到该会话场景。
+
+    session_id 为会话场景键（私聊=用户ID，群聊=group:房间ID）：群里切换只影响
+    该群共享上下文，不影响同用户私聊的选择。
+    """
     arg = str(arg or "").strip().lower()
-    current = active_agent(from_id)
+    current = active_agent(session_id)
     if not arg or arg in ("?", "列表", "查看", "当前", "状态", "help"):
         names = "、".join("{}（{}）".format(k, v) for k, v in AGENT_DISPLAY.items())
         return "当前智能体：{}。\n切换命令：/智能体 codex、/智能体 openclaw；恢复默认：/智能体 默认\n也可以直接说“切换到codex”。可选：{}".format(
             AGENT_DISPLAY.get(current, current), names)
     if arg in ("默认", "default", "reset"):
-        set_user_agent(from_id, "")
-        return "已恢复默认智能体：{}。".format(AGENT_DISPLAY.get(active_agent(from_id), active_agent(from_id)))
+        set_user_agent(session_id, "")
+        return "已恢复默认智能体：{}。".format(AGENT_DISPLAY.get(active_agent(session_id), active_agent(session_id)))
     if arg in AGENT_DISPLAY:
-        set_user_agent(from_id, arg)
+        set_user_agent(session_id, arg)
         return "已切换到 {} 智能体，后续对话默认由 {} 回答。".format(AGENT_DISPLAY[arg], AGENT_DISPLAY[arg])
     return "未知智能体：{}。可选：{}。".format(arg, "、".join(AGENT_DISPLAY.values()))
 
@@ -3658,20 +3706,27 @@ def _do_push_route(args, text, from_id, from_name, room_id, room_name, rounds):
     return cmd_push(hm, from_id, from_name, room_id, room_name)
 
 
-def dispatch_route(tool, args, text, from_id, from_name, room_id, room_name, rounds=1):
-    """执行路由到的功能；参数缺失时记 pending 并追问（最多 3 轮）。"""
+def dispatch_route(tool, args, text, from_id, from_name, room_id, room_name, rounds=1,
+                   session_id=None):
+    """执行路由到的功能；参数缺失时记 pending 并追问（最多 3 轮）。
+
+    chat_answer 使用会话场景键 session_id（群聊=group:房间ID，共享上下文）；
+    提醒/推送等本地功能仍按用户 from_id 处理。
+    """
     try:
         if tool == "set_reminder":
             return _do_reminder_route(args, text, from_id, from_name, room_id, room_name, rounds)
         if tool == "set_daily_push":
             return _do_push_route(args, text, from_id, from_name, room_id, room_name, rounds)
         if tool == "chat_answer":
+            if session_id is None:
+                session_id = ai_session_key(from_id, room_id)
             route_pending_clear(from_id)
             if not is_allowed(from_id):
                 return AI_NO_PERMISSION_MSG
             q = (args.get("question") or text or "").strip()
             try:
-                return ai_answer(q, session_id=from_id)
+                return ai_answer(q, session_id=session_id)
             except Exception as e:
                 log_error(f"OpenClaw 问答失败: {e}")
                 return AI_FAILURE_MSG
@@ -3714,49 +3769,108 @@ def _looks_like_new_session_request(text):
     return t in ("新对话", "新会话", "开新对话", "开新会话", "新开对话", "新开会话", "重新对话")
 
 
-def smart_fallback(text, from_id, from_name, room_id, room_name, cfg):
-    """普通消息由 OpenClaw 回答；提醒和推送由 OpenClaw 判断后交给本地执行。"""
+_MENTION_VERBS = r"(?:说|告诉|通知|转告|发消息|发个消息)"
+
+
+def _parse_mention_request(text, room_id):
+    """识别「艾特/at/@某人 + 说/发消息 内容」的明确指令（仅限群聊）。
+
+    返回 (群昵称, 消息内容)；不是明确艾特指令时返回 None。为避免误判，
+    自然语言模式要求必须带“说/告诉/通知/转告/发消息”等动词。
+    """
+    t = str(text or "").strip()
+    if not t or not str(room_id or "").strip():
+        return None
+    if not re.search(r"艾特|@|(?<![a-zA-Z])at(?![a-zA-Z])", t, re.I):
+        return None
+    m = re.match(
+        r"^(?:帮我在群里|在群里帮我|帮我|在群里)?(?:艾特|@|at)\s*"
+        r"(@?[\u4e00-\u9fa5\w\-]{1,30}?)\s*"
+        + _MENTION_VERBS + r"\s*[:：]?\s*(.+)$",
+        t, re.I | re.S)
+    if not m:
+        return None
+    target = m.group(1).lstrip("@").strip()
+    content = m.group(2).strip()
+    if not target or not content:
+        return None
+    return target, content
+
+
+def do_mention(target, content, from_id, from_name, room_id, room_name):
+    """艾特功能：机器人在当前群里以「@成员 消息」的形式替用户向群内成员发消息。
+
+    只允许在群聊中向群内成员发送，任何情况下都不会给他人发私聊消息；
+    私聊里使用会直接拒绝。
+    """
+    target = str(target or "").strip().lstrip("@").strip()
+    content = str(content or "").strip()
+    room_id = str(room_id or "").strip()
+    if not room_id:
+        return "⚠️ 艾特功能只能在群里使用，不能给别人发私聊消息。"
+    if not target or not content:
+        return "⚠️ 用法：/艾特 群昵称 消息内容（只在当前群里发送）"
+    if not is_allowed(from_id):
+        return AI_NO_PERMISSION_MSG
+    if target == from_name or target == from_id:
+        return "⚠️ 不能艾特自己，换一个群成员试试。"
+    text = "@{} {}".format(target, content)
+    ok, resp = bot_send(room_name or room_id, text, is_room=True)
+    if not ok:
+        log_error("艾特发送失败: {}".format(str(resp)[:200]))
+        return "❌ 发送失败：{}".format(str(resp)[:100]) if resp else "❌ 发送失败，请稍后重试"
+    return "✅ 已替你在群里艾特 {}：{}".format(target, content)
+
+
+def smart_fallback(text, from_id, from_name, room_id, room_name, cfg, session_id=None):
+    """普通消息由 OpenClaw 回答；提醒和推送由 OpenClaw 判断后交给本地执行。
+
+    session_id 是会话场景键（私聊=用户ID，群聊=group:房间ID），缺省时按
+    from_id/room_id 推导：同一群里所有成员共享同一 AI 上下文。
+    """
     text = (text or "").strip()
     if len(text) < 2:
         return None
+    if session_id is None:
+        session_id = ai_session_key(from_id, room_id)
     if not is_allowed(from_id):
         return AI_NO_PERMISSION_MSG
     switch_req = _parse_agent_switch_request(text)
     if switch_req is not None:
         try:
-            return handle_agent_switch(switch_req, from_id)
+            return handle_agent_switch(switch_req, session_id)
         except Exception as e:
             log_error(f"智能体切换失败: {e}")
             return AI_FAILURE_MSG
     if _looks_like_new_session_request(text):
-        if active_agent(from_id) == AGENT_CODEX:
+        if active_agent(session_id) == AGENT_CODEX:
             try:
-                return codex_start_new_session(from_id)
+                return codex_start_new_session(session_id)
             except Exception as e:
                 log_error("Codex 新会话失败: {}".format(e))
                 return AI_FAILURE_MSG
         try:
-            openclaw_start_new_session(from_id)
+            openclaw_start_new_session(session_id)
             return "已开启新的会话。后续对话将从新的上下文开始。"
         except Exception as e:
             log_error("OpenClaw 新会话失败: {}".format(e))
             return AI_FAILURE_MSG
     if _looks_like_compact_request(text):
-        if active_agent(from_id) == AGENT_CODEX:
+        if active_agent(session_id) == AGENT_CODEX:
             try:
-                return codex_compact_session(from_id)
+                return codex_compact_session(session_id)
             except Exception as e:
                 log_error("Codex 上下文压缩失败: {}".format(e))
                 return AI_FAILURE_MSG
         try:
-            return openclaw_compact_session(from_id)
+            return openclaw_compact_session(session_id)
         except Exception as e:
             log_error("OpenClaw 上下文压缩失败: {}".format(e))
             return AI_FAILURE_MSG
 
     def answer_openclaw():
         try:
-            return ai_answer(text, session_id=from_id)
+            return ai_answer(text, session_id=session_id)
         except Exception as e:
             log_error(f"OpenClaw 问答失败: {e}")
             return AI_FAILURE_MSG
@@ -3779,9 +3893,10 @@ def smart_fallback(text, from_id, from_name, room_id, room_name, cfg):
             route_pending_clear(from_id)
             if tool == "chat_answer":
                 return answer_openclaw()
-            return dispatch_route(tool, args, text, from_id, from_name, room_id, room_name, rounds=1)
+            return dispatch_route(tool, args, text, from_id, from_name, room_id, room_name,
+                                  rounds=1, session_id=session_id)
         return dispatch_route(tool, args, text, from_id, from_name, room_id, room_name,
-                              rounds=pending.get("rounds", 1) + 1)
+                              rounds=pending.get("rounds", 1) + 1, session_id=session_id)
 
     if cfg.get("smart", True) and _looks_like_automation(text):
         try:
@@ -3791,36 +3906,43 @@ def smart_fallback(text, from_id, from_name, room_id, room_name, cfg):
             return AI_FAILURE_MSG
         if tool in AUTOMATION_ACTIONS:
             return dispatch_route(
-                tool, args, text, from_id, from_name, room_id, room_name, rounds=1
+                tool, args, text, from_id, from_name, room_id, room_name,
+                rounds=1, session_id=session_id
             )
     return answer_openclaw()
 
 
 # ---------------- 命令处理 ----------------
-def handle_command(text, from_id, from_name, room_id, room_name, cfg):
-    """返回回复文本；无需回复返回 None。"""
+def handle_command(text, from_id, from_name, room_id, room_name, cfg, session_id=None):
+    """返回回复文本；无需回复返回 None。
+
+    AI 相关命令使用会话场景键 session_id（私聊=用户ID，群聊=group:房间ID）；
+    记账/提醒/推送等本地功能仍按用户 from_id 独立。
+    """
     raw_text = (text or "").strip()
+    if session_id is None:
+        session_id = ai_session_key(from_id, room_id)
     if raw_text.lower() in SESSION_COMMANDS:
-        if active_agent(from_id) == AGENT_CODEX:
+        if active_agent(session_id) == AGENT_CODEX:
             if raw_text.lower() in ("/compact", "/压缩上下文", "压缩上下文"):
                 try:
-                    return codex_compact_session(from_id)
+                    return codex_compact_session(session_id)
                 except Exception as e:
                     log_error("Codex 上下文压缩失败: {}".format(e))
                     return AI_FAILURE_MSG
             try:
-                return codex_start_new_session(from_id)
+                return codex_start_new_session(session_id)
             except Exception as e:
                 log_error("Codex 新会话失败: {}".format(e))
                 return AI_FAILURE_MSG
         if raw_text.lower() in ("/compact", "/压缩上下文", "压缩上下文"):
             try:
-                return openclaw_compact_session(from_id)
+                return openclaw_compact_session(session_id)
             except Exception as e:
                 log_error("OpenClaw 上下文压缩失败: {}".format(e))
                 return AI_FAILURE_MSG
         try:
-            openclaw_start_new_session(from_id)
+            openclaw_start_new_session(session_id)
             return "已开启新的会话。后续对话将从新的上下文开始。"
         except Exception as e:
             log_error("OpenClaw 新会话失败: {}".format(e))
@@ -3829,13 +3951,13 @@ def handle_command(text, from_id, from_name, room_id, room_name, cfg):
     rest = text[len(cmd):].strip()
 
     if cmd in AGENT_SWITCH_CMDS:
-        return handle_agent_switch(rest, from_id)
+        return handle_agent_switch(rest, session_id)
 
     if cmd in ("/ai",):
         if not rest:
             return "⚠️ 用法：/ai 后面加空格再写内容，例如：/ai 今天上海天气怎么样"
         try:
-            return ai_answer(rest, session_id=from_id)
+            return ai_answer(rest, session_id=session_id)
         except Exception as e:
             log_error(f"AI 调用失败: {e}")
             return AI_FAILURE_MSG
@@ -3844,10 +3966,18 @@ def handle_command(text, from_id, from_name, room_id, room_name, cfg):
         if not rest:
             return "用法：/搜索 <内容>，例如：/搜索 今天有什么足球比赛"
         try:
-            return ai_answer(rest, session_id=from_id)
+            return ai_answer(rest, session_id=session_id)
         except Exception as e:
             log_error(f"OpenClaw 问答失败: {e}")
             return AI_FAILURE_MSG
+
+    if cmd in ("/艾特", "/at", "/mention"):
+        if not rest:
+            return "⚠️ 用法：/艾特 群昵称 消息内容（只在当前群里发送）"
+        parts = rest.split(None, 1)
+        target = parts[0].lstrip("@")
+        content = parts[1] if len(parts) > 1 else ""
+        return do_mention(target, content, from_id, from_name, room_id, room_name)
 
     if cmd == "/记账":
         return do_ledger(rest, from_id)
@@ -4618,10 +4748,11 @@ async function loadOpenClawSessions(){
   try{
     var d=await api('/api/openclaw/sessions');var sessions=d.sessions||[];
     if(!sessions.length){list.innerHTML='<span class="dim">暂无 OpenClaw 会话</span>';return}
-    var h='<table><thead><tr><th>用户</th><th>会话引用</th><th>最近更新</th><th>上下文</th><th>消息</th><th>压缩</th><th>操作</th></tr></thead><tbody>';
+    var h='<table><thead><tr><th>用户/群聊</th><th>会话引用</th><th>最近更新</th><th>上下文</th><th>消息</th><th>压缩</th><th>操作</th></tr></thead><tbody>';
     sessions.forEach(function(s){
       var state=s.active?'<span class="badge on">当前</span> ':'';
-      h+='<tr><td>'+esc(s.user_name)+'<br><span class="dim">'+esc(s.user_ref)+'</span></td>'
+      var who=(s.is_group?'<span class="badge on">群聊</span> '+esc(s.user_name):esc(s.user_name));
+      h+='<tr><td>'+who+'<br><span class="dim">'+esc(s.user_ref)+'</span></td>'
         +'<td>'+state+esc(s.session_ref)+'</td><td>'+esc(s.updated_at||'-')+'</td>'
         +'<td>'+esc(s.context_text||'暂无统计')+'</td><td>'+esc(s.message_count)+'</td><td>'+esc(s.compaction_count)+'</td>'
         +'<td><div class="session-actions"><button class="btn" onclick="viewOpenClawSession(\\''+esc(s.session_ref)+'\\')">查看</button>'
@@ -4688,10 +4819,14 @@ setInterval(loadUsers,30000);
 
 # ---------------- 后台会话 API 数据 ----------------
 def _openclaw_session_public(item, user_name=""):
+    is_group = bool(item.get("_is_group"))
+    if is_group:
+        user_name = item.get("room_name") or "群聊"
     return {
         "user_ref": item.get("user_ref", ""),
         "session_ref": item.get("session_ref", ""),
-        "user_name": public_display_name(user_name, item.get("_user_id")),
+        "user_name": user_name if is_group else public_display_name(user_name, item.get("_user_id")),
+        "is_group": is_group,
         "updated_at": item.get("updated_at", ""),
         "context_used": item.get("context_used"),
         "context_limit": item.get("context_limit"),
@@ -5462,6 +5597,7 @@ class Handler(BaseHTTPRequestHandler):
 
         reply = None
         cfg = load_config()
+        session_id = ai_session_key(from_id, room_id)
         if mtype == "text" and cfg.get("auto_reply", True):
             text_in = content.strip()
             # 每日推送城市确认流程：有待确认时优先处理（群里可不用 @机器人）
@@ -5474,30 +5610,40 @@ class Handler(BaseHTTPRequestHandler):
             elif (not in_room) or mentioned:
                 # 去掉对机器人本体的 @提及（开头/中间/结尾都可能出现），避免原样发给 AI
                 text_clean = strip_bot_mentions(text_in, bot_name)
-                cmd_text = re.sub(r"^@\s*[\u4e00-\u9fa5\w\-]+", "", text_clean).strip()
-                cmd_word = cmd_text.split(None, 1)[0].lower() if cmd_text else ""
-                # 权限规则：AI 类命令需要授权；普通功能（计算/记账/提醒等）人人可用
-                if ((cmd_text.startswith("/") and cmd_word in AI_CMDS)
-                        or cmd_text.strip().lower() in SESSION_COMMANDS) and not is_allowed(from_id):
-                    reply = AI_NO_PERMISSION_MSG
-                elif cmd_text.startswith("/") or cmd_text.strip().lower() in SESSION_COMMANDS:
-                    reply = handle_command(cmd_text, from_id, sender_name, room_id, room_name, cfg)
-                    if reply is None:
-                        reply = FALLBACK_HELP
+                mention_req = _parse_mention_request(text_clean, room_id) if in_room else None
+                if mention_req is not None:
+                    target, content = mention_req
+                    if not is_allowed(from_id):
+                        reply = AI_NO_PERMISSION_MSG
+                    else:
+                        reply = do_mention(target, content, from_id, sender_name, room_id, room_name)
                 else:
-                    expr = normalize_expr(text_in)
-                    if is_math_expr(expr):
-                        try:
-                            result = evaluate_math(expr)
-                            reply = f"{expr} = {fmt_number(result)}"
-                        except ZeroDivisionError:
-                            reply = "除数不能为 0"
-                        except ValueError:
-                            reply = None
-                    if reply is None:
-                        reply = smart_fallback(cmd_text, from_id, sender_name, room_id, room_name, cfg)
-                    if reply is None:
-                        reply = FALLBACK_HELP
+                    cmd_text = re.sub(r"^@\s*[\u4e00-\u9fa5\w\-]+", "", text_clean).strip()
+                    cmd_word = cmd_text.split(None, 1)[0].lower() if cmd_text else ""
+                    # 权限规则：AI 类命令需要授权；普通功能（计算/记账/提醒等）人人可用
+                    if ((cmd_text.startswith("/") and cmd_word in AI_CMDS)
+                            or cmd_text.strip().lower() in SESSION_COMMANDS) and not is_allowed(from_id):
+                        reply = AI_NO_PERMISSION_MSG
+                    elif cmd_text.startswith("/") or cmd_text.strip().lower() in SESSION_COMMANDS:
+                        reply = handle_command(cmd_text, from_id, sender_name, room_id, room_name, cfg,
+                                               session_id)
+                        if reply is None:
+                            reply = FALLBACK_HELP
+                    else:
+                        expr = normalize_expr(text_in)
+                        if is_math_expr(expr):
+                            try:
+                                result = evaluate_math(expr)
+                                reply = f"{expr} = {fmt_number(result)}"
+                            except ZeroDivisionError:
+                                reply = "除数不能为 0"
+                            except ValueError:
+                                reply = None
+                        if reply is None:
+                            reply = smart_fallback(cmd_text, from_id, sender_name, room_id, room_name, cfg,
+                                                   session_id)
+                        if reply is None:
+                            reply = FALLBACK_HELP
 
         rec = {
             "type": mtype,
