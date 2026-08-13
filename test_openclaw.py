@@ -119,6 +119,14 @@ class OpenClawTests(unittest.TestCase):
                 continue
             for name in aliases[kind]:
                 stack.enter_context(mock.patch.object(app, name, value, create=True))
+        # 生产 config.json 里可能配了 openclaw.session_index，会覆盖上面 patch 的
+        # 常量导致测试读到真实会话；把 CONFIG_FILE 指向临时目录里不存在的文件，
+        # 让 load_config() 走默认值（无 session_index），保证 fixture 生效。
+        if registry or index or transcript_dir:
+            base = os.path.dirname(registry or index or transcript_dir or ".")
+            stack.enter_context(mock.patch.object(
+                app, "CONFIG_FILE", os.path.join(base, "config.json"), create=True
+            ))
 
     @staticmethod
     def _write_json(path, value):
