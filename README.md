@@ -254,7 +254,26 @@ docker logs -f wxBotWebhook                  # 容器日志
 docker restart wxBotWebhook                  # 重启机器人容器（掉线时）
 ```
 
-### 1.8 环境变量（可选）
+### 1.8 微信容器自动恢复（看护）
+
+网页版微信会话会周期性过期：容器会卡在“未登录且二维码为空”的状态，登录态失效后
+既不再收发消息，扫码页也没有二维码，无法重新登录。`app.py` 内置一个**看护线程**
+自动处理，无需人工干预：
+
+1. 每 5 分钟检查一次微信容器健康状态；连续 3 次（约 15 分钟）未登录且二维码为空，
+   判定为“会话卡死”。
+2. 自动执行 `docker restart wxBotWebhook` 重启容器，并等待 90 秒。
+3. 重启后若二维码已生成：只是等扫码，不再折腾（扫码登录即可恢复）。
+4. 重启后仍无二维码：说明 `/root/wxBot_session.json` 会话文件已过期/损坏，
+   将其改名为 `session.json.expired-<时间>` 备份后再次重启容器，强制要求重新扫码。
+5. 动作后 15 分钟内不再重复操作（冷却期）；登录恢复正常后失败计数清零。
+
+看护动作会记录到 `system_events.log`（类型 `watchdog`），管理后台「系统事件」页可查。
+扫码页在无二维码时也会给出明确提示（“会话已过期，看护程序正在自动恢复…”），
+不再出现“二维码空白 + 静默失效”。如确认在线状态异常，仍可手动
+`docker restart wxBotWebhook` 立即恢复。
+
+### 1.9 环境变量（可选）
 
 `app.py` 的所有路径/端口都可以用环境变量覆盖，默认值与上表一致：
 
@@ -267,6 +286,13 @@ docker restart wxBotWebhook                  # 重启机器人容器（掉线时
 | `WXBOT_BOT_TOKEN_FILE` | `/root/wxBot_logs/.login_token` | 机器人 API token 文件 |
 | `WXBOT_BOT_BASE` | `http://127.0.0.1:3002` | 机器人发送消息接口 |
 | `WXBOT_PUBLIC_BASE` | `http://127.0.0.1:3002` | 管理后台展示的扫码登录地址（填公网 IP 或域名，如 `http://47.97.219.242:3002`） |
+| `WXBOT_WATCHDOG_ENABLED` | `1` | 微信容器看护开关（`0` 关闭） |
+| `WXBOT_WATCHDOG_INTERVAL` | `300` | 看护检查间隔（秒） |
+| `WXBOT_WATCHDOG_FAIL_LIMIT` | `3` | 连续未登录几次才触发恢复动作 |
+| `WXBOT_WATCHDOG_RESTART_CMD` | `docker restart wxBotWebhook` | 重启容器的命令 |
+| `WXBOT_WATCHDOG_SESSION_FILE` | `/root/wxBot_session.json` | 微信会话文件路径 |
+| `WXBOT_WATCHDOG_GRACE_SECONDS` | `90` | 重启后等待容器生成二维码的秒数 |
+| `WXBOT_WATCHDOG_COOLDOWN` | `900` | 一次恢复动作后的冷却期（秒），期内不再重复 |
 
 ---
 

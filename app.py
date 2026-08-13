@@ -1247,17 +1247,127 @@ def extract_wechat_login_qr(html):
     return match.group(2).strip() if match else ""
 
 
-def fetch_wechat_login_qr(timeout=8):
+def fetch_wechat_login_qr(timeout=8, retries=3):
+    """拉取微信登录二维码；容器刚启动时可能还没生成，重试几次再放弃。"""
     url = BOT_BASE + "/login?token=" + urllib.parse.quote(bot_token())
-    with urllib.request.urlopen(url, timeout=timeout) as response:
-        html = response.read().decode("utf-8", "ignore")
-    return extract_wechat_login_qr(html)
+    last_err = ""
+    for i in range(max(1, int(retries))):
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as response:
+                html = response.read().decode("utf-8", "ignore")
+            qr = extract_wechat_login_qr(html)
+            if qr:
+                return qr
+        except Exception as e:
+            last_err = str(e)
+        if i < int(retries) - 1:
+            time.sleep(2)
+    if last_err:
+        raise IOError(last_err)
+    return ""
 
 
 def fetch_wechat_qrcode_script(timeout=8):
     url = BOT_BASE + "/static/qrcode.min.js?token=" + urllib.parse.quote(bot_token())
     with urllib.request.urlopen(url, timeout=timeout) as response:
         return response.read()
+
+
+# ---------------- 微信容器自愈看护 ----------------
+# 微信网页版会话会周期性过期：容器会卡在“未登录”且二维码为空的状态，
+# 不再自动恢复。看护线程周期检查，卡死时自动重启容器；重启后仍无二维码
+# 则清理过期会话文件强制重新扫码，避免静默失效。
+WATCHDOG_ENABLED = os.environ.get("WXBOT_WATCHDOG_ENABLED", "1") == "1"
+WATCHDOG_INTERVAL = int(os.environ.get("WXBOT_WATCHDOG_INTERVAL", "300"))      # 每 5 分钟检查
+WATCHDOG_FAIL_LIMIT = int(os.environ.get("WXBOT_WATCHDOG_FAIL_LIMIT", "3"))   # 连续未登录 3 次才动作
+WATCHDOG_RESTART_CMD = os.environ.get("WXBOT_WATCHDOG_RESTART_CMD",
+                                      "docker restart wxBotWebhook")
+WATCHDOG_SESSION_FILE = os.environ.get("WXBOT_WATCHDOG_SESSION_FILE",
+                                       "/root/wxBot_session.json")
+WATCHDOG_GRACE_SECONDS = int(os.environ.get("WXBOT_WATCHDOG_GRACE_SECONDS", "90"))
+WATCHDOG_COOLDOWN = int(os.environ.get("WXBOT_WATCHDOG_COOLDOWN", "900"))     # 动作后 15 分钟内不再重复
+WATCHDOG_LOCK = threading.Lock()
+_watchdog_last_action = 0.0
+
+
+def _run_watchdog_cmd(cmd):
+    try:
+        proc = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+        if proc.returncode != 0:
+            log_error("微信看护执行失败 {}: {}".format(
+                cmd, (proc.stderr or proc.stdout or "")[:200]))
+    except Exception as e:
+        log_error("微信看护执行异常 {}: {}".format(cmd, e))
+
+
+def _watchdog_check_once():
+    """微信容器健康检查与自愈：返回 True 表示执行了恢复动作。"""
+    global _watchdog_last_action
+    with WATCHDOG_LOCK:
+        if time.time() - _watchdog_last_action < WATCHDOG_COOLDOWN:
+            return False
+        status = bot_status()
+        if status.get("logged_in"):
+            return False
+        try:
+            qr = fetch_wechat_login_qr()
+        except Exception:
+            qr = ""
+        if qr:
+            # 二维码可拿到：只是等人扫码，不折腾
+            return False
+        _watchdog_last_action = time.time()
+        log_system_event({
+            "type": "watchdog",
+            "content": "微信未登录且无二维码（{}），自动重启容器".format(
+                status.get("raw") or "容器不可达"),
+        })
+        _run_watchdog_cmd(WATCHDOG_RESTART_CMD)
+        time.sleep(WATCHDOG_GRACE_SECONDS)
+        if bot_status().get("logged_in"):
+            return True
+        try:
+            qr2 = fetch_wechat_login_qr()
+        except Exception:
+            qr2 = ""
+        if qr2:
+            log_system_event({
+                "type": "watchdog",
+                "content": "容器已重启，等待扫码登录（二维码已生成）",
+            })
+            return True
+        # 重启后仍没有二维码：会话文件过期/损坏，清理后强制重新扫码
+        if os.path.exists(WATCHDOG_SESSION_FILE):
+            bak = WATCHDOG_SESSION_FILE + ".expired-" + time.strftime("%Y%m%d%H%M%S")
+            try:
+                os.rename(WATCHDOG_SESSION_FILE, bak)
+                log_system_event({
+                    "type": "watchdog",
+                    "content": "会话已过期，清理会话文件 {} 并再次重启，请扫码".format(bak),
+                })
+            except Exception as e:
+                log_error("清理微信会话文件失败: {}".format(e))
+        _run_watchdog_cmd(WATCHDOG_RESTART_CMD)
+        return True
+
+
+def watchdog_worker():
+    """后台看护线程：周期检查微信容器，卡死时自动重启/清会话，避免静默失效。"""
+    if not WATCHDOG_ENABLED:
+        return
+    fail_count = 0
+    while True:
+        time.sleep(WATCHDOG_INTERVAL)
+        try:
+            if bot_status().get("logged_in"):
+                fail_count = 0
+                continue
+            fail_count += 1
+            if fail_count >= WATCHDOG_FAIL_LIMIT:
+                fail_count = 0
+                _watchdog_check_once()
+        except Exception as e:
+            log_error("微信看护检查异常: {}".format(e))
 
 
 # ---------------- 微信身份归一化 ----------------
@@ -5900,11 +6010,17 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 log_error("获取微信登录二维码失败: {}".format(e))
                 qr_url = ""
+            if qr_url:
+                message = ""
+            elif status.get("reachable"):
+                message = "微信会话已过期，看护程序正在自动恢复，请稍后刷新"
+            else:
+                message = "微信容器不可达，看护程序正在重启容器，请稍后刷新"
             self._json({
                 "success": bool(qr_url),
                 "logged_in": False,
                 "qr_url": qr_url,
-                "message": "" if qr_url else "暂时无法获取二维码，请稍后刷新",
+                "message": message,
             })
         elif path == "/api/messages":
             q = (qs.get("q") or [""])[0].strip()
@@ -6553,6 +6669,7 @@ def main():
     if started == 0:
         return
     threading.Thread(target=reminder_worker, daemon=True).start()
+    threading.Thread(target=watchdog_worker, daemon=True).start()
     try:
         while True:
             time.sleep(3600)

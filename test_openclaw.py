@@ -96,15 +96,19 @@ class _ModelsJsonHandler(BaseHTTPRequestHandler):
 class OpenClawTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        # 测试会故意触发错误路径（如 AI 调用失败），把 error.log 隔离到
-        # 临时目录，避免污染生产 error.log 并在后台误报“AI 不可用”。
+        # 测试会故意触发错误路径（如 AI 调用失败、看护动作），把 error.log /
+        # system_events.log 隔离到临时目录，避免污染生产日志并产生假告警。
         cls._cls_tmpdir = tempfile.TemporaryDirectory()
         cls._error_log_path = os.path.join(cls._cls_tmpdir.name, "error.log")
         cls._error_log_patch = mock.patch.object(app, "ERROR_LOG", cls._error_log_path)
         cls._error_log_patch.start()
+        cls._sys_log_path = os.path.join(cls._cls_tmpdir.name, "system_events.log")
+        cls._sys_log_patch = mock.patch.object(app, "SYSTEM_LOG", cls._sys_log_path)
+        cls._sys_log_patch.start()
 
     @classmethod
     def tearDownClass(cls):
+        cls._sys_log_patch.stop()
         cls._error_log_patch.stop()
         cls._cls_tmpdir.cleanup()
 
@@ -1390,6 +1394,93 @@ class OpenClawTests(unittest.TestCase):
         self.assertIn("/wechat-login/qrcode.js", page)
         self.assertIn("/api/wechat-login/qrcode", page)
         self.assertNotIn('new EventSource("/sse")', page)
+
+    def test_fetch_wechat_login_qr_retries_on_empty(self):
+        import urllib.request as ur
+
+        class _Resp:
+            def __init__(self, html):
+                self._html = html
+
+            def read(self):
+                return self._html.encode("utf-8")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def _resp(html):
+            class _Ctx:
+                def __enter__(self):
+                    return _Resp(html)
+
+                def __exit__(self, *a):
+                    return False
+            return _Ctx()
+
+        with mock.patch.object(app, "bot_token", return_value="t"), \
+             mock.patch.object(ur, "urlopen",
+                               side_effect=[_resp('<script>qrcode.makeCode("")</script>'),
+                                            _resp('<script>qrcode.makeCode("https://login.weixin.qq.com/l/ok")</script>')]), \
+             mock.patch.object(app.time, "sleep"):
+            qr = app.fetch_wechat_login_qr(retries=2)
+        self.assertEqual(qr, "https://login.weixin.qq.com/l/ok")
+
+    def test_watchdog_does_nothing_when_qr_available(self):
+        with mock.patch.object(app, "bot_status",
+                               return_value={"reachable": True, "logged_in": False, "raw": "unHealthy"}), \
+             mock.patch.object(app, "fetch_wechat_login_qr",
+                               return_value="https://login.weixin.qq.com/l/scan"), \
+             mock.patch.object(app, "_run_watchdog_cmd",
+                               side_effect=AssertionError("不应重启")):
+            result = app._watchdog_check_once()
+        self.assertFalse(result)  # 等人扫码，不折腾
+
+    def test_watchdog_restarts_container_when_stuck(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session = os.path.join(tmp, "session.json")
+            with open(session, "w", encoding="utf-8") as f:
+                f.write("{}")
+            with mock.patch.object(app, "bot_status",
+                                   side_effect=[
+                                       {"reachable": True, "logged_in": False, "raw": "unHealthy"},
+                                       {"reachable": True, "logged_in": False, "raw": "unHealthy"},
+                                   ]), \
+                 mock.patch.object(app, "fetch_wechat_login_qr",
+                                   side_effect=["", "https://login.weixin.qq.com/l/new"]), \
+                 mock.patch.object(app, "WATCHDOG_SESSION_FILE", session), \
+                 mock.patch.object(app, "WATCHDOG_GRACE_SECONDS", 0), \
+                 mock.patch.object(app, "WATCHDOG_COOLDOWN", 0), \
+                 mock.patch.object(app, "_run_watchdog_cmd") as cmd:
+                app._watchdog_last_action = 0.0
+                result = app._watchdog_check_once()
+            self.assertTrue(result)
+            self.assertEqual(cmd.call_count, 1)
+            # 会话文件未被误删（重启后二维码出来了）
+            self.assertTrue(os.path.exists(session))
+
+    def test_watchdog_clears_expired_session_when_qr_still_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session = os.path.join(tmp, "session.json")
+            with open(session, "w", encoding="utf-8") as f:
+                f.write("{}")
+            with mock.patch.object(app, "bot_status",
+                                   return_value={"reachable": True, "logged_in": False, "raw": "unHealthy"}), \
+                 mock.patch.object(app, "fetch_wechat_login_qr", return_value=""), \
+                 mock.patch.object(app, "WATCHDOG_SESSION_FILE", session), \
+                 mock.patch.object(app, "WATCHDOG_GRACE_SECONDS", 0), \
+                 mock.patch.object(app, "WATCHDOG_COOLDOWN", 0), \
+                 mock.patch.object(app, "_run_watchdog_cmd") as cmd:
+                app._watchdog_last_action = 0.0
+                result = app._watchdog_check_once()
+            self.assertTrue(result)
+            # 重启后仍无二维码：清会话 + 再重启（共两次）
+            self.assertEqual(cmd.call_count, 2)
+            self.assertFalse(os.path.exists(session))
+            baks = [f for f in os.listdir(tmp) if f.startswith("session.json.expired-")]
+            self.assertEqual(len(baks), 1)
 
     def test_admin_status_and_page_do_not_expose_long_ids(self):
         long_user_id = "wxid_" + "B" * 72
