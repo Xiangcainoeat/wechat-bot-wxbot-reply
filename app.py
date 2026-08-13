@@ -32,6 +32,7 @@ import urllib.parse
 import urllib.request
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import difflib
 
 # ---------------- 配置 ----------------
 # 所有路径/端口均可通过环境变量覆盖，默认值与线上服务器保持一致。
@@ -111,12 +112,20 @@ OPENCLAW_SESSION_DIR = OPENCLAW_TRANSCRIPT_DIR
 PERM_FILE = os.path.join(BASE_DIR, "permissions.json")   # 权限(管理员/成员白名单)
 USERS_FILE = os.path.join(BASE_DIR, "users.json")        # 见过的用户(昵称->ID)
 IDENTITY_FILE = os.path.join(BASE_DIR, "identities.json") # 稳定用户ID与微信临时ID映射
+GROUP_MEMORY_FILE = os.environ.get(
+    "WXBOT_GROUP_MEMORY_FILE", os.path.join(BASE_DIR, "group_memory.json")
+)  # 群聊长期记忆：群名 + 成员称呼（昵称/外号/纠错）
+COLLECTS_FILE = os.environ.get(
+    "WXBOT_COLLECTS_FILE", os.path.join(BASE_DIR, "collects.json")
+)  # 收款/欠款登记（网页版协议无法真实转账，做群内记账与催收）
 LEDGER_LOCK = threading.Lock()
 REMINDER_LOCK = threading.Lock()
 SUBS_LOCK = threading.Lock()
 PERM_LOCK = threading.Lock()
 USERS_LOCK = threading.Lock()
 IDENTITY_LOCK = threading.Lock()
+GROUP_MEMORY_LOCK = threading.Lock()
+COLLECTS_LOCK = threading.Lock()
 OUTBOX_LOCK = threading.Lock()
 OPENCLAW_REGISTRY_LOCK = threading.Lock()
 OPENCLAW_USAGE_LOCK = threading.Lock()
@@ -206,12 +215,18 @@ WECHAT_SYSTEM_PROMPT = (
     "工具由系统自动执行，你只需要直接给出最终结论。"
     "不要输出工具调用标记（如 <tool_calls>、<invoke>、DSML 标签）或代码块。"
     "如果用户问你是谁、基于什么智能体或运行环境，统一回答：我是 OpenClaw 智能体。"
+    "回复长度由场景决定，由你判断：如果用户只是在闲聊、打招呼、表达情绪、简短回应"
+    "（比如“你好”“好的”“666”“你是小狗吗”），用 1-5 句简短口语化回复，"
+    "长度要有随机变化，不要每次千篇一律；如果用户需要查询信息、分析对比、总结、"
+    "写内容、出方案、解决问题，则给出完整详细的回答，可以分点展开。"
 )
 OPENCLAW_DIRECT_SYSTEM_PROMPT = (
     "你是通过微信回答用户问题的助手。请直接用简洁的纯文本回答用户的问题，"
     "只输出最终回答，不要输出工具调用标记（如 <tool_calls>、<invoke>、DSML 标签）或代码块，"
     "不要提及工具、搜索或内部过程。需要核实最新信息时可以使用网页搜索工具，"
     "必要时简要说明以官方渠道为准，不要编造具体数字或日期。"
+    "回复长度由场景决定，由你判断：闲聊、打招呼、表达情绪时用 1-5 句简短口语化回复"
+    "（长度随机变化）；需要查询、分析、对比、总结、写内容时给出完整详细回答。"
 )
 OPENCLAW_COMPACT_SYSTEM_PROMPT = (
     "你是上下文压缩助手。请把用户提供的微信对话记录压缩成一份简明摘要。"
@@ -258,6 +273,7 @@ FALLBACK_HELP = (
     "   例：“明天早上8点提醒我开会”“每天八点推送北京市朝阳区天气”\n"
     "6. AI 问答：直接问我任何问题（可 /智能体 codex 切换回答后端）\n"
     "7. 群内艾特：/艾特 群昵称 消息（只在群里发送，不能私聊外发）\n"
+    "8. 上下文统计：/统计 开 或 /统计 关，也可说“隐藏上下文统计”\n"
     "\n"
     "详细用法：/说明"
 )
@@ -287,6 +303,10 @@ DETAIL_HELP = (
     "   /智能体 默认 恢复全局默认；也可直接说“切换到codex”\n"
     "9. 群内艾特：/艾特 群昵称 消息内容，或说“艾特张三说你好”\n"
     "   只会在当前群里以 @昵称 形式发送，绝不私聊外发；私聊里使用会被拒绝\n"
+    "10. 上下文统计开关：/统计 开 / /统计 关，或说“隐藏/显示上下文统计”\n"
+    "11. 收款登记（群内记账，网页版不支持真实转账）：/收款 100 张三 买奶茶；\n"
+    "    /催收 张三 在群里艾特提醒还钱；/欠款 查看别人欠你多少\n"
+    "12. 防撤回：有人撤回消息时会提示“撤回没用”并展示原内容（尽力而为）\n"
     "\n"
     "记账例外：账本必须用 /记账 + / - 精确格式，AI 不会代记"
 )
@@ -586,6 +606,7 @@ def _agent_pref_entry(user_id, create=False):
         entry.setdefault("agent", "")
         entry.setdefault("codex_thread", "")
         entry.setdefault("codex_usage", {})
+        entry.setdefault("show_stats", True)
         return entry
 
 
@@ -593,6 +614,27 @@ def user_agent(user_id):
     """返回用户手动选择的智能体 id；未设置返回空串（由全局默认决定）。"""
     entry = _agent_pref_entry(user_id)
     return str(entry.get("agent") or "").strip()
+
+
+def stats_visible(session_key):
+    """该会话场景是否显示 token 统计（默认显示）。"""
+    entry = _agent_pref_entry(session_key)
+    return bool(entry.get("show_stats", True))
+
+
+def set_stats_visible(session_key, visible):
+    """开关会话场景的 token 统计显示（按场景持久化，默认显示）。"""
+    session_key = str(session_key or "").strip()
+    if not session_key:
+        return
+    with AGENT_PREFS_LOCK:
+        data = _agent_prefs_load()
+        entry = data["users"].setdefault(session_key, {})
+        if visible:
+            entry.pop("show_stats", None)  # 恢复默认：显示
+        else:
+            entry["show_stats"] = False
+        _agent_prefs_save(data)
 
 
 def set_user_agent(user_id, agent):
@@ -1614,6 +1656,265 @@ def record_user(from_id, name):
             save_users(u)
 
 
+# ---------------- 群聊长期记忆（成员称呼 / 艾特纠错） ----------------
+def _group_memory_load():
+    try:
+        with open(GROUP_MEMORY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            data = {}
+    except Exception:
+        data = {}
+    data.setdefault("rooms", {})
+    return data
+
+
+def _group_memory_save(data):
+    try:
+        parent = os.path.dirname(GROUP_MEMORY_FILE)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        temp = GROUP_MEMORY_FILE + ".tmp"
+        with open(temp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(temp, GROUP_MEMORY_FILE)
+    except Exception as e:
+        log_error("保存群聊记忆失败: {}".format(e))
+
+
+def remember_sender_in_room(room_id, room_name, from_id, sender_name):
+    """记录群成员称呼到长期记忆：同一群里谁=哪个昵称/别名（外号）。"""
+    room_id = str(room_id or "").strip()
+    from_id = str(from_id or "").strip()
+    sender_name = str(sender_name or "").strip()
+    if not room_id or not from_id or not sender_name:
+        return
+    with GROUP_MEMORY_LOCK:
+        data = _group_memory_load()
+        room = data["rooms"].setdefault(
+            room_id, {"room_name": "", "members": {}, "updated_at": ""}
+        )
+        if room_name:
+            room["room_name"] = str(room_name)
+        member = room["members"].setdefault(from_id, {"names": []})
+        changed = False
+        if sender_name not in member["names"]:
+            member["names"].append(sender_name)
+            changed = True
+        if changed:
+            room["updated_at"] = now_str()
+            _group_memory_save(data)
+
+
+def remember_alias_for_member(room_id, member_id, alias):
+    """艾特成功后，把用户实际输入的称呼也记为成员别名（长期纠错记忆）。"""
+    room_id = str(room_id or "").strip()
+    member_id = str(member_id or "").strip()
+    alias = str(alias or "").strip().lstrip("@").strip()
+    if not room_id or not member_id or not alias:
+        return
+    with GROUP_MEMORY_LOCK:
+        data = _group_memory_load()
+        room = data["rooms"].setdefault(
+            room_id, {"room_name": "", "members": {}, "updated_at": ""}
+        )
+        member = room["members"].setdefault(member_id, {"names": []})
+        if alias not in member["names"]:
+            member["names"].append(alias)
+            room["updated_at"] = now_str()
+            _group_memory_save(data)
+
+
+def _normalize_name(value):
+    return re.sub(r"\s+", "", str(value or "")).lower()
+
+
+def room_member_aliases(room_id):
+    """返回该群的成员别名表：[(member_id, [names...]), ...]（新到旧）。"""
+    room_id = str(room_id or "").strip()
+    with GROUP_MEMORY_LOCK:
+        data = _group_memory_load()
+        room = data["rooms"].get(room_id) or {}
+        members = room.get("members") or {}
+        return [
+            (mid, list(member.get("names") or []))
+            for mid, member in members.items()
+            if member.get("names")
+        ]
+
+
+def resolve_member_name(room_id, target):
+    """在群成员长期记忆里解析目标称呼：精确匹配 → 模糊纠错（昵称/错别字）。
+
+    返回 (member_id, 群内规范称呼) 或 None。
+    """
+    target = str(target or "").strip().lstrip("@").strip()
+    norm = _normalize_name(target)
+    if not norm:
+        return None
+    aliases = room_member_aliases(room_id)
+    # 精确匹配（忽略空格/大小写）
+    for mid, names in aliases:
+        for name in names:
+            if _normalize_name(name) == norm:
+                return mid, name
+    # 模糊匹配：包含关系 / 编辑距离
+    best = None
+    best_score = 0.0
+    for mid, names in aliases:
+        for name in names:
+            n = _normalize_name(name)
+            if not n:
+                continue
+            if norm in n or n in norm:
+                score = 0.9 + min(len(norm), len(n)) / max(1, max(len(norm), len(n))) * 0.1
+            else:
+                score = difflib.SequenceMatcher(None, norm, n).ratio()
+            if score > best_score:
+                best_score = score
+                best = (mid, name)
+    if best and best_score >= 0.6:
+        return best
+    return None
+
+
+# ---------------- 收款 / 欠款登记（群内记账 + 催收） ----------------
+def _collects_load():
+    try:
+        with open(COLLECTS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            data = {}
+    except Exception:
+        data = {}
+    data.setdefault("items", [])
+    return data
+
+
+def _collects_save(data):
+    try:
+        parent = os.path.dirname(COLLECTS_FILE)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        temp = COLLECTS_FILE + ".tmp"
+        with open(temp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(temp, COLLECTS_FILE)
+    except Exception as e:
+        log_error("保存收款记录失败: {}".format(e))
+
+
+def collect_add(payee_id, payee_name, room_id, room_name, payer_name, amount, note):
+    """登记一笔应收：payer_name 欠 payee 金额。返回记录描述。"""
+    payee_id = str(payee_id or "").strip()
+    payer_name = str(payer_name or "").strip()
+    note = str(note or "").strip()
+    room_id = str(room_id or "").strip()
+    try:
+        amount = round(float(amount), 2)
+    except (TypeError, ValueError):
+        raise ValueError("金额格式不对，例如：/收款 100 张三 买奶茶")
+    if amount <= 0:
+        raise ValueError("金额必须大于 0")
+    if not payer_name:
+        raise ValueError("缺少收款对象，例如：/收款 100 张三 买奶茶")
+    # 尽量解析成群成员，便于后续催收时艾特
+    payer_id = ""
+    resolved = resolve_member_name(room_id, payer_name) if room_id else None
+    if resolved:
+        payer_id, payer_name = resolved[0], resolved[1]
+    item = {
+        "payee_id": payee_id,
+        "payee_name": payee_name or "我",
+        "payer_id": payer_id,
+        "payer_name": payer_name,
+        "room_id": room_id,
+        "room_name": room_name,
+        "amount": amount,
+        "note": note,
+        "t": now_str(),
+    }
+    with COLLECTS_LOCK:
+        data = _collects_load()
+        data["items"].append(item)
+        _collects_save(data)
+    return item
+
+
+def collect_owed_to(payee_id):
+    """返回别人欠 payee 的未结记录（按人汇总）。"""
+    payee_id = str(payee_id or "").strip()
+    with COLLECTS_LOCK:
+        items = _collects_load().get("items") or []
+    rows = {}
+    for item in items:
+        if str(item.get("payee_id") or "") != payee_id:
+            continue
+        key = str(item.get("payer_name") or "未知")
+        rows.setdefault(key, {"amount": 0.0, "notes": [], "room": item.get("room_name") or ""})
+        rows[key]["amount"] = round(rows[key]["amount"] + float(item.get("amount") or 0), 2)
+        note = str(item.get("note") or "")
+        rows[key]["notes"].append(note if note else "无备注")
+    return rows
+
+
+def _parse_collect_command(rest, from_id, from_name, room_id, room_name):
+    """解析 /收款 金额 对象 [备注] → 登记并返回记录。"""
+    rest = str(rest or "").strip()
+    m = re.match(r"^([\d.]+)\s*([^\s]+)(?:\s+(.*))?$", rest)
+    if not m:
+        raise ValueError("用法：/收款 金额 对象 备注，例如：/收款 100 张三 买奶茶")
+    amount = m.group(1)
+    payer = m.group(2).lstrip("@").strip()
+    note = (m.group(3) or "").strip()
+    return collect_add(from_id, from_name, room_id, room_name, payer, amount, note)
+
+
+def do_collect_urge(rest, from_id, from_name, room_id, room_name):
+    """催收：在群里艾特欠款人提醒还钱（仅在群里发送）。"""
+    target = str(rest or "").strip().lstrip("@").strip()
+    if not target:
+        return "⚠️ 用法：/催收 群昵称"
+    owed = collect_owed_to(from_id)
+    hit = None
+    for name, info in owed.items():
+        if _normalize_name(name) == _normalize_name(target):
+            hit = (name, info)
+            break
+    if hit is None:
+        return "😌 {} 不欠你钱，先 /收款 登记一下。".format(target)
+    name, info = hit
+    room_id = str(room_id or "").strip()
+    resolved = resolve_member_name(room_id, name) if room_id else None
+    send_name = resolved[1] if resolved else name
+    if room_id:
+        text = "@{} 你欠 {} {} 元，该还啦！{}".format(
+            send_name, from_name or "我", fmt_number(info["amount"]),
+            "（{}）".format("；".join(info["notes"])) if info["notes"] else "")
+        ok, resp = bot_send(room_name or room_id, text, is_room=True)
+        if not ok:
+            log_error("催收发送失败: {}".format(str(resp)[:200]))
+            return "❌ 催收消息发送失败，请稍后重试"
+        return "✅ 已在群里提醒 {} 还你 {} 元。".format(send_name, fmt_number(info["amount"]))
+    return "🔔 {} 欠你 {} 元，记得找 TA 收！{}".format(
+        name, fmt_number(info["amount"]),
+        "（{}）".format("；".join(info["notes"])) if info["notes"] else "")
+
+
+def collect_summary(from_id):
+    """查看别人欠我的款项汇总。"""
+    owed = collect_owed_to(from_id)
+    if not owed:
+        return "💰 还没有人欠你钱，用 /收款 金额 对象 备注 登记。"
+    lines = ["💰 别人欠你的："]
+    for name, info in owed.items():
+        room = "（{}）".format(info["room"]) if info.get("room") else ""
+        lines.append("  {} 欠你 {} 元{}：{}".format(
+            name, fmt_number(info["amount"]), room, "；".join(info["notes"])))
+    lines.append("发「/催收 名字」可在群里提醒 TA。")
+    return "\n".join(lines)
+
+
 # ---------------- 记账 ----------------
 def load_ledger():
     try:
@@ -2409,8 +2710,8 @@ def clean_wechat_reply(text):
 
 
 def wechat_outbound_text(reply, sender_name="", in_room=False):
-    text = f"@{sender_name} {reply}" if in_room else str(reply or "")
-    return clean_wechat_reply(text)
+    """群/私聊回复都不再 @ 发送者，直接回复；只有明确要求艾特群成员时才用 @。"""
+    return clean_wechat_reply(str(reply or ""))
 
 
 def geocode_city(name):
@@ -2764,7 +3065,7 @@ def codex_answer(prompt, session_id=""):
             set_codex_thread(user_id, new_thread)
         stats = codex_record_turn(user_id, new_thread or thread_id)
     reply = clean_wechat_reply(reply) or "（没有返回内容）"
-    status = codex_context_status(user_id, stats) if user_id else ""
+    status = codex_context_status(user_id, stats) if (user_id and stats_visible(user_id)) else ""
     return (reply + "\n" + status).strip() if status else reply
 
 
@@ -2940,9 +3241,12 @@ def codex_compact_session(user_id):
         raise ValueError("压缩后创建新会话失败")
     set_codex_thread(user_id, new_thread)
     add_codex_usage(user_id, usage)
-    status = codex_context_status(user_id, usage)
-    return "已压缩上下文：之前 {} 轮对话已整理成摘要并作为记忆保留，后续对话继续基于这份摘要交流（不是开新窗口）。\n\n记忆摘要：\n{}\n\n{}".format(
-        len(records), summary, status)
+    status = codex_context_status(user_id, usage) if stats_visible(user_id) else ""
+    if status:
+        return "已压缩上下文：之前 {} 轮对话已整理成摘要并作为记忆保留，后续对话继续基于这份摘要交流（不是开新窗口）。\n\n记忆摘要：\n{}\n\n{}".format(
+            len(records), summary, status)
+    return "已压缩上下文：之前 {} 轮对话已整理成摘要并作为记忆保留，后续对话继续基于这份摘要交流（不是开新窗口）。\n\n记忆摘要：\n{}".format(
+        len(records), summary)
 
 
 def codex_start_new_session(user_id):
@@ -3047,7 +3351,11 @@ def ai_answer(prompt, session_id=""):
             reply = clean_wechat_reply(raw_reply)
         if not reply:
             raise ValueError("OpenClaw 返回内容为空")
-        return _with_context_status(reply, key) if key else reply
+        if not key:
+            return reply
+        if not stats_visible(session_id):
+            return reply
+        return _with_context_status(reply, key)
     raise ValueError("OpenClaw 未配置：请启用 OpenClaw 对话并配置模型提供商")
 
 
@@ -3204,11 +3512,18 @@ def openclaw_compact_session(user_id):
     if not key:
         raise ValueError("缺少微信用户会话")
     claw = openclaw_config()
+    show_stats = stats_visible(user_id)
+
+    def compact_reply(message):
+        if not show_stats:
+            return message
+        return _with_context_status(message, key)
+
     item = _openclaw_session_by_key(key)
     records = [r for r in (item or {}).get("_transcript") or []
                if r.get("role") in ("user", "assistant")]
     if not item or len(records) < 2:
-        return _with_context_status("当前会话内容很少，暂时不需要压缩。", key)
+        return compact_reply("当前会话内容很少，暂时不需要压缩。")
     lines = []
     for rec in records:
         role = "用户" if rec.get("role") == "user" else "OpenClaw"
@@ -3241,7 +3556,7 @@ def openclaw_compact_session(user_id):
             # 会话行数很少无需截断：不注入摘要，避免上下文虚增
             with OPENCLAW_USAGE_LOCK:
                 _OPENCLAW_LAST_USAGE.pop(str(key), None)
-            return _with_context_status("当前会话内容很少，暂时不需要压缩。", key)
+            return compact_reply("当前会话内容很少，暂时不需要压缩。")
         # 2) 摘要写回同一会话（gateway 内部追加，不触发模型回复）
         seed_text = (
             "【历史对话压缩摘要】这是系统压缩旧对话后生成的记忆摘要，请长期记住并作为回答依据。"
@@ -3258,9 +3573,8 @@ def openclaw_compact_session(user_id):
         # 3) 丢弃压缩前的旧 usage 统计，后续消息显示压缩后的真实上下文
         with OPENCLAW_USAGE_LOCK:
             _OPENCLAW_LAST_USAGE.pop(str(key), None)
-    return _with_context_status(
-        "已压缩上下文：把之前 {} 条对话整理成摘要写回当前会话，后续对话从这里继续。".format(len(records)),
-        key,
+    return compact_reply(
+        "已压缩上下文：把之前 {} 条对话整理成摘要写回当前会话，后续对话从这里继续。".format(len(records))
     )
 
 
@@ -3769,32 +4083,82 @@ def _looks_like_new_session_request(text):
     return t in ("新对话", "新会话", "开新对话", "开新会话", "新开对话", "新开会话", "重新对话")
 
 
+def _parse_stats_toggle_request(text):
+    """自然语言开关上下文统计：返回 True（开启）/ False（隐藏）/ None（不是开关指令）。"""
+    t = (text or "").strip()
+    if not t or len(t) > 40:
+        return None
+    if not re.search(r"(?:上下文|统计|用量|token)", t, re.I):
+        return None
+    if re.search(r"(?:什么是|啥是|介绍一下|怎么|如何|为什么|区别)", t):
+        return None
+    hide = bool(re.search(r"(?:隐藏|关闭|关掉|去掉|取消|不显示)", t))
+    show = bool(re.search(r"(?:显示|开启|打开|恢复|加上)", t))
+    if re.search(r"(?:不要|别|不想|不用)", t):
+        # “不要显示统计” = 隐藏
+        hide, show = True, False
+    if hide and not show:
+        return False
+    if show and not hide:
+        return True
+    return None
+
+
 _MENTION_VERBS = r"(?:说|告诉|通知|转告|发消息|发个消息)"
+_MENTION_META_QUESTION = re.compile(r"(?:怎么用|如何使用|是什么|啥是|介绍一下|功能|原理)")
+
+
+def _mention_pair(match):
+    target = match.group(1).lstrip("@").strip()
+    content = (match.group(2) or "").strip()
+    return target, content
 
 
 def _parse_mention_request(text, room_id):
-    """识别「艾特/at/@某人 + 说/发消息 内容」的明确指令（仅限群聊）。
+    """识别群内艾特指令（仅限群聊），返回 (目标称呼, 消息内容)（内容可为空）。
 
-    返回 (群昵称, 消息内容)；不是明确艾特指令时返回 None。为避免误判，
-    自然语言模式要求必须带“说/告诉/通知/转告/发消息”等动词。
+    群里指挥机器人艾特某人，不再追问是哪个群，一律在当前群发送。支持：
+    1. 艾特/at/@ + 名字 + 说/告诉/发消息 + 内容
+    2. 以 @名字 开头 + 内容（群里指挥转达）
+    3. 帮我在群里艾特 名字 [内容]
+    4. 裸指令：艾特/at 名字 [内容]（问“艾特功能怎么用”这类元问题不算）
     """
     t = str(text or "").strip()
     if not t or not str(room_id or "").strip():
         return None
     if not re.search(r"艾特|@|(?<![a-zA-Z])at(?![a-zA-Z])", t, re.I):
         return None
+    # 1) 明确指令：艾特/at/@ + 名字 + 动词 + 内容（动词必须出现，不会误伤聊天）
     m = re.match(
-        r"^(?:帮我在群里|在群里帮我|帮我|在群里)?(?:艾特|@|at)\s*"
+        r"^(?:帮我在群里|在群里帮我|帮我|请帮我|在群里)?(?:艾特|@|at)\s*"
         r"(@?[\u4e00-\u9fa5\w\-]{1,30}?)\s*"
-        + _MENTION_VERBS + r"\s*[:：]?\s*(.+)$",
+        + _MENTION_VERBS + r"\s*[:：]?\s*(.*)$",
         t, re.I | re.S)
-    if not m:
+    if m:
+        return _mention_pair(m)
+    # 2) 以 @名字 开头（群里指挥转达），内容可选
+    m = re.match(
+        r"^@\s*(@?[\u4e00-\u9fa5\w\-]{1,30}?)(?:(?:\s*[:：]\s*|\s+)(.*))?$",
+        t, re.I | re.S)
+    if m:
+        return _mention_pair(m)
+    # 问“艾特功能怎么用”这类元问题不算指令
+    if _MENTION_META_QUESTION.search(t):
         return None
-    target = m.group(1).lstrip("@").strip()
-    content = m.group(2).strip()
-    if not target or not content:
-        return None
-    return target, content
+    # 3) 帮我在群里艾特 名字 [内容]
+    m = re.match(
+        r"^(?:帮我在群里|在群里帮我|帮我|请帮我|在群里)(?:艾特|@|at)\s*"
+        r"(@?[\u4e00-\u9fa5\w\-]{1,30}?)(?:(?:\s*[:：]\s*|\s+)(.*))?$",
+        t, re.I | re.S)
+    if m:
+        return _mention_pair(m)
+    # 4) 裸指令：艾特/at 名字 [内容]
+    m = re.match(
+        r"^(?:艾特|at)\s*(@?[\u4e00-\u9fa5\w\-]{1,30}?)(?:(?:\s*[:：]\s*|\s+)(.*))?$",
+        t, re.I | re.S)
+    if m:
+        return _mention_pair(m)
+    return None
 
 
 def do_mention(target, content, from_id, from_name, room_id, room_name):
@@ -3808,18 +4172,59 @@ def do_mention(target, content, from_id, from_name, room_id, room_name):
     room_id = str(room_id or "").strip()
     if not room_id:
         return "⚠️ 艾特功能只能在群里使用，不能给别人发私聊消息。"
-    if not target or not content:
+    if not target:
         return "⚠️ 用法：/艾特 群昵称 消息内容（只在当前群里发送）"
     if not is_allowed(from_id):
         return AI_NO_PERMISSION_MSG
     if target == from_name or target == from_id:
         return "⚠️ 不能艾特自己，换一个群成员试试。"
+    if not content:
+        return "⚠️ 请带上要发送的内容，例如：艾特张三说你好"
+    # 智能纠错：优先用群长期记忆里的规范称呼（昵称/外号/错别字自动纠正）
+    resolved = resolve_member_name(room_id, target)
+    if resolved:
+        member_id, canonical = resolved
+        if canonical != target:
+            remember_alias_for_member(room_id, member_id, target)
+        target = canonical
     text = "@{} {}".format(target, content)
     ok, resp = bot_send(room_name or room_id, text, is_room=True)
     if not ok:
         log_error("艾特发送失败: {}".format(str(resp)[:200]))
         return "❌ 发送失败：{}".format(str(resp)[:100]) if resp else "❌ 发送失败，请稍后重试"
     return "✅ 已替你在群里艾特 {}：{}".format(target, content)
+
+
+def handle_recall_notice(content, from_id, sender_name, room_id):
+    """防撤回：识别“XX撤回了一条消息”提示，把缓存的原内容公之于众（撤回没用）。
+
+    网页版协议不一定上报撤回事件，这里做尽力而为：收到撤回提示时，
+    从消息记录里找出同一发送者/同一群最近一条非撤回消息并展示。
+    """
+    content = str(content or "")
+    if "撤回了一条消息" not in content:
+        return None
+    room_id = str(room_id or "").strip()
+    from_id = str(from_id or "").strip()
+    sender_name = str(sender_name or "").strip() or "有人"
+
+    def _find(records, match_from):
+        for rec in reversed(records):
+            if room_id and str(rec.get("roomId") or "") != room_id:
+                continue
+            if match_from and from_id and str(rec.get("fromId") or "") != from_id:
+                continue
+            original = str(rec.get("content") or "")
+            if original and "撤回" not in original:
+                return original
+        return ""
+
+    original = _find(_recent, True) or _find(_recent, False)
+    if not original:
+        original = _find(read_messages(5000), True) or _find(read_messages(5000), False)
+    if not original:
+        return "⚠️ {} 撤回了一条消息，撤回没用，但我没来得及缓存原内容。".format(sender_name)
+    return "⚠️ {} 撤回了一条消息，撤回没用：「{}」".format(sender_name, original[:200])
 
 
 def smart_fallback(text, from_id, from_name, room_id, room_name, cfg, session_id=None):
@@ -3835,6 +4240,12 @@ def smart_fallback(text, from_id, from_name, room_id, room_name, cfg, session_id
         session_id = ai_session_key(from_id, room_id)
     if not is_allowed(from_id):
         return AI_NO_PERMISSION_MSG
+    stats_req = _parse_stats_toggle_request(text)
+    if stats_req is not None:
+        set_stats_visible(session_id, stats_req)
+        if stats_req:
+            return "已开启上下文统计，后续回复末尾会显示 token 用量。"
+        return "已隐藏上下文统计，后续回复不再显示 token 用量。"
     switch_req = _parse_agent_switch_request(text)
     if switch_req is not None:
         try:
@@ -3978,6 +4389,45 @@ def handle_command(text, from_id, from_name, room_id, room_name, cfg, session_id
         target = parts[0].lstrip("@")
         content = parts[1] if len(parts) > 1 else ""
         return do_mention(target, content, from_id, from_name, room_id, room_name)
+
+    if cmd in ("/统计", "/stats"):
+        arg = rest.strip().lower()
+        if not arg or arg in ("?", "查看", "状态", "当前"):
+            return "当前上下文统计：{}。\n/统计 开 或 /统计 关 切换；也可以直接说“显示上下文统计”/“隐藏上下文统计”。".format(
+                "显示中" if stats_visible(session_id) else "已隐藏")
+        if arg in ("开", "显示", "开启", "打开", "on", "show"):
+            set_stats_visible(session_id, True)
+            return "已开启上下文统计，后续回复末尾会显示 token 用量。"
+        if arg in ("关", "隐藏", "关闭", "off", "hide"):
+            set_stats_visible(session_id, False)
+            return "已隐藏上下文统计，后续回复不再显示 token 用量。"
+        return "用法：/统计 开 或 /统计 关"
+
+    if cmd in ("/打电话", "/call"):
+        if not room_id:
+            return "⚠️ 打电话只能在群里发起。"
+        if not rest:
+            return "⚠️ 用法：/打电话 群昵称"
+        target = rest.lstrip("@").strip()
+        resolved = resolve_member_name(room_id, target)
+        if resolved:
+            target = resolved[1]
+        return "📵 网页版微信协议不支持发起语音/视频通话，无法给你打 {} 的电话。".format(target)
+
+    if cmd in ("/收款", "/collect"):
+        try:
+            item = _parse_collect_command(rest, from_id, from_name, room_id, room_name)
+        except ValueError as e:
+            return "⚠️ {}".format(e)
+        note = "（{}）".format(item["note"]) if item.get("note") else ""
+        return "✅ 已登记：{} 欠你 {} 元{}。发「/催收 {}」可提醒 TA 还钱。".format(
+            item["payer_name"], fmt_number(item["amount"]), note, item["payer_name"])
+
+    if cmd in ("/催收", "/urge"):
+        return do_collect_urge(rest, from_id, from_name, room_id, room_name)
+
+    if cmd in ("/欠款", "/owed"):
+        return collect_summary(from_id)
 
     if cmd == "/记账":
         return do_ledger(rest, from_id)
@@ -5594,56 +6044,64 @@ class Handler(BaseHTTPRequestHandler):
         if not sender_name:
             sender_name = "用户 " + public_user_ref(from_id) if from_id else "未知"
         record_user(from_id, sender_name)
+        if in_room:
+            remember_sender_in_room(room_id, room_name, from_id, sender_name)
 
         reply = None
         cfg = load_config()
         session_id = ai_session_key(from_id, room_id)
         if mtype == "text" and cfg.get("auto_reply", True):
             text_in = content.strip()
-            # 每日推送城市确认流程：有待确认时优先处理（群里可不用 @机器人）
-            pending_reply = handle_pending_reply(from_id, text_in) if text_in else None
-            wizard_reply = handle_wizard(from_id, text_in) if (pending_reply is None and text_in) else None
-            if pending_reply is not None:
-                reply = pending_reply
-            elif wizard_reply is not None:
-                reply = wizard_reply
-            elif (not in_room) or mentioned:
-                # 去掉对机器人本体的 @提及（开头/中间/结尾都可能出现），避免原样发给 AI
-                text_clean = strip_bot_mentions(text_in, bot_name)
-                mention_req = _parse_mention_request(text_clean, room_id) if in_room else None
-                if mention_req is not None:
-                    target, content = mention_req
-                    if not is_allowed(from_id):
-                        reply = AI_NO_PERMISSION_MSG
+            # 防撤回：识别撤回提示并把缓存的原内容公之于众
+            recall_reply = handle_recall_notice(content, from_id, sender_name, room_id)
+            if recall_reply is not None:
+                reply = recall_reply
+            else:
+                # 每日推送城市确认流程：有待确认时优先处理（群里可不用 @机器人）
+                pending_reply = handle_pending_reply(from_id, text_in) if text_in else None
+                wizard_reply = handle_wizard(from_id, text_in) if (pending_reply is None and text_in) else None
+                if pending_reply is not None:
+                    reply = pending_reply
+                elif wizard_reply is not None:
+                    reply = wizard_reply
+                elif (not in_room) or mentioned or (
+                        in_room and text_in.startswith("/") and len(text_in.strip()) > 1):
+                    # 去掉对机器人本体的 @提及（开头/中间/结尾都可能出现），避免原样发给 AI
+                    text_clean = strip_bot_mentions(text_in, bot_name)
+                    mention_req = _parse_mention_request(text_clean, room_id) if in_room else None
+                    if mention_req is not None:
+                        target, content = mention_req
+                        if not is_allowed(from_id):
+                            reply = AI_NO_PERMISSION_MSG
+                        else:
+                            reply = do_mention(target, content, from_id, sender_name, room_id, room_name)
                     else:
-                        reply = do_mention(target, content, from_id, sender_name, room_id, room_name)
-                else:
-                    cmd_text = re.sub(r"^@\s*[\u4e00-\u9fa5\w\-]+", "", text_clean).strip()
-                    cmd_word = cmd_text.split(None, 1)[0].lower() if cmd_text else ""
-                    # 权限规则：AI 类命令需要授权；普通功能（计算/记账/提醒等）人人可用
-                    if ((cmd_text.startswith("/") and cmd_word in AI_CMDS)
-                            or cmd_text.strip().lower() in SESSION_COMMANDS) and not is_allowed(from_id):
-                        reply = AI_NO_PERMISSION_MSG
-                    elif cmd_text.startswith("/") or cmd_text.strip().lower() in SESSION_COMMANDS:
-                        reply = handle_command(cmd_text, from_id, sender_name, room_id, room_name, cfg,
-                                               session_id)
-                        if reply is None:
-                            reply = FALLBACK_HELP
-                    else:
-                        expr = normalize_expr(text_in)
-                        if is_math_expr(expr):
-                            try:
-                                result = evaluate_math(expr)
-                                reply = f"{expr} = {fmt_number(result)}"
-                            except ZeroDivisionError:
-                                reply = "除数不能为 0"
-                            except ValueError:
-                                reply = None
-                        if reply is None:
-                            reply = smart_fallback(cmd_text, from_id, sender_name, room_id, room_name, cfg,
+                        cmd_text = re.sub(r"^@\s*[\u4e00-\u9fa5\w\-]+", "", text_clean).strip()
+                        cmd_word = cmd_text.split(None, 1)[0].lower() if cmd_text else ""
+                        # 权限规则：AI 类命令需要授权；普通功能（计算/记账/提醒等）人人可用
+                        if ((cmd_text.startswith("/") and cmd_word in AI_CMDS)
+                                or cmd_text.strip().lower() in SESSION_COMMANDS) and not is_allowed(from_id):
+                            reply = AI_NO_PERMISSION_MSG
+                        elif cmd_text.startswith("/") or cmd_text.strip().lower() in SESSION_COMMANDS:
+                            reply = handle_command(cmd_text, from_id, sender_name, room_id, room_name, cfg,
                                                    session_id)
-                        if reply is None:
-                            reply = FALLBACK_HELP
+                            if reply is None:
+                                reply = FALLBACK_HELP
+                        else:
+                            expr = normalize_expr(text_in)
+                            if is_math_expr(expr):
+                                try:
+                                    result = evaluate_math(expr)
+                                    reply = f"{expr} = {fmt_number(result)}"
+                                except ZeroDivisionError:
+                                    reply = "除数不能为 0"
+                                except ValueError:
+                                    reply = None
+                            if reply is None:
+                                reply = smart_fallback(cmd_text, from_id, sender_name, room_id, room_name, cfg,
+                                                       session_id)
+                            if reply is None:
+                                reply = FALLBACK_HELP
 
         rec = {
             "type": mtype,

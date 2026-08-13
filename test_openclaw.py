@@ -428,10 +428,10 @@ class OpenClawTests(unittest.TestCase):
             "最终回答\n官方文档\n名称 值\n状态 正常",
         )
 
-    def test_group_sender_name_is_cleaned_with_reply(self):
+    def test_group_reply_is_not_prefixed_with_sender_mention(self):
         self.assertEqual(
             app.wechat_outbound_text("**回答**", "😀**用户**", True),
-            "@用户 回答",
+            "回答",
         )
 
     def test_automation_route_exposes_only_reminder_and_daily_push(self):
@@ -606,14 +606,66 @@ class OpenClawTests(unittest.TestCase):
         self.assertIsNone(parse("艾特张三说你好", ""))  # 私聊不识别
         self.assertIsNone(parse("今天@张三 一起吃饭吗", "room-1"))  # 只是提及，不是指令
 
+    def test_parse_mention_request_supports_bare_and_prefixed_forms(self):
+        parse = self._require_callable("_parse_mention_request")
+        # 群里指挥转达：以 @名字 开头，不再追问是哪个群
+        self.assertEqual(parse("@张三 你好", "room-1"), ("张三", "你好"))
+        self.assertEqual(parse("@张三", "room-1"), ("张三", ""))
+        self.assertEqual(parse("帮我在群里艾特张三", "room-1"), ("张三", ""))
+        self.assertEqual(parse("帮我艾特张三：晚上聚餐", "room-1"), ("张三", "晚上聚餐"))
+        self.assertEqual(parse("艾特王五发消息", "room-1"), ("王五", ""))
+        # 元问题（问艾特功能怎么用）不算指令
+        self.assertIsNone(parse("艾特功能怎么用", "room-1"))
+        self.assertIsNone(parse("介绍一下艾特功能", "room-1"))
+        self.assertIsNone(parse("你好@张三 一起吃饭吗", "room-1"))
+
+    def test_group_memory_learns_aliases_and_resolves_names(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            memory = os.path.join(tmp, "group_memory.json")
+            with mock.patch.object(app, "GROUP_MEMORY_FILE", memory):
+                app.remember_sender_in_room("room-1", "测试群", "member-a", "王小明")
+                app.remember_sender_in_room("room-1", "测试群", "member-b", "老李")
+                # 精确匹配
+                self.assertEqual(app.resolve_member_name("room-1", "王小明"), ("member-a", "王小明"))
+                # 外号/别名：把输入称呼记为别名后可直接命中
+                app.remember_alias_for_member("room-1", "member-a", "小明")
+                self.assertEqual(app.resolve_member_name("room-1", "小明"), ("member-a", "小明"))
+                # 模糊纠错（错别字/多字少字）
+                resolved = app.resolve_member_name("room-1", "王小鸣")
+                self.assertIsNotNone(resolved)
+                self.assertEqual(resolved[0], "member-a")
+                # 未知称呼解析不到
+                self.assertIsNone(app.resolve_member_name("room-1", "张三"))
+                # 长期记忆落盘
+                with open(memory, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                self.assertEqual(data["rooms"]["room-1"]["room_name"], "测试群")
+                self.assertEqual(data["rooms"]["room-1"]["members"]["member-a"]["names"], ["王小明", "小明"])
+
+    def test_do_mention_uses_canonical_name_and_learns_alias(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            memory = os.path.join(tmp, "group_memory.json")
+            with mock.patch.object(app, "GROUP_MEMORY_FILE", memory), \
+                 mock.patch.object(app, "is_allowed", return_value=True), \
+                 mock.patch.object(app, "bot_send",
+                                   return_value=(True, '{"success":true}')) as send:
+                app.remember_sender_in_room("room-1", "测试群", "member-a", "王小明")
+                reply = app.do_mention("小明", "你好", "wx-user", "用户", "room-1", "测试群")
+                self.assertIn("已替你在群里艾特 王小明", reply)
+                send.assert_called_once_with("测试群", "@王小明 你好", is_room=True)
+                # 输入称呼被记入长期记忆
+                self.assertEqual(app.resolve_member_name("room-1", "小明"), ("member-a", "小明"))
+
     def test_do_mention_sends_group_message_and_rejects_private(self):
         with mock.patch.object(app, "is_allowed", return_value=True), \
              mock.patch.object(app, "bot_send",
                                return_value=(True, '{"success":true}')) as send:
             reply = app.do_mention("张三", "你好", "wx-user", "用户", "room-1", "测试群")
             private_reply = app.do_mention("张三", "你好", "wx-user", "用户", "", "")
+            empty_reply = app.do_mention("张三", "", "wx-user", "用户", "room-1", "测试群")
         self.assertIn("已替你在群里艾特 张三", reply)
         self.assertIn("只能在群里使用", private_reply)
+        self.assertIn("请带上要发送的内容", empty_reply)
         send.assert_called_once_with("测试群", "@张三 你好", is_room=True)
 
     def test_do_mention_requires_permission(self):
@@ -621,6 +673,56 @@ class OpenClawTests(unittest.TestCase):
              mock.patch.object(app, "bot_send", side_effect=AssertionError("不应发送")):
             reply = app.do_mention("张三", "你好", "wx-user", "用户", "room-1", "测试群")
         self.assertEqual(reply, app.AI_NO_PERMISSION_MSG)
+
+    def test_stats_toggle_natural_language_and_persistence(self):
+        parse = self._require_callable("_parse_stats_toggle_request")
+        self.assertIs(parse("隐藏上下文统计"), False)
+        self.assertIs(parse("关闭上下文统计"), False)
+        self.assertIs(parse("不要显示token统计"), False)
+        self.assertIs(parse("显示上下文统计"), True)
+        self.assertIs(parse("开启上下文统计"), True)
+        self.assertIs(parse("你好"), None)
+        self.assertIs(parse("什么是上下文统计"), None)
+        with tempfile.TemporaryDirectory() as tmp:
+            prefs = os.path.join(tmp, "agent_prefs.json")
+            with mock.patch.object(app, "AGENT_PREFS_FILE", prefs):
+                self.assertTrue(app.stats_visible("group:room-1"))
+                app.set_stats_visible("group:room-1", False)
+                self.assertFalse(app.stats_visible("group:room-1"))
+                self.assertTrue(app.stats_visible("wx-user"))  # 场景隔离
+                app.set_stats_visible("group:room-1", True)
+                self.assertTrue(app.stats_visible("group:room-1"))
+
+    def test_smart_fallback_hides_stats_by_natural_language(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prefs = os.path.join(tmp, "agent_prefs.json")
+            with mock.patch.object(app, "AGENT_PREFS_FILE", prefs), \
+                 mock.patch.object(app, "is_allowed", return_value=True):
+                reply = app.smart_fallback("隐藏上下文统计", "wx-user", "用户", "", "", {"smart": True})
+                self.assertIn("已隐藏", reply)
+                self.assertFalse(app.stats_visible("wx-user"))
+
+    def test_handle_command_stats_command(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prefs = os.path.join(tmp, "agent_prefs.json")
+            with mock.patch.object(app, "AGENT_PREFS_FILE", prefs):
+                on = app.handle_command("/统计 开", "wx-user", "用户", "", "", app.load_config())
+                off = app.handle_command("/统计 关", "wx-user", "用户", "", "", app.load_config())
+                self.assertIn("已开启", on)
+                self.assertIn("已隐藏", off)
+                self.assertFalse(app.stats_visible("wx-user"))
+
+    def test_ai_answer_omits_stats_when_hidden(self):
+        cfg = {"enabled": True, "base_url": "http://127.0.0.1:1/v1", "api_key": "k"}
+        with mock.patch.object(app, "active_agent", return_value="openclaw"), \
+             mock.patch.object(app, "openclaw_config", return_value=cfg), \
+             mock.patch.object(app, "openclaw_active_key", return_value="wx-user"), \
+             mock.patch.object(app, "openclaw_chat", return_value="回答内容"), \
+             mock.patch.object(app, "stats_visible", return_value=False), \
+             mock.patch.object(app, "_with_context_status",
+                               side_effect=AssertionError("不应附加统计")):
+            reply = app.ai_answer("问题", session_id="wx-user")
+        self.assertEqual(reply, "回答内容")
 
     def test_receive_pipeline_sends_group_mention(self):
         source = {
@@ -642,22 +744,113 @@ class OpenClawTests(unittest.TestCase):
                 self.result = value
 
         receiver = _Receiver()
-        with mock.patch.object(app, "identity_user_id", return_value="stable-user", create=True), \
-             mock.patch.object(app, "record_user"), \
-             mock.patch.object(app, "load_config", return_value={"auto_reply": True, "smart": True}), \
-             mock.patch.object(app, "handle_pending_reply", return_value=None), \
-             mock.patch.object(app, "handle_wizard", return_value=None), \
-             mock.patch.object(app, "is_allowed", return_value=True), \
-             mock.patch.object(app, "bot_send", return_value=(True, '{"success":true}')) as send, \
-             mock.patch.object(app, "save_record") as save:
-            app.Handler._on_receive(receiver, fields)
+        with tempfile.TemporaryDirectory() as tmp:
+            memory = os.path.join(tmp, "group_memory.json")
+            with mock.patch.object(app, "GROUP_MEMORY_FILE", memory), \
+                 mock.patch.object(app, "identity_user_id", return_value="stable-user", create=True), \
+                 mock.patch.object(app, "record_user"), \
+                 mock.patch.object(app, "load_config", return_value={"auto_reply": True, "smart": True}), \
+                 mock.patch.object(app, "handle_pending_reply", return_value=None), \
+                 mock.patch.object(app, "handle_wizard", return_value=None), \
+                 mock.patch.object(app, "is_allowed", return_value=True), \
+                 mock.patch.object(app, "bot_send", return_value=(True, '{"success":true}')) as send, \
+                 mock.patch.object(app, "save_record") as save:
+                app.Handler._on_receive(receiver, fields)
+                send.assert_called_once_with("测试群", "@张三 你好", is_room=True)
+                data = receiver.result.get("data") or {}
+                self.assertIn("已替你在群里艾特 张三", data.get("content", ""))
+                rec = save.call_args.args[0]
+                self.assertEqual(rec["roomId"], "@@room")
+                self.assertEqual(rec["reply"], "✅ 已替你在群里艾特 张三：你好")
+                # 群成员称呼被记入长期记忆
+                self.assertEqual(app.resolve_member_name("@@room", "Z"), ("stable-user", "Z"))
 
-        send.assert_called_once_with("测试群", "@张三 你好", is_room=True)
+    def test_group_slash_command_works_without_mention(self):
+        source = {
+            "room": {"id": "@@room", "payload": {"topic": "测试群"}},
+            "from": {"payload": {"id": "@user", "name": "Z"}},
+            "to": {"payload": {"name": "kindle"}},
+        }
+        fields = {
+            "type": (None, b"text"),
+            "content": (None, "/说明".encode("utf-8")),
+            "source": (None, json.dumps(source, ensure_ascii=False).encode("utf-8")),
+            "isMentioned": (None, b"0"),
+            "isMsgFromSelf": (None, b"0"),
+            "isSystemEvent": (None, b"0"),
+        }
+
+        class _Receiver:
+            def _json(self, value):
+                self.result = value
+
+        receiver = _Receiver()
+        with tempfile.TemporaryDirectory() as tmp:
+            memory = os.path.join(tmp, "group_memory.json")
+            with mock.patch.object(app, "GROUP_MEMORY_FILE", memory), \
+                 mock.patch.object(app, "identity_user_id", return_value="stable-user", create=True), \
+                 mock.patch.object(app, "record_user"), \
+                 mock.patch.object(app, "load_config", return_value={"auto_reply": True, "smart": True}), \
+                 mock.patch.object(app, "handle_pending_reply", return_value=None), \
+                 mock.patch.object(app, "handle_wizard", return_value=None), \
+                 mock.patch.object(app, "save_record"):
+                app.Handler._on_receive(receiver, fields)
         data = receiver.result.get("data") or {}
-        self.assertIn("已替你在群里艾特 张三", data.get("content", ""))
-        rec = save.call_args.args[0]
-        self.assertEqual(rec["roomId"], "@@room")
-        self.assertEqual(rec["reply"], "✅ 已替你在群里艾特 张三：你好")
+        self.assertIn("功能说明", data.get("content", ""))
+
+    def test_handle_recall_notice_reveals_cached_content(self):
+        handle = self._require_callable("handle_recall_notice")
+        app._recent.append({
+            "roomId": "room-1", "fromId": "member-a", "from": "张三",
+            "content": "明天下午三点开会", "reply": "好的",
+        })
+        try:
+            reply = handle("张三撤回了一条消息", "member-a", "张三", "room-1")
+            reply_no_from = handle("撤回了一条消息", "", "系统", "room-1")
+            reply_empty = handle("你好", "member-a", "张三", "room-1")
+        finally:
+            app._recent.clear()
+        self.assertIn("明天下午三点开会", reply)
+        self.assertIn("撤回没用", reply)
+        self.assertIn("明天下午三点开会", reply_no_from)
+        self.assertIsNone(reply_empty)
+
+    def test_collect_add_and_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            collects = os.path.join(tmp, "collects.json")
+            with mock.patch.object(app, "COLLECTS_FILE", collects), \
+                 mock.patch.object(app, "GROUP_MEMORY_FILE", os.path.join(tmp, "g.json")):
+                item = app.collect_add("payee-a", "我", "room-1", "测试群", "张三", "100", "买奶茶")
+                summary = app.collect_summary("payee-a")
+                none_owed = app.collect_summary("other-user")
+        self.assertEqual(item["payer_name"], "张三")
+        self.assertEqual(item["amount"], 100.0)
+        self.assertIn("张三 欠你 100 元", summary)
+        self.assertIn("还没有人欠你钱", none_owed)
+
+    def test_collect_command_and_urge(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            collects = os.path.join(tmp, "collects.json")
+            with mock.patch.object(app, "COLLECTS_FILE", collects), \
+                 mock.patch.object(app, "GROUP_MEMORY_FILE", os.path.join(tmp, "g.json")), \
+                 mock.patch.object(app, "bot_send",
+                                   return_value=(True, '{"success":true}')) as send:
+                recorded = app.handle_command(
+                    "/收款 100 张三 买奶茶", "payee-a", "我", "room-1", "测试群", app.load_config())
+                urged = app.handle_command(
+                    "/催收 张三", "payee-a", "我", "room-1", "测试群", app.load_config())
+            self.assertIn("已登记", recorded)
+            self.assertIn("已在群里提醒 张三", urged)
+            send.assert_called_once_with(
+                "测试群", "@张三 你欠 我 100 元，该还啦！（买奶茶）", is_room=True)
+
+    def test_call_command_replies_web_protocol_limit(self):
+        reply = app.handle_command(
+            "/打电话 张三", "wx-user", "用户", "room-1", "测试群", app.load_config())
+        private = app.handle_command(
+            "/打电话 张三", "wx-user", "用户", "", "", app.load_config())
+        self.assertIn("网页版微信协议不支持", reply)
+        self.assertIn("只能在群里", private)
 
     def test_same_session_requests_are_serialized(self):
         _ConcurrentOpenClawHandler.active = 0
