@@ -22,6 +22,7 @@
 import json
 import hashlib
 import os
+import random
 import re
 import secrets
 import shutil
@@ -222,6 +223,12 @@ WECHAT_SYSTEM_PROMPT = (
     "替用户在群里艾特/发消息、收款登记、催收、防撤回等均由本地功能自动处理，"
     "你无法直接操作微信，遇到这类需求直接告诉用户对应用法"
     "（如“艾特张三说你好”“/收款 100 张三 买奶茶”），不要说做不到。"
+    "当用户要求替他在群里艾特/提醒/告诉/转告某人（如“帮我转告田浩亢明天带电脑”"
+    "“提醒小盆友去签到”“艾特张三说晚上聚餐”）时，在一次回复里同时给出："
+    "①每一行单独输出【艾特】群里称呼：要发送的内容（一行一个目标，称呼用群里名字，"
+    "不要用代词“他/她”，内容只写真正要发给对方的话）；"
+    "②其余部分只写一句给用户看的简短确认（1~5 个字，随机风格，"
+    "如“已搞定”“妥了”“已办”，不要复述用户原话，不要解释过程）。"
     "如果用户告诉你群里某成员的昵称/外号/英文名对应哪个真实姓名"
     "（比如“THk 群里这个人叫田浩亢”“小明就是王小明”“记住小明的真名是王小明”），"
     "在回复末尾单独附加一行【记住称呼】别名=真实姓名（一行一个对应关系），"
@@ -236,6 +243,11 @@ OPENCLAW_DIRECT_SYSTEM_PROMPT = (
     "（长度随机变化）；需要查询、分析、对比、总结、写内容时给出完整详细回答。"
     "替用户在群里艾特/发消息、收款登记、催收、防撤回等由本地功能自动处理，"
     "遇到这类需求直接告诉用户对应用法，不要说做不到。"
+    "当用户要求替他在群里艾特/提醒/告诉/转告某人时，在一次回复里同时给出："
+    "①每一行单独输出【艾特】群里称呼：要发送的内容（一行一个目标，用群里名字，"
+    "不要用代词“他/她”，内容只写真正要发给对方的话）；"
+    "②其余部分只写一句给用户看的简短确认（1~5 个字，随机风格，如“已搞定”“妥了”，"
+    "不要复述用户原话）。"
 )
 OPENCLAW_COMPACT_SYSTEM_PROMPT = (
     "你是上下文压缩助手。请把用户提供的微信对话记录压缩成一份简明摘要。"
@@ -469,6 +481,51 @@ _OPENCLAW_MAX_TRANSCRIPT_BYTES = 4 * 1024 * 1024
 _OPENCLAW_MAX_TRANSCRIPT_RECORDS = 5000
 # 群聊共享会话键前缀：同一群里所有成员共享同一 AI 上下文。
 GROUP_SESSION_PREFIX = "group:"
+# 最近收到的消息里机器人的微信昵称（@机器人只是触发前缀，绝不把机器人当艾特目标）。
+_BOT_NAME = ""
+_BOT_NAME_LOCK = threading.Lock()
+
+# 群聊“对话保持”：用户用 @/斜杠/反斜杠召唤机器人并得到回复后，
+# 短时间内在群里继续发消息不再需要每次都 @（按人计时，不影响其他成员）。
+GROUP_ENGAGE_SECONDS = int(os.environ.get("WXBOT_GROUP_ENGAGE_SECONDS", "900"))
+_group_engage = {}
+_group_engage_lock = threading.Lock()
+
+
+def set_bot_name(name):
+    """记录最近一次消息里的机器人昵称（如 kindle）。"""
+    global _BOT_NAME
+    name = str(name or "").strip()
+    with _BOT_NAME_LOCK:
+        if name:
+            _BOT_NAME = name
+
+
+def bot_name_now():
+    """当前机器人昵称；拿不到时回退为空串（不参与判定）。"""
+    with _BOT_NAME_LOCK:
+        return _BOT_NAME
+
+
+def _group_mark_engaged(room_id, from_id):
+    """机器人刚在群里回复过某人，给该用户开一段“免@继续聊”的窗口。"""
+    room_id = str(room_id or "").strip()
+    from_id = str(from_id or "").strip()
+    if not room_id or not from_id:
+        return
+    with _group_engage_lock:
+        _group_engage.setdefault(room_id, {})[from_id] = time.time()
+
+
+def _group_is_engaged(room_id, from_id):
+    """该用户是否在群里的免@对话窗口内。"""
+    room_id = str(room_id or "").strip()
+    from_id = str(from_id or "").strip()
+    if not room_id or not from_id:
+        return False
+    with _group_engage_lock:
+        t = _group_engage.get(room_id, {}).get(from_id, 0)
+    return bool(t) and (time.time() - t) < GROUP_ENGAGE_SECONDS
 
 
 def ai_session_key(from_id, room_id):
@@ -4404,11 +4461,27 @@ def _parse_mention_request(text, room_id, bot_name=""):
     return None
 
 
-def do_mention(target, content, from_id, from_name, room_id, room_name):
+_MENTION_DONE_TEMPLATES = (
+    "✅ 已艾特 {target}",
+    "已搞定 {target}",
+    "妥了，已艾特 {target}",
+    "好了，已提醒 {target}",
+    "已办，@了 {target}",
+    "搞定 {target}",
+)
+
+
+def _mention_done(target):
+    """艾特成功的简短随机确认（1~5 字，不复述用户原话）。"""
+    return random.choice(_MENTION_DONE_TEMPLATES).format(target=target)
+
+
+def do_mention(target, content, from_id, from_name, room_id, room_name, bot_name=""):
     """艾特功能：机器人在当前群里以「@成员 消息」的形式替用户向群内成员发消息。
 
     只允许在群聊中向群内成员发送，任何情况下都不会给他人发私聊消息；
-    私聊里使用会直接拒绝。
+    私聊里使用会直接拒绝。目标为机器人自己（@kindle 触发前缀）或发送者本人时拒绝。
+    成功后只回一句 1~5 字的简短随机确认，不重复用户原话。
     """
     target = str(target or "").strip().lstrip("@").strip()
     content = str(content or "").strip()
@@ -4419,6 +4492,9 @@ def do_mention(target, content, from_id, from_name, room_id, room_name):
         return "⚠️ 用法：/艾特 群昵称 消息内容（只在当前群里发送）"
     if not is_allowed(from_id):
         return AI_NO_PERMISSION_MSG
+    bot_name = str(bot_name or "").strip() or bot_name_now()
+    if bot_name and _normalize_name(target) == _normalize_name(bot_name):
+        return "⚠️ 不能艾特机器人自己。"
     if target == from_name or target == from_id:
         return "⚠️ 不能艾特自己，换一个群成员试试。"
     # 智能纠错：优先用群长期记忆里的规范称呼（昵称/外号/错别字自动纠正）
@@ -4428,13 +4504,48 @@ def do_mention(target, content, from_id, from_name, room_id, room_name):
         if canonical != target:
             remember_alias_for_member(room_id, member_id, target)
         target = canonical
+    if bot_name and _normalize_name(target) == _normalize_name(bot_name):
+        return "⚠️ 不能艾特机器人自己。"
     text = "@{} {}".format(target, content) if content else "@{}".format(target)
     ok, resp = bot_send(room_name or room_id, text, is_room=True)
     if not ok:
         log_error("艾特发送失败: {}".format(str(resp)[:200]))
         return "❌ 发送失败：{}".format(str(resp)[:100]) if resp else "❌ 发送失败，请稍后重试"
-    # 确认回复不重复用户原话（内容是从语境推断的，原样回显反而啰嗦）
-    return "✅ 已替你在群里艾特 {}".format(target)
+    return _mention_done(target)
+
+
+_MENTION_PLAN_RE = re.compile(r"^【艾特】\s*([^：:【】\s]+)(?:\s*[：:]\s*|\s+)(.+?)\s*$")
+
+
+def execute_ai_mention_plan(reply, from_id, from_name, room_id, room_name, bot_name=""):
+    """执行 AI 回复里的【艾特】目标：内容 计划（一行一个），并移除计划行。
+
+    AI 在一次调用里同时产出“要 @ 谁、发什么内容、给用户看的简短确认”，
+    本地把每条 @ 连续发送出去，只把确认文案留给用户，不再重复调 API。
+    目标为机器人自己/发送者本人时本地拒绝，不发送。
+    """
+    reply = str(reply or "")
+    room_id = str(room_id or "").strip()
+    if not room_id:
+        return reply
+    sent = []
+    kept = []
+    for line in reply.splitlines():
+        m = _MENTION_PLAN_RE.match(line.strip())
+        if m:
+            target = m.group(1).strip().lstrip("@").strip()
+            content = m.group(2).strip()
+            if target:
+                res = do_mention(target, content, from_id, from_name, room_id, room_name,
+                                 bot_name=bot_name)
+                if str(res or "").startswith(("✅", "已", "妥", "好", "搞", "办")):
+                    sent.append(target)
+            continue
+        kept.append(line)
+    text = "\n".join(kept).strip()
+    if not text and sent:
+        return _mention_done(sent[0])
+    return text
 
 
 def handle_recall_notice(content, from_id, sender_name, room_id):
@@ -6293,6 +6404,7 @@ class Handler(BaseHTTPRequestHandler):
         to_payload = (source.get("to") or {}).get("payload") or {}
 
         bot_name = to_payload.get("name") or to_payload.get("alias") or ""
+        set_bot_name(bot_name)
         room_name = room_payload.get("topic") or room.get("topic") or ""
         room_id = room.get("id") or ""
         in_room = bool(room_id)
@@ -6338,9 +6450,14 @@ class Handler(BaseHTTPRequestHandler):
                 elif wizard_reply is not None:
                     reply = wizard_reply
                 elif (not in_room) or mentioned or (
-                        in_room and text_in.startswith("/") and len(text_in.strip()) > 1):
+                        in_room and len(text_in.strip()) > 1 and (
+                            text_in.startswith("/") or text_in.startswith("\\")
+                            or _group_is_engaged(room_id, from_id))):
                     # 去掉对机器人本体的 @提及（开头/中间/结尾都可能出现），避免原样发给 AI
                     text_clean = strip_bot_mentions(text_in, bot_name)
+                    # 反斜杠 = 开启对话：去掉前缀后交给 AI 正常对话
+                    if text_clean.startswith("\\"):
+                        text_clean = text_clean[1:].strip()
                     # 群里称呼学习优先：“THk 群里这个人叫田浩亢”是告知称呼，不是艾特指令
                     alias_reply = learn_group_alias(room_id, text_clean) if in_room else None
                     if alias_reply is not None:
@@ -6352,7 +6469,8 @@ class Handler(BaseHTTPRequestHandler):
                             if not is_allowed(from_id):
                                 reply = AI_NO_PERMISSION_MSG
                             else:
-                                reply = do_mention(target, content, from_id, sender_name, room_id, room_name)
+                                reply = do_mention(target, content, from_id, sender_name, room_id, room_name,
+                                                   bot_name=bot_name)
                         else:
                             cmd_text = re.sub(r"^@\s*[\u4e00-\u9fa5\w\-]+", "", text_clean).strip()
                             cmd_word = cmd_text.split(None, 1)[0].lower() if cmd_text else ""
@@ -6380,6 +6498,14 @@ class Handler(BaseHTTPRequestHandler):
                                                            session_id)
                                 if reply is None:
                                     reply = FALLBACK_HELP
+
+        # 一次 AI 调用产出的“艾特计划 + 简短确认”：本地连续发送 @，只把确认留给用户
+        if in_room and reply and isinstance(reply, str):
+            reply = execute_ai_mention_plan(reply, from_id, sender_name, room_id, room_name,
+                                            bot_name=bot_name)
+        # 机器人刚回复过该用户：开启群里“免@继续聊”窗口（按人计时）
+        if in_room and reply:
+            _group_mark_engaged(room_id, from_id)
 
         rec = {
             "type": mtype,

@@ -665,7 +665,9 @@ class OpenClawTests(unittest.TestCase):
                                    return_value=(True, '{"success":true}')) as send:
                 app.remember_sender_in_room("room-1", "测试群", "member-a", "王小明")
                 reply = app.do_mention("小明", "你好", "wx-user", "用户", "room-1", "测试群")
-                self.assertIn("已替你在群里艾特 王小明", reply)
+                # 简短随机确认（1~5 字），且带上规范称呼
+                self.assertIn("王小明", reply)
+                self.assertLess(len(reply), 16)
                 send.assert_called_once_with("测试群", "@王小明 你好", is_room=True)
                 # 输入称呼被记入长期记忆
                 self.assertEqual(app.resolve_member_name("room-1", "小明"), ("member-a", "小明"))
@@ -677,11 +679,12 @@ class OpenClawTests(unittest.TestCase):
             reply = app.do_mention("张三", "你好", "wx-user", "用户", "room-1", "测试群")
             private_reply = app.do_mention("张三", "你好", "wx-user", "用户", "", "")
             empty_reply = app.do_mention("张三", "", "wx-user", "用户", "room-1", "测试群")
-        # 确认回复不重复用户原话
-        self.assertEqual(reply, "✅ 已替你在群里艾特 张三")
+        # 确认回复简短且不重复用户原话（内容“你好”不应出现在确认里）
+        self.assertIn("张三", reply)
+        self.assertNotIn("你好", reply)
         self.assertIn("只能在群里使用", private_reply)
         # 无内容时只发一个裸 @，也允许
-        self.assertEqual(empty_reply, "✅ 已替你在群里艾特 张三")
+        self.assertIn("张三", empty_reply)
         send.assert_any_call("测试群", "@张三 你好", is_room=True)
         send.assert_any_call("测试群", "@张三", is_room=True)
 
@@ -751,7 +754,10 @@ class OpenClawTests(unittest.TestCase):
                                    return_value=(True, '{"success":true}')) as send:
                 app.remember_sender_in_room("room-1", "测试群", "member-a", "王小明")
                 reply = app.do_mention("王小明", "明天记得带电脑", "wx-user", "用户", "room-1", "测试群")
-        self.assertEqual(reply, "✅ 已替你在群里艾特 王小明")
+        # 确认简短随机，绝不回显用户原话
+        self.assertIn("王小明", reply)
+        self.assertNotIn("明天记得带电脑", reply)
+        self.assertLess(len(reply), 16)
         send.assert_called_once_with("测试群", "@王小明 明天记得带电脑", is_room=True)
 
     def test_receive_pipeline_learns_name_alias_instead_of_mention(self):
@@ -890,12 +896,15 @@ class OpenClawTests(unittest.TestCase):
                 app.Handler._on_receive(receiver, fields)
                 send.assert_called_once_with("测试群", "@张三 你好", is_room=True)
                 data = receiver.result.get("data") or {}
-                self.assertIn("已替你在群里艾特 张三", data.get("content", ""))
+                self.assertIn("张三", data.get("content", ""))
+                self.assertNotIn("你好", data.get("content", ""))
                 rec = save.call_args.args[0]
                 self.assertEqual(rec["roomId"], "@@room")
-                self.assertEqual(rec["reply"], "✅ 已替你在群里艾特 张三")
+                self.assertIn("张三", rec["reply"])
                 # 群成员称呼被记入长期记忆
                 self.assertEqual(app.resolve_member_name("@@room", "Z"), ("stable-user", "Z"))
+                # 机器人回复过该用户：群里开启免@继续聊窗口
+                self.assertTrue(app._group_is_engaged("@@room", "stable-user"))
 
     def test_group_slash_command_works_without_mention(self):
         source = {
@@ -929,6 +938,164 @@ class OpenClawTests(unittest.TestCase):
                 app.Handler._on_receive(receiver, fields)
         data = receiver.result.get("data") or {}
         self.assertIn("功能说明", data.get("content", ""))
+
+    def test_do_mention_rejects_bot_self(self):
+        with mock.patch.object(app, "is_allowed", return_value=True), \
+             mock.patch.object(app, "bot_send", side_effect=AssertionError("不应发送")):
+            reply = app.do_mention("kindle", "你好", "wx-user", "用户", "room-1", "测试群",
+                                   bot_name="kindle")
+            reply_case = app.do_mention("@KINDLE", "你好", "wx-user", "用户", "room-1", "测试群",
+                                        bot_name="kindle")
+        self.assertIn("不能艾特机器人自己", reply)
+        self.assertIn("不能艾特机器人自己", reply_case)
+        # 未显式传 bot_name 时，回退到最近记录的机器人昵称（覆盖 /艾特 命令路径）
+        with mock.patch.object(app, "bot_name_now", return_value="kindle"), \
+             mock.patch.object(app, "is_allowed", return_value=True):
+            reply2 = app.do_mention("kindle", "你好", "wx-user", "用户", "room-1", "测试群")
+        self.assertIn("不能艾特机器人自己", reply2)
+
+    def test_execute_ai_mention_plan_sends_and_returns_short_confirmation(self):
+        plan_reply = "【艾特】田浩亢：明天记得带电脑\n已搞定"
+        with mock.patch.object(app, "is_allowed", return_value=True), \
+             mock.patch.object(app, "bot_send",
+                               return_value=(True, '{"success":true}')) as send:
+            out = app.execute_ai_mention_plan(plan_reply, "wx-user", "Z", "room-1", "测试群",
+                                              bot_name="kindle")
+        self.assertEqual(out, "已搞定")
+        send.assert_called_once_with("测试群", "@田浩亢 明天记得带电脑", is_room=True)
+
+    def test_execute_ai_mention_plan_skips_bot_self_and_handles_multiple(self):
+        plan_reply = "【艾特】kindle：别闹\n【艾特】张三：晚上聚餐\n妥了"
+        with mock.patch.object(app, "is_allowed", return_value=True), \
+             mock.patch.object(app, "bot_send",
+                               return_value=(True, '{"success":true}')) as send:
+            out = app.execute_ai_mention_plan(plan_reply, "wx-user", "Z", "room-1", "测试群",
+                                              bot_name="kindle")
+        self.assertEqual(out, "妥了")
+        self.assertEqual(send.call_count, 1)
+        send.assert_called_once_with("测试群", "@张三 晚上聚餐", is_room=True)
+
+    def test_backslash_opens_conversation_without_mention(self):
+        source = {
+            "room": {"id": "@@room", "payload": {"topic": "测试群"}},
+            "from": {"payload": {"id": "@user", "name": "Z"}},
+            "to": {"payload": {"name": "kindle"}},
+        }
+        fields = {
+            "type": (None, b"text"),
+            "content": (None, "\\帮我查一下今天天气".encode("utf-8")),
+            "source": (None, json.dumps(source, ensure_ascii=False).encode("utf-8")),
+            "isMentioned": (None, b"0"),
+            "isMsgFromSelf": (None, b"0"),
+            "isSystemEvent": (None, b"0"),
+        }
+
+        class _Receiver:
+            def _json(self, value):
+                self.result = value
+
+        receiver = _Receiver()
+        with tempfile.TemporaryDirectory() as tmp:
+            memory = os.path.join(tmp, "group_memory.json")
+            with mock.patch.object(app, "GROUP_MEMORY_FILE", memory), \
+                 mock.patch.object(app, "identity_user_id", return_value="stable-user", create=True), \
+                 mock.patch.object(app, "record_user"), \
+                 mock.patch.object(app, "load_config", return_value={"auto_reply": True, "smart": True}), \
+                 mock.patch.object(app, "handle_pending_reply", return_value=None), \
+                 mock.patch.object(app, "handle_wizard", return_value=None), \
+                 mock.patch.object(app, "is_allowed", return_value=True), \
+                 mock.patch.object(app, "smart_fallback",
+                                   return_value="今天晴，26 度") as sf, \
+                 mock.patch.object(app, "save_record"):
+                app.Handler._on_receive(receiver, fields)
+        data = receiver.result.get("data") or {}
+        self.assertIn("今天晴", data.get("content", ""))
+        # 反斜杠前缀被剥掉，正文交给 AI
+        self.assertEqual(sf.call_args.args[0], "帮我查一下今天天气")
+
+    def test_group_engagement_allows_followup_without_mention(self):
+        source = {
+            "room": {"id": "@@room", "payload": {"topic": "测试群"}},
+            "from": {"payload": {"id": "@user", "name": "Z"}},
+            "to": {"payload": {"name": "kindle"}},
+        }
+
+        class _Receiver:
+            def _json(self, value):
+                self.result = value
+
+        def _fields(content, mentioned):
+            return {
+                "type": (None, b"text"),
+                "content": (None, content.encode("utf-8")),
+                "source": (None, json.dumps(source, ensure_ascii=False).encode("utf-8")),
+                "isMentioned": (None, b"1" if mentioned else b"0"),
+                "isMsgFromSelf": (None, b"0"),
+                "isSystemEvent": (None, b"0"),
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            memory = os.path.join(tmp, "group_memory.json")
+            with mock.patch.object(app, "GROUP_MEMORY_FILE", memory), \
+                 mock.patch.object(app, "identity_user_id", return_value="stable-user", create=True), \
+                 mock.patch.object(app, "record_user"), \
+                 mock.patch.object(app, "load_config", return_value={"auto_reply": True, "smart": True}), \
+                 mock.patch.object(app, "handle_pending_reply", return_value=None), \
+                 mock.patch.object(app, "handle_wizard", return_value=None), \
+                 mock.patch.object(app, "is_allowed", return_value=True), \
+                 mock.patch.object(app, "smart_fallback",
+                                   return_value="回答") as sf, \
+                 mock.patch.object(app, "save_record"):
+                # 第一次：@ 触发
+                app.Handler._on_receive(_Receiver(), _fields("你好", True))
+                self.assertTrue(app._group_is_engaged("@@room", "stable-user"))
+                sf.assert_called_once()
+                # 第二次：同一用户不 @ 也不带斜杠，仍在免@窗口内
+                app.Handler._on_receive(_Receiver(), _fields("继续聊", False))
+                self.assertEqual(sf.call_count, 2)
+                self.assertEqual(sf.call_args.args[0], "继续聊")
+
+    def test_receive_pipeline_executes_ai_mention_plan(self):
+        source = {
+            "room": {"id": "@@room", "payload": {"topic": "测试群"}},
+            "from": {"payload": {"id": "@user", "name": "Z"}},
+            "to": {"payload": {"name": "kindle"}},
+        }
+        fields = {
+            "type": (None, b"text"),
+            "content": (None, "帮我转告张三晚上聚餐".encode("utf-8")),
+            "source": (None, json.dumps(source, ensure_ascii=False).encode("utf-8")),
+            "isMentioned": (None, b"1"),
+            "isMsgFromSelf": (None, b"0"),
+            "isSystemEvent": (None, b"0"),
+        }
+
+        class _Receiver:
+            def _json(self, value):
+                self.result = value
+
+        receiver = _Receiver()
+        with tempfile.TemporaryDirectory() as tmp:
+            memory = os.path.join(tmp, "group_memory.json")
+            with mock.patch.object(app, "GROUP_MEMORY_FILE", memory), \
+                 mock.patch.object(app, "identity_user_id", return_value="stable-user", create=True), \
+                 mock.patch.object(app, "record_user"), \
+                 mock.patch.object(app, "load_config", return_value={"auto_reply": True, "smart": True}), \
+                 mock.patch.object(app, "handle_pending_reply", return_value=None), \
+                 mock.patch.object(app, "handle_wizard", return_value=None), \
+                 mock.patch.object(app, "is_allowed", return_value=True), \
+                 mock.patch.object(app, "smart_fallback",
+                                   return_value="【艾特】张三：晚上聚餐\n妥了"), \
+                 mock.patch.object(app, "bot_send",
+                                   return_value=(True, '{"success":true}')) as send, \
+                 mock.patch.object(app, "save_record") as save:
+                app.Handler._on_receive(receiver, fields)
+                # 计划行被本地执行并移除，只留简短确认
+                send.assert_called_once_with("测试群", "@张三 晚上聚餐", is_room=True)
+                data = receiver.result.get("data") or {}
+                self.assertEqual(data.get("content", ""), "妥了")
+                rec = save.call_args.args[0]
+                self.assertEqual(rec["reply"], "妥了")
 
     def test_handle_recall_notice_reveals_cached_content(self):
         handle = self._require_callable("handle_recall_notice")
